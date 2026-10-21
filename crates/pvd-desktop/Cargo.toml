@@ -1,0 +1,24 @@
+[package]
+name = "pvd-desktop"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bevy = { version = "=0.18.1", default-features = false, features = ["std", "async_executor", "bevy_asset", "bevy_winit", "bevy_window", "bevy_log", "bevy_render", "bevy_core_pipeline", "bevy_pbr", "bevy_gizmos", "bevy_gizmos_render", "png", "multi_threaded"] }
+bevy_egui = { version = "=0.39.1", default-features = false, features = ["render", "default_fonts", "manage_clipboard"] }
+egui = { version = "=0.33.3", features = ["serde"] }
+egui_dock = { version = "=0.18.0", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "=1.8.7"
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
+pvd-core = { path = "../pvd-core" }
+pvd-protocol = { path = "../pvd-protocol" }
+pvd-transport = { path = "../pvd-transport" }
+
+[build-dependencies]
+find-msvc-tools = "=0.1.14"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+winit = { version = "=0.30.13", default-features = false }

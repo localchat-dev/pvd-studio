@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(pvd_physx_particles LANGUAGES CXX)
+add_subdirectory("../physx-features" "feature-harness" EXCLUDE_FROM_ALL)
+add_feature_producer(pvd-particles main.cpp)
+target_compile_options(pvd-particles PRIVATE /wd4996)

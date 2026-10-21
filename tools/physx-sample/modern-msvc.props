@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)compat;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /Wv:19.10 /MP2</AdditionalOptions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>

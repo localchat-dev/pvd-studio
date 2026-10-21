@@ -1,0 +1,35 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["vendor/bevy_winit", "vendor/egui_dock"]
+default-members = ["crates/pvd-cli"]
+resolver = "3"
+
+[patch.crates-io]
+bevy_winit = { path = "vendor/bevy_winit" }
+egui_dock = { path = "vendor/egui_dock" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[workspace.dependencies]
+pvd-protocol = { path = "crates/pvd-protocol" }
+pvd-core = { path = "crates/pvd-core" }
+pvd-transport = { path = "crates/pvd-transport" }
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.pvd-protocol]
+opt-level = 2
+
+[profile.dev.package.pvd-core]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,223 @@
+use super::*;
+
+pub(super) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
+    let language = studio.prefs.language;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("PVD STUDIO").size(17.0).strong());
+        ui.add_space(8.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut studio.path_input)
+                .hint_text(language.text("Open or drop a capture", "打开或拖入录制文件"))
+                .desired_width((ui.available_width() - 460.0).max(120.0)),
+        );
+        if ui.button(language.text("Open", "打开")).clicked() {
+            if studio.path_input.trim().is_empty() {
+                studio.pick_file(PickerKind::OpenCapture, ui.ctx().clone());
+            } else {
+                let path = PathBuf::from(&studio.path_input);
+                studio.request_ui_action(ui.ctx(), "toolbar-open", UiAction::Open(path));
+            }
+        }
+        if ui
+            .add_enabled(!studio.file_picker.is_busy(), egui::Button::new("…"))
+            .on_hover_text(language.text("Browse captures", "选择录制文件"))
+            .clicked()
+        {
+            studio.pick_file(PickerKind::OpenCapture, ui.ctx().clone());
+        }
+        if ui
+            .add_enabled(
+                studio.recording.is_some() || studio.bytes.is_some(),
+                egui::Button::new(language.text("Close", "关闭")),
+            )
+            .clicked()
+        {
+            studio.request_ui_action(ui.ctx(), "toolbar-close", UiAction::Close);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            settings_menu(ui, language.text("Settings", "设置"), |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(600.0)
+                    .show(ui, |ui| {
+                        settings(ui, studio);
+                    });
+            });
+            if studio.server.is_none() {
+                if ui
+                    .add_enabled(
+                        !studio.file_picker.is_busy(),
+                        egui::Button::new(language.text("Listen", "开始监听"))
+                            .fill(egui::Color32::from_rgb(32, 67, 76)),
+                    )
+                    .on_disabled_hover_text(language.text(
+                        "Finish or cancel the file dialog first.",
+                        "请先完成或取消文件选择。",
+                    ))
+                    .clicked()
+                {
+                    studio.request_ui_action(ui.ctx(), "toolbar-listen", UiAction::StartListener);
+                }
+            } else if ui
+                .button(language.text("Stop listener", "停止监听"))
+                .clicked()
+            {
+                studio.request_ui_action(ui.ctx(), "toolbar-stop-listener", UiAction::StopListener);
+            }
+            connection(ui, studio);
+        });
+    });
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        playback(ui, studio);
+        ui.separator();
+        let source = studio.source_text(language);
+        let name = std::path::Path::new(source)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(source);
+        ui.add(egui::Label::new(egui::RichText::new(name).small().color(MUTED)).truncate())
+            .on_hover_text(source);
+    });
+    ui.add_space(4.0);
+}
+
+fn connection(ui: &mut egui::Ui, studio: &Studio) {
+    let language = studio.prefs.language;
+    let label = if studio
+        .server
+        .as_ref()
+        .is_some_and(|server| server.is_stopping())
+    {
+        language.text("TCP · Stopping", "TCP · 正在停止")
+    } else if studio
+        .receive_status
+        .as_ref()
+        .is_some_and(|status| status.last_failure.is_some())
+    {
+        language.text("TCP · Receive error", "TCP · 接收异常")
+    } else if studio.receive_backlog_warning() {
+        language.text("TCP · Backlog", "TCP · 接收积压")
+    } else if studio
+        .receive_status
+        .as_ref()
+        .is_some_and(|status| status.connected)
+    {
+        if studio
+            .receive_status
+            .as_ref()
+            .is_some_and(|status| status.received_bytes == 0)
+        {
+            language.text("TCP · Waiting for data", "TCP · 等待数据")
+        } else {
+            language.text("TCP · Receiving", "TCP · 接收中")
+        }
+    } else if studio.server.is_some() {
+        language.text("TCP · Listening", "TCP · 监听中")
+    } else {
+        language.text("TCP · Off", "TCP · 未监听")
+    };
+    let mut detail = studio.connection.text(language).to_owned();
+    if let Some(summary) = studio.receive_summary(language) {
+        detail.push('\n');
+        detail.push_str(&summary);
+        detail.push('\n');
+        detail.push_str(&studio.receive_detail(language));
+    }
+    let color = if studio
+        .receive_status
+        .as_ref()
+        .is_some_and(|status| status.last_failure.is_some())
+        || studio.receive_backlog_warning()
+    {
+        receive_status_color(studio)
+    } else if studio.server.is_some() {
+        ACCENT
+    } else {
+        MUTED
+    };
+    ui.add(egui::Label::new(egui::RichText::new(label).small().color(color)).truncate())
+        .on_hover_text(detail);
+}
+
+fn settings(ui: &mut egui::Ui, studio: &mut Studio) {
+    let language = studio.prefs.language;
+    ui.set_min_width(360.0);
+    ui.add_enabled_ui(studio.server.is_none(), |ui| {
+        ui.strong(language.text("TCP connection", "TCP 连接"));
+        ui.horizontal(|ui| {
+            ui.label(language.text("Address", "地址"));
+            ui.add(egui::TextEdit::singleline(&mut studio.prefs.listener.host).desired_width(160.0))
+                .on_hover_text(language.text(
+                    "0.0.0.0 listens on all local IPv4 interfaces. Remote clients use this computer's reachable IP address.",
+                    "0.0.0.0 监听所有本机 IPv4 网卡。远端连接时填写本机可达的 IP 地址。",
+                ));
+            ui.label(language.text("Port", "端口"));
+            ui.add(egui::DragValue::new(&mut studio.prefs.listener.port).range(1..=65535));
+        });
+        ui.separator();
+        ui.strong(language.text("Playback history", "回放历史"));
+        ui.add(egui::TextEdit::singleline(&mut studio.prefs.history_directory).desired_width(340.0))
+            .on_hover_text(language.text("History directory", "历史缓存目录"));
+        ui.horizontal(|ui| {
+            ui.label(language.text("Capacity", "容量"));
+            ui.add(egui::DragValue::new(&mut studio.prefs.history_budget_gib).range(1..=1024).suffix(" GiB"))
+                .on_hover_text(language.text(
+                    "The oldest history is removed when capacity is reached. Live reception continues.",
+                    "达到容量后淘汰最早的历史，实时接收继续。",
+                ));
+            ui.label(language.text("Refresh", "刷新"));
+            ui.add(egui::DragValue::new(&mut studio.prefs.live_refresh_hz).range(15..=120).suffix(" Hz"));
+        });
+        receive_storage_settings(ui, &mut studio.prefs);
+        ui.separator();
+        ui.checkbox(&mut studio.prefs.auto_capture, language.text("Save incoming recordings", "自动保存录制"));
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut studio.prefs.capture_directory).desired_width(240.0))
+                .on_hover_text(language.text("Recording directory", "录制目录"));
+            if ui.add_enabled(!studio.file_picker.is_busy(), egui::Button::new(language.text("Browse…", "选择…"))).clicked() {
+                studio.pick_file(PickerKind::RecordingDirectory, ui.ctx().clone());
+                ui.close();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(language.text("File limit", "文件上限"));
+            ui.add(egui::DragValue::new(&mut studio.prefs.raw_capture_limit_gib).range(0..=16384).suffix(" GiB"))
+                .on_hover_text(language.text(
+                    "0 means unlimited. A quota or write failure stops the recording file; live reception continues. Each connection uses a new .pvdstream file. Incomplete recordings remain .partial.",
+                    "0 表示不限容量。达到上限或写入失败时停止保存文件，实时接收继续。每次连接生成新的 .pvdstream 文件，不完整的录制保留为 .partial。",
+                ));
+        });
+    });
+    if studio.server.is_some() {
+        ui.label(
+            egui::RichText::new(language.text(
+                "Stop listening to edit connection and recording settings.",
+                "停止监听后可修改连接和录制设置。",
+            ))
+            .small()
+            .color(MUTED),
+        );
+    }
+    if let Some(path) = &studio.capture_path {
+        ui.add(egui::Label::new(path.display().to_string()).truncate())
+            .on_hover_text(path.display().to_string());
+    }
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(language.text("Language", "语言"));
+        egui::ComboBox::from_id_salt("interface-language")
+            .selected_text(studio.prefs.language.label())
+            .show_ui(ui, |ui| {
+                for option in [Language::Chinese, Language::English] {
+                    ui.selectable_value(&mut studio.prefs.language, option, option.label());
+                }
+            });
+        if ui
+            .button(language.text("Reset layout", "重置布局"))
+            .clicked()
+        {
+            studio.prefs.dock = Preferences::default().dock;
+        }
+    });
+}
