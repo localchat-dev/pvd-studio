@@ -28,7 +28,9 @@ static PxHeightField* terrain(FeatureContext& context, bool ceiling) {
     description.nbColumns = 5;
     description.samples.data = samples.data();
     description.samples.stride = sizeof(PxHeightFieldSample);
+#if PX_PHYSICS_VERSION_MAJOR == 3
     description.thickness = ceiling ? 1.5f : -2.0f;
+#endif
     return feature_require(context.cooking->createHeightField(description, context.physics->getPhysicsInsertionCallback()), "height field");
 }
 
@@ -83,7 +85,7 @@ int main(int argc, char** argv) {
         if (argc != 3) throw std::runtime_error("Usage: pvd-heightfield capture.pvdstream truth.json");
         std::ofstream truth(argv[2], std::ios::trunc);
         if (!truth) throw std::runtime_error("cannot open truth output");
-        truth << std::setprecision(9) << "{\"sdk\":\"3.4.2\",\"frames\":[";
+        truth << std::setprecision(9) << "{\"sdk\":\"" << feature_sdk_version() << "\",\"frames\":[";
         FeatureContext context(argv[1]);
         auto* field = terrain(context, false);
         auto* ceiling = terrain(context, true);

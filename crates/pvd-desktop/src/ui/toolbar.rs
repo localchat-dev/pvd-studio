@@ -9,7 +9,7 @@ pub(super) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
         ui.add(
             egui::TextEdit::singleline(&mut studio.path_input)
                 .hint_text(language.text("Open or drop a capture", "打开或拖入录制文件"))
-                .desired_width((ui.available_width() - 460.0).max(120.0)),
+                .desired_width((ui.available_width() - 520.0).max(120.0)),
         );
         if ui.button(language.text("Open", "打开")).clicked() {
             if studio.path_input.trim().is_empty() {
@@ -36,6 +36,7 @@ pub(super) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
             studio.request_ui_action(ui.ctx(), "toolbar-close", UiAction::Close);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            help::menu(ui, language);
             settings_menu(ui, language.text("Settings", "设置"), |ui| {
                 egui::ScrollArea::vertical()
                     .max_height(600.0)
@@ -70,6 +71,7 @@ pub(super) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         playback(ui, studio);
+        frame_sources::show(ui, studio);
         ui.separator();
         let source = studio.source_text(language);
         let name = std::path::Path::new(source)
@@ -204,6 +206,22 @@ fn settings(ui: &mut egui::Ui, studio: &mut Studio) {
             .on_hover_text(path.display().to_string());
     }
     ui.separator();
+    ui.menu_button(language.text("Panels", "面板"), |ui| {
+        for panel in Panel::ALL {
+            let mut visible = studio.prefs.dock.find_tab(&panel).is_some();
+            let response = ui.add_enabled(
+                panel.is_closeable(),
+                egui::Checkbox::new(&mut visible, panel.label(language)),
+            );
+            if response.changed() {
+                if visible {
+                    studio.prefs.show_panel(panel);
+                } else {
+                    studio.prefs.hide_panel(panel);
+                }
+            }
+        }
+    });
     ui.horizontal(|ui| {
         ui.label(language.text("Language", "语言"));
         egui::ComboBox::from_id_salt("interface-language")

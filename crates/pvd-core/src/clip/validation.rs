@@ -27,8 +27,16 @@ impl ValidationState {
             | Action::Debug(id, ..)
             | Action::Contacts(id, ..) => object_bytes(state, *id),
             Action::ClearDebug(ids) => ids.iter().map(|id| object_bytes(state, *id)).sum(),
+            Action::ReplaceDebug(_) => state
+                .debug_draw
+                .values()
+                .map(|draw| {
+                    (draw.capacity() - draw.len()) * std::mem::size_of::<Primitive>()
+                        + crate::debug_windows::primitive_bytes(draw)
+                })
+                .sum(),
             Action::Error(_) => 0,
-            Action::Camera(name, _) => state
+            Action::Camera(name, _) | Action::RemoveCamera(name) => state
                 .cameras
                 .get(name)
                 .map_or(0, |_| crate::camera_entry_bytes(name)),

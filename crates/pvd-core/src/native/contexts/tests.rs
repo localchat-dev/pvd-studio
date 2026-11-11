@@ -226,6 +226,43 @@ fn cancelled_or_budget_refused_mapping_is_not_published() {
 }
 
 #[test]
+fn collected_scene_lifetimes_exclude_reused_sources_without_an_action_log() {
+    let mut builder = builder(false);
+    let sources = BTreeMap::from([(7, 0x1000), (8, 0x2000)]);
+    let mut contexts = Collector::from_state(&mut builder, &sources, &mut 0, &mut || true).unwrap();
+    let class = Name {
+        namespace: 1,
+        name: 2,
+    };
+    for event in [
+        Event::DestroyInstance { id: 7 },
+        Event::CreateInstance { class, id: 7 },
+    ] {
+        push(&mut builder, event).unwrap();
+    }
+    contexts.observe(&mut builder, &sources, 7, &mut 0).unwrap();
+    builder.recording.actions = Default::default();
+    contexts.install(&mut builder);
+    let contexts = builder.recording.native_scene_contexts.as_ref().unwrap();
+    assert_eq!(contexts.source(8, 0), Some(0x2000));
+    assert_eq!(contexts.source(7, 0), None);
+    assert_eq!(contexts.source(7, 1), None);
+}
+
+#[test]
+fn cancelled_collector_does_not_publish_a_mapping() {
+    let mut builder = builder(false);
+    let failure = Collector::from_state(&mut builder, &BTreeMap::new(), &mut 0, &mut || false)
+        .err()
+        .unwrap();
+    assert_eq!(
+        failure.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::Interrupted
+    );
+    assert!(builder.recording.native_scene_contexts.is_none());
+}
+
+#[test]
 fn mapped_stages_preserve_window_duplicate_clock_and_cancellation_checks() {
     let mut recording = recording();
     let cancel = AtomicBool::new(false);

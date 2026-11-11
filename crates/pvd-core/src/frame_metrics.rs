@@ -74,8 +74,26 @@ fn context(recording: &Recording, scene: u64, generation: u32) -> Option<u64> {
             .native_scene_contexts
             .as_ref()?
             .source(scene, generation)
-    } else {
+    } else if recording
+        .frame_sources
+        .source(crate::frame_sources::FrameSourceKey::Legacy)
+        .is_some()
+    {
         Some(scene)
+    } else {
+        recording
+            .frame_sources
+            .source(crate::frame_sources::FrameSourceKey::Captured {
+                section: crate::frame_sources::FrameSection::PhysX,
+                source: scene,
+            })
+            .filter(|source| {
+                source
+                    .frames()
+                    .rev()
+                    .any(|frame| frame.scene.is_some_and(|object| object.id == scene))
+            })
+            .map(|_| scene)
     }
 }
 
@@ -84,9 +102,13 @@ pub fn supports_stages(recording: &Recording, scene: u64, generation: u32) -> bo
 }
 
 pub fn source_context(recording: &Recording, scene: u64, generation: u32) -> Result<u64, Error> {
-    context(recording, scene, generation).ok_or_else(|| error(
-        "fixed PhysX stage metrics require a unique PVD3 database Scene lifetime mapping: profile context uses SDK source pointers, while scene IDs are container-local; reused or unmapped contexts remain unavailable; use an exact event curve with an explicit reference scene window",
-    ))
+    context(recording, scene, generation).ok_or_else(|| {
+        error(if recording.source == RecordingSource::Pvd3Database {
+            "fixed PhysX stage metrics require a unique PVD3 database Scene lifetime mapping: profile context uses SDK source pointers, while scene IDs are container-local; reused or unmapped contexts remain unavailable; use an exact event curve with an explicit reference scene window"
+        } else {
+            "fixed PhysX stage metrics require a captured PhysX frame source associated with a PxScene; ApexFrame clocks and unproven source objects do not define PhysX stage windows"
+        })
+    })
 }
 
 pub fn sample(
@@ -126,22 +148,28 @@ pub fn sample(
     let boundaries: Vec<_> = recording
         .frames
         .iter()
-        .filter(|frame| frame.scene_id == scene)
+        .filter(|frame| recording.frame_matches_scene(frame, scene))
         .collect();
-    let matching = |span: &&ProfileSpan| {
+    let analysis = if metric == Metric::FrameInterval {
+        &recording.analysis
+    } else {
+        crate::native::analysis_history::end_analysis(recording)?
+    };
+    let matching = |span: &ProfileSpan| {
         span.context == context
             && span.thread == CROSS_THREAD_ID
-            && recording.analysis.profile_zone_name(span.zone) == Some("PhysXSDK")
-            && recording.analysis.profile_event_name(span.zone, span.event) == Some(metric.name())
+            && analysis.profile_zone_name(span.zone) == Some("PhysXSDK")
+            && analysis.profile_event_name(span.zone, span.event) == Some(metric.name())
     };
-    let mut points = attribute(
-        &boundaries,
-        recording.analysis.profile_spans().filter(matching),
-        metric,
-        frames,
-        scale,
-        cancelled,
-    )?;
+    let spans = (metric != Metric::FrameInterval)
+        .then(|| crate::native::analysis_history::Spans::new(recording, usize::MAX, cancelled))
+        .transpose()?;
+    let spans = spans.into_iter().flatten().filter_map(|span| match span {
+        Ok(span) if matching(&span) => Some(Ok(span)),
+        Ok(_) => None,
+        Err(failure) => Some(Err(failure)),
+    });
+    let mut points = attribute(&boundaries, spans, metric, frames, scale, cancelled)?;
     for point in &mut points {
         if cancelled.load(Ordering::Relaxed) {
             return Err(error("frame metric sampling cancelled"));
@@ -149,10 +177,11 @@ pub fn sample(
         let Some(frame) = recording.frame_info(point.frame) else {
             return Err(error("frame metric sample index is out of range"));
         };
-        if frame.scene_id != scene {
+        if !recording.frame_matches_scene(frame, scene) {
             continue;
         }
         if metric != Metric::FrameInterval
+            && !crate::native::analysis_history::available(recording)
             && point.frame < recording.analysis.profile_summary().first_retained_frame
         {
             point.milliseconds = None;
@@ -198,9 +227,9 @@ pub fn sample(
     Ok(points)
 }
 
-fn attribute<'a>(
+fn attribute(
     boundaries: &[&FrameInfo],
-    spans: impl Iterator<Item = &'a ProfileSpan>,
+    spans: impl Iterator<Item = Result<ProfileSpan, Error>>,
     metric: Metric,
     requested: &[usize],
     scale: f64,
@@ -245,6 +274,7 @@ fn attribute<'a>(
     }
     if metric != Metric::FrameInterval && monotonic {
         for span in spans {
+            let span = span?;
             if cancelled.load(Ordering::Relaxed) {
                 return Err(error("frame metric sampling cancelled"));
             }
@@ -315,7 +345,7 @@ mod tests {
         let spans = [span(20, 50), span(110, 180), span(120, 150), span(180, 220)];
         let points = attribute(
             &frames.iter().collect::<Vec<_>>(),
-            spans.iter(),
+            spans.iter().cloned().map(Ok),
             Metric::Solver,
             &[0, 1, 2, 3, 4],
             0.1,

@@ -8,6 +8,8 @@ mod cold_seek_tests;
 #[cfg(test)]
 mod disk_accounting;
 #[cfg(test)]
+mod frame_source_tests;
+#[cfg(test)]
 mod full_update_tests;
 mod object_keys;
 #[cfg(test)]
@@ -31,6 +33,10 @@ use crate::{
     contacts::Contact,
     debug_draw::Primitive,
     error,
+    frame_sources::{
+        FrameBinding, FrameDirectory, FrameDirectoryLimits, FrameSection, FrameSourceKey,
+        SourceFrame,
+    },
     metrics::{Metrics, Stage},
 };
 use analysis_cache::AnalysisCache;
@@ -57,6 +63,7 @@ const MAGIC: &[u8; 8] = b"PVDHIS03";
 const MAX_RECORD: usize = 64 << 20;
 const MAX_INDEX_FRAMES: usize = 1_000_000;
 const MAX_ERRORS: usize = 512;
+const MAX_DISPLAY_DIRTY_BYTES: usize = 8 << 20;
 const LARGE_PROPERTY_BYTES: usize = 4096;
 const SERIALIZATION_CACHE_BYTES: usize = 256 << 10;
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1951,6 +1958,17 @@ pub(crate) struct Streaming {
     pub pending: SceneUpdate,
     pub frame: Option<FrameInfo>,
     pub frames_seen: usize,
+    requested_source: Option<FrameSourceKey>,
+    automatic_source: Option<FrameSourceKey>,
+    pub selected_source: Option<FrameSourceKey>,
+    pub display_analysis: Option<SharedAnalysis>,
+    pub display_source_frame: Option<(FrameSourceKey, SourceFrame)>,
+    display_dirty: BTreeSet<u64>,
+    display_cameras_dirty: BTreeSet<String>,
+    display_errors_dirty: bool,
+    display_dirty_bytes: usize,
+    display_requires_full: bool,
+    display_crossed_source: bool,
     pub state_bytes: usize,
     pub analysis_inputs: Vec<AnalysisInput>,
     analysis_input_bytes: usize,
@@ -1964,17 +1982,113 @@ impl Streaming {
             dirty: BTreeSet::new(),
             errors_dirty: false,
             cameras_dirty: BTreeSet::new(),
-            pending: SceneUpdate {
-                replace_all: true,
-                ..Default::default()
-            },
+            pending: SceneUpdate::default(),
             frame: None,
             frames_seen: 0,
+            requested_source: None,
+            automatic_source: None,
+            selected_source: None,
+            display_analysis: None,
+            display_source_frame: None,
+            display_dirty: BTreeSet::new(),
+            display_cameras_dirty: BTreeSet::new(),
+            display_errors_dirty: false,
+            display_dirty_bytes: 0,
+            display_requires_full: true,
+            display_crossed_source: false,
             state_bytes: 0,
             analysis_inputs: Vec::new(),
             analysis_input_bytes: 0,
             analysis_failure: None,
             errors: VecDeque::new(),
+        }
+    }
+    pub fn frame_directory() -> FrameDirectory {
+        FrameDirectory::new(FrameDirectoryLimits {
+            // The history writer retires its oldest segment after committing the new frame.
+            frames: MAX_INDEX_FRAMES + 1,
+            ..FrameDirectoryLimits::default()
+        })
+    }
+    pub fn memory_bytes(&self) -> usize {
+        self.state_bytes.saturating_add(self.display_dirty_bytes)
+    }
+    pub fn set_frame_source(&mut self, source: Option<FrameSourceKey>) -> bool {
+        self.requested_source = source;
+        self.select_frame_source()
+    }
+    fn select_frame_source(&mut self) -> bool {
+        let selected = self.requested_source.or(self.automatic_source);
+        if selected == self.selected_source {
+            return false;
+        }
+        self.selected_source = selected;
+        self.refresh_frame_source();
+        true
+    }
+    pub fn refresh_frame_source(&mut self) {
+        self.pending = SceneUpdate::default();
+        self.frame = None;
+        self.display_source_frame = None;
+        self.display_requires_full = true;
+        self.clear_display_changes();
+    }
+    fn clear_display_changes(&mut self) {
+        self.display_dirty.clear();
+        self.display_cameras_dirty.clear();
+        self.display_errors_dirty = false;
+        self.display_dirty_bytes = 0;
+        self.display_crossed_source = false;
+    }
+    fn observe_frame_source(&mut self, source: FrameSourceKey) {
+        let promotes_physx = matches!(
+            self.automatic_source,
+            Some(FrameSourceKey::Captured {
+                section: FrameSection::Apex,
+                ..
+            })
+        ) && matches!(
+            source,
+            FrameSourceKey::Captured {
+                section: FrameSection::PhysX,
+                ..
+            }
+        );
+        if self.automatic_source.is_none() || promotes_physx {
+            self.automatic_source = Some(source);
+            self.select_frame_source();
+        }
+    }
+    pub fn prune_frame_sources(&self, directory: &mut FrameDirectory) {
+        let first = self
+            .history
+            .frame_infos
+            .first()
+            .map_or(self.frames_seen, |info| info.index);
+        directory.discard_before(first);
+    }
+    fn track_display_changes(&mut self, action: &Action, ids: &[u64], limit: usize) {
+        if self.display_requires_full {
+            return;
+        }
+        for &id in ids {
+            if self.display_dirty.insert(id) {
+                self.display_dirty_bytes = self.display_dirty_bytes.saturating_add(64);
+            }
+        }
+        match action {
+            Action::Error(_) => self.display_errors_dirty = true,
+            Action::Camera(name, _) | Action::RemoveCamera(name)
+                if self.display_cameras_dirty.insert(name.clone()) =>
+            {
+                self.display_dirty_bytes = self.display_dirty_bytes.saturating_add(name.len() + 64);
+            }
+            _ => {}
+        }
+        if self.display_dirty_bytes > MAX_DISPLAY_DIRTY_BYTES || self.memory_bytes() > limit {
+            // Bookkeeping may collapse to a replacement without retaining unselected object payloads.
+            self.display_requires_full = true;
+            self.clear_display_changes();
         }
     }
     pub fn analysis_input(&mut self, input: AnalysisInput) {
@@ -1994,6 +2108,12 @@ impl Streaming {
         state: &mut SceneState,
         limit: usize,
     ) -> Result<(), Error> {
+        let mut replaced_ids = Vec::new();
+        if let Action::ReplaceDebug(draw) = &action {
+            replaced_ids.extend(state.debug_draw.keys().chain(draw.keys()).copied());
+            replaced_ids.sort_unstable();
+            replaced_ids.dedup();
+        }
         let ids: &[u64] = match &action {
             Action::Create(object) => std::slice::from_ref(&object.id),
             Action::Destroy(id)
@@ -2003,7 +2123,8 @@ impl Streaming {
             | Action::Debug(id, ..)
             | Action::Contacts(id, ..) => std::slice::from_ref(id),
             Action::ClearDebug(ids) => ids,
-            Action::Error(_) | Action::Camera(..) => &[],
+            Action::ReplaceDebug(_) => &replaced_ids,
+            Action::Error(_) | Action::Camera(..) | Action::RemoveCamera(_) => &[],
         };
         let before = action_bytes(state, &action, ids);
         if let Action::Error(event) = &action {
@@ -2013,7 +2134,7 @@ impl Streaming {
             }
             self.errors.push_back((self.frames_seen, event.clone()));
         }
-        if let Action::Camera(name, _) = &action {
+        if let Action::Camera(name, _) | Action::RemoveCamera(name) = &action {
             self.cameras_dirty.insert(name.clone());
         }
         action.apply(state);
@@ -2030,22 +2151,26 @@ impl Streaming {
                 "current live scene exceeds its bounded object/resource budget",
             ));
         }
+        self.track_display_changes(&action, ids, limit);
         self.dirty.extend(ids.iter().copied());
         Ok(())
     }
     pub fn complete(
         &mut self,
-        timestamp: u64,
-        scene_id: u64,
+        info: FrameInfo,
+        binding: FrameBinding,
         state: &SceneState,
         analysis: &SharedAnalysis,
-    ) {
+        directory: &mut FrameDirectory,
+    ) -> Result<(), Error> {
         let _timer = self.history.metrics.measure(Stage::FrameComplete);
-        let info = FrameInfo {
-            index: self.frames_seen,
-            timestamp,
-            scene_id,
-        };
+        if info.index != self.frames_seen {
+            return Err(error("live frame boundary is not in capture order"));
+        }
+        let next_frame = self
+            .frames_seen
+            .checked_add(1)
+            .ok_or_else(|| error("live frame count overflow"))?;
         let patch = {
             let _timer = self.history.metrics.measure(Stage::FrameCapture);
             let mut patch = SceneUpdate::capture(state, &self.dirty, self.errors_dirty);
@@ -2063,13 +2188,59 @@ impl Streaming {
             analysis,
             std::mem::take(&mut self.analysis_inputs),
         );
+        let retained = self
+            .history
+            .frame_infos
+            .last()
+            .is_some_and(|last| last.index == info.index);
+        directory.observe(info.index, binding, retained)?;
+        self.frames_seen = next_frame;
+        self.prune_frame_sources(directory);
         self.analysis_input_bytes = 0;
-        self.pending.merge(patch);
+        self.observe_frame_source(binding.source);
+        if self.selected_source == Some(binding.source) {
+            let display_patch = if self.display_requires_full {
+                SceneUpdate::full(state)
+            } else if self.display_crossed_source {
+                let mut display =
+                    SceneUpdate::capture(state, &self.display_dirty, self.display_errors_dirty);
+                display.cameras = self
+                    .display_cameras_dirty
+                    .iter()
+                    .map(|name| (name.clone(), state.cameras.get(name).copied()))
+                    .collect();
+                display
+            } else {
+                patch
+            };
+            self.pending.merge(display_patch);
+            self.display_source_frame = Some((
+                binding.source,
+                SourceFrame {
+                    index: info.index,
+                    ordinal: directory
+                        .source(binding.source)
+                        .ok_or_else(|| {
+                            error("live frame source is absent from its observed directory")
+                        })?
+                        .observed_frames()
+                        .checked_sub(1)
+                        .ok_or_else(|| error("live source frame ordinal is absent"))?,
+                    source_object: binding.source_object,
+                    scene: binding.scene,
+                },
+            ));
+            self.frame = Some(info);
+            self.display_analysis = Some(analysis.clone());
+            self.display_requires_full = false;
+            self.clear_display_changes();
+        } else {
+            self.display_crossed_source = true;
+        }
         self.dirty.clear();
         self.errors_dirty = false;
         self.cameras_dirty.clear();
-        self.frames_seen += 1;
-        self.frame = Some(info);
+        Ok(())
     }
     pub fn snapshot(&self) -> DiskRecording {
         self.history.snapshot()
@@ -2078,7 +2249,7 @@ impl Streaming {
 
 fn action_bytes(state: &SceneState, action: &Action, ids: &[u64]) -> usize {
     match action {
-        Action::Camera(name, _) => state
+        Action::Camera(name, _) | Action::RemoveCamera(name) => state
             .cameras
             .get(name)
             .map_or(0, |_| camera_entry_bytes(name)),

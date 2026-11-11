@@ -10,6 +10,7 @@ pvd-cache/
 __pycache__/
 *.py[cod]
 *.pvdstream
+*.pvd
 *.pvdcapture
 *.pxd
 *.pxd2

@@ -182,13 +182,14 @@ fn shared_binding_copy_budget_is_reserved_before_push_or_remove_mutates_state() 
         let value_copy = builder.state.objects[&1].properties["Children"].retained_bytes();
         let binding_copy = 32 + bindings(&builder.state).len() * 80;
         let required = action.retained_bytes() + value_copy + binding_copy;
-        builder.memory_limit = required - 1;
+        let metadata = builder.recording.frame_sources.index_bytes();
+        builder.memory_limit = metadata + required - 1;
         assert!(builder.apply_action(action.clone()).is_err());
         assert_eq!(builder.retained_bytes, 0);
         assert_eq!(builder.recording.actions.len(), old_actions);
         assert_eq!(wire(&builder.state), old_wire);
         assert!(Arc::ptr_eq(bindings(&builder.state), bindings(&held)));
-        builder.memory_limit = required;
+        builder.memory_limit = metadata + required;
         builder.apply_action(action).unwrap();
         assert_eq!(builder.retained_bytes, required);
         assert_eq!(wire(&held), old_wire);

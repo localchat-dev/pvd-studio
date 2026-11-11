@@ -84,14 +84,25 @@ fn filter(data: [u32; 4], flags: u32, expected: &Value) {
 #[test]
 #[ignore = "requires official SDK pvd-query-shapes capture and independent result JSON"]
 fn sweep_overlap_and_batched_queries_match_sdk_results_across_lifetimes() {
-    let capture = std::env::var_os("PVD_QUERY_SHAPES_CAPTURE")
+    verify_queries("PVD_QUERY_SHAPES_CAPTURE", "physx-3.4", "3.4.2");
+}
+
+#[test]
+#[ignore = "requires PhysX 4.1.2 query capture and same-run SDK hit truth"]
+fn physx41_sweep_overlap_and_batched_queries_match_sdk_results_across_lifetimes() {
+    verify_queries("PVD_QUERY_SHAPES41_CAPTURE", "physx-4.1", "4.1.2");
+}
+
+fn verify_queries(variable: &str, name: &str, version: &str) {
+    let capture = std::env::var_os(variable)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../captures/physx-3.4-query-shapes.pvdstream")
+                .join(format!("../../captures/{name}-query-shapes.pvdstream"))
         });
     let truth: Value =
         serde_json::from_str(&fs::read_to_string(capture.with_extension("json")).unwrap()).unwrap();
+    assert_eq!(truth["sdk"].as_str(), Some(version));
     let recording = Recording::from_path(capture).unwrap();
     assert_eq!(
         recording.frame_count(),

@@ -228,15 +228,25 @@ impl MemorySource for ResidentAnalysis {
                 } => {
                     churn.allocations += 1;
                     churn.allocated_bytes += allocation.size;
+                    churn.surviving_allocations += 1;
+                    churn.surviving_bytes += allocation.size;
                     if let Some(replaced) = replaced {
                         churn.replaced_addresses += 1;
                         churn.replaced_bytes += replaced.size;
+                        if replaced.received_frame == frame {
+                            churn.surviving_allocations -= 1;
+                            churn.surviving_bytes -= replaced.size;
+                        }
                     }
                 }
                 EventKind::Free { allocation } => {
                     churn.frees += 1;
                     if let Some(allocation) = allocation {
                         churn.freed_bytes += allocation.size;
+                        if allocation.received_frame == frame {
+                            churn.surviving_allocations -= 1;
+                            churn.surviving_bytes -= allocation.size;
+                        }
                     } else {
                         churn.unmatched_frees += 1;
                     }

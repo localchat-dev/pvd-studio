@@ -7,12 +7,12 @@
 | 目录 | 布局与含义 | 证据及边界 |
 | --- | --- | --- |
 | 当前源ID映射 | u32数量，每项`u64 source + u32 local_id` | save `0x1400C3B80–0x1400C3BC5`；destroyInstance `0x1400BFAB0`移除source键。它是当前映射，不是完整代际历史 |
-| 具名相机目录 | u32数量，每项`u32 name_StringHandle + u32 local_id` | setCamera `0x1400C40C0–0x1400C43B0`创建/更新相机实例。三份真实表均为空，非空解释只有静态证据，尚未实现容器相机回放 |
+| 具名相机目录 | u32数量，每项`u32 name_StringHandle + u32 local_id` | setCamera `0x1400C40C0–0x1400C43B0`创建/更新相机实例。三份真实表均为空；非空解析与回放有静态证据及构造覆盖，见[相机与显示属性](native-settings.md) |
 | Section索引 | 每行`u64 begin_ticks, begin_event, end_ticks, end_event` | serializer `0x1400BCBD0–0x1400BCD60`，addSectionEvent `0x1400BDF20–0x1400BE240`；246个真实帧行与type-8起止事件相符。开放/推断边界未由这些样例证明 |
 | 内存事件实例 | 两个u32 local ID，缺失值`0xffffffff` | save `0x1400C3CDA–0x1400C3D0A`；setMemoryEventInstances `0x1400C4530`。baseline为两个缺失值，rich/limits为`[1,3]`；内部实例不一定出现在SDK源ID映射 |
 | 内存名称目录 | 数量及`type_string, file_string, u32 line, u32 index` | addMemoryEventEntry `0x1400BDD00–0x1400BDDD0`，save `0x1400C3D31–0x1400C3E03`；三样例分别0、273、224项。这一尾部是最终内存名称目录，不是显示设置 |
 
-Profile目录原有的opaque u64仍保持未知；名称目录都只代表保存时内容，不能推导名称生效历史。该目录辨识用于独立的首帧裁尾写入实验，三份原文件逐字节重建、十五个前缀逐帧正倒序及分析核对通过。实验尚未加入正式保存入口，也未通过原版打开、倒放和再次保存验证，范围和复现见 [原版前缀写出实验](native-prefix-experiment.md)。
+Profile目录中的opaque u64仍保持未知；名称目录都只代表保存时内容，不能推导名称生效历史。受限的整份重写与区间裁剪由独立写出入口提供，范围和验证方法见[原版容器保存](native-export.md)。内部字节重建和回放核对不替代原版打开、倒放和再次保存验证。
 
 ## 非空起点快照
 
@@ -20,9 +20,9 @@ Profile目录原有的opaque u64仍保持未知；名称目录都只代表保存
 
 静态依据是 `writeModelInstance 0x1400E8190`、`writeInstanceData 0x1400E83C0` 和 `readInstanceData 0x1400E5B60`。baseline/rich 保存实例表的字段与 type-10 时刻已传输状态逐项比较；真实非空首快照仍需独立输入。
 
-保存的profile/memory/renderer事件属性只恢复为值，不当作新事件执行；起点之前的性能开始、完整存活分配和错误历史顺序无法由快照补出，导入提供诊断。错误数组保留为后续可追加的值，不伪造事件编号。自写两页、8事件、3帧用例验证跨页更新/销毁/数组和正反随机回放；它不是原版实际输出。
+保存的profile/memory/renderer事件属性只恢复为值，不当作新事件执行；起点之前的性能开始、完整存活分配和错误历史顺序无法由快照补出，导入提供诊断。错误数组保留为后续可追加的值，并提供独立的[起点已有错误列表](native-errors.md)，不伪造接收帧或事件编号。自写两页、8事件、3帧用例验证跨页更新/销毁/数组和正反随机回放；它不是原版实际输出。
 
-真实非空首快照、中段裁剪和多页文件仍需配对采集。摘要与源文件相同的副本不能作为裁剪证据；页数量以实际目录为准，不能由文件名或预计帧数判断。
+原版自身保存的非空首快照、中段裁剪和多页文件仍需配对采集。项目导出的受限中段不能替代这些来源证据；摘要与源文件相同的副本不能作为裁剪证据。页数量以实际目录为准，不能由文件名或预计帧数判断。
 
 适配器读取 PVD3 数据库 v1 的有界子集。已有原版保存文件及同次 SDK 流用于核对对象、属性、几何、生命周期、分析、错误和回放。绘制的真实配对覆盖 JointFrames、四类限位、RGB 三角形及同帧多次提交，见[原版绘制](native-debug-draw.md)；这不代表完整格式或双向读写兼容。
 
@@ -86,7 +86,15 @@ F06 的关键指令：
 1400c4a0b  cmove eax,ecx
 ```
 
-这确认至少存在两条不同的二进制格式路径。注意 F08 的顶层文件分派只观察到直接比较原生字节序的两个常量，不能因 F05 有字节交换就声称原版顶层打开路径支持所有大端文件。
+这确认至少存在两条不同的二进制格式路径。注意 F08 的引擎文件分派只观察到直接比较原生字节序的两个常量，不能因 F05 有字节交换就声称原版顶层打开路径支持所有大端文件。
+
+## 已观察：`.pvd` ZIP 包装入口
+
+匹配的 EXE/MAP 中，文件对话框、拖放和文件参数均调用 `PVDMainWindow::open`。该函数先检查后缀：`pvd` 进入 `OpenZip → GetZipItem → UnzipItem`，直接 `pxd2` 则交给 `PvdEngine::load`。ZIP 分支遍历成员，选择后缀精确为小写 `pxd2` 的文件，解包后再调用同一引擎入口。因此底层的两个内容签名不能排除上层 ZIP 包装。
+
+ZIP reader 的实际指令检查本地头、中央目录和末尾目录签名，并处理 stored/deflate。原版主窗口会解压所有成员；多个匹配时后面的条目覆盖先前选择。这些是静态控制流证据，不能替代原版实际生成包的打开、回放和重存配对。
+
+项目提供唯一录制成员、有限大小和严格结构校验的[录制包读取](pvd-archive.md)，不提取附属文件、不写出 ZIP。内层仍受已支持 SDK stream 或 PVD3 database 的各自边界约束；旧 `.pxd` 没有由此获得格式证据。
 
 ## 已观察：Save 入口与容器前缀
 
@@ -123,7 +131,7 @@ F11 的两块元数据调用还通过原版虚表槽位复核：
 
 ## 文件名与导出库的边界
 
-EXE ASCII 字符串还包含 `*.pxd3`、`pxd3`、`backingFile`；MAP 将 `pxd3` 放在 `PvdEngine.obj`。这与临时 backing-file 路径是值得继续核对的线索，**不构成公开 `.pxd3` 兼容声明**。打开过滤字符串同时存在 `Clip Files (*.pvd *.pxd2)`，与手册列出的 `.pxd/.pxd2` 不完全相同；不能把单个字符串当作完整 UI 或格式支持证明，也不把 `.pvd` 与 `.pxd` 自动等同。
+EXE ASCII 字符串还包含 `*.pxd3`、`pxd3`、`backingFile`；MAP 将 `pxd3` 放在 `PvdEngine.obj`。这与临时 backing-file 路径是值得继续核对的线索，**不构成公开 `.pxd3` 兼容声明**。打开过滤器包含 `Clip Files (*.pvd *.pxd2)`，对应上文已核对的 ZIP 包装和直接文件入口。它与手册列出的 `.pxd/.pxd2` 不完全相同；`.pvd` 包装不能作为旧 `.pxd` 读取证据。
 
 `dumpbin /exports PVD3.exe` 只列出一个导出：`NvOptimusEnablement`。`dumpbin /linkermember:1 PVDNext.lib` 只列出相应导入描述符、null descriptor/thunk 和 `__imp_NvOptimusEnablement`。所以这份 `.lib` 不是可直接链接的 PVDCore 读写 SDK；当前没有由它提供的、可在控制台无窗口调用的官方转换 API 证据。
 
@@ -153,11 +161,12 @@ EXE ASCII 字符串还包含 `*.pxd3`、`pxd3`、`backingFile`；MAP 将 `pxd3` 
 | 对象元数据 | 原版 `write`，固定 SDK `PxPvdObjectModelMetaData.cpp` 的 writer/read/各 serialize | 完整消费 baseline 103981 B、rich 148990 B，所有字符串、属性、类和消息块边界相符；保存模型中的引用 / StringHandle 是 4 B 内部值，即使 EXE 与 SDK 为 x64。 |
 | 历史元数据 | `save 0x1400EE720` / `load 0x1400ED7B0` | u64 总事件数；u32 数量 + 24 B PageFileData；u32 数量 + 24 B SnapshotInfo；u32 数量 + 16 B `{i32 id,u64 position,u32 length}` 实例位置表。 |
 | PageFileData | `writeOutPage 0x1400F4BE0` 与 `beginAddEvent 0x1400F0F90` | `{u64 first_event,u64 position,u32 event_count,u32 byte_length}`；position 相对第二次分页后的 backing 起点。 |
+| SnapshotInfo | `saveSnapshot 0x1400F3950` 与元数据 `save 0x1400EE720` | `{u64 event,u64 position,u32 byte_length,4 B padding}`；已核对 x64 构建按 24 B 整体保存，尾部填充没有初始化，写出原样保留。真实 baseline/rich 的该值均为 492，不能要求为零。 |
 | 页内容 | `writeOutPage` | u32 count + count 个 u32 偏移 + 连续事件字节；首偏移 0，严格递增，末边界取页有效长度。baseline 一页 2602 事件；rich 一页 3457 事件。 |
 | 正向应用 | `visitPvdObjectModelEventType<EventDoOperator> 0x1400E8B20` | 1 创建、2 销毁、3 属性、4 属性消息、5 插入、6 删除；3/4 的字节块后还有 u32 count + u32 undo 引用。7 数组元素更新有静态代码实现，当前两真实样例无该类型，不列实测。 |
 | 8 用户事件 | `addUserEvent`，实际动态元数据 | 本样例全部为 `_debugger_::SectionEventData`，24 B `{u64 source_stream,u64 ticks,u32 string_handle,u8 begin,3 B padding}`；240 条组成 120 帧。其他用户事件类型明确拒绝。 |
 | 9/10 存储辅助 | `EventDoOperator` 中 9 直接返回，10 只消费 i32 ID + u64 位置 | 导入从 event=0 的初始快照顺序重建自己的检查点，不使用原版 undo 来“倒减变换”。非空初始快照的受支持布局可恢复；真实原版非空起点与多页录制仍待配对验证。 |
-| 通信实例映射 | `StreamMetaData::save 0x1400C3AC0` → `0x1400BC860` | v1 + 两个 u64 时钟比例 + count 个 26 B 记录；4 B local key、8 B source、4 B local ID、两个 u32 与两个 bool。source→local 映射用于目录身份和帧归属；显示设置仍不导入。 |
+| 通信实例映射 | `StreamMetaData::save 0x1400C3AC0` → `0x1400BC860` | v1 + 两个 u64 时钟比例 + count 个 26 B 记录；4 B local key、8 B source、4 B local ID、两个 u32 与两个 bool。source→local 映射用于目录身份和帧归属；可选颜色、拾取和顶层标记按[显示属性](native-settings.md)导入。 |
 
 查询记录中原版已把字符串转换为 StringHandle。适配器按已核对的 PvdRaycast / PvdSweep / PvdOverlap 的 32 位布局与元数据指针表恢复字符串，复用现有查询解码器；结果逐帧对同次 raw 查询值核验。不存在重新模拟。
 
@@ -184,11 +193,12 @@ rich 配对文件包含 `_debugger_::PxProfileZone` 实例 2 的 `events`（属�
 
 ## API、限制与后续
 
-- `Recording::from_bytes` / `from_path` 按内容签名分派，扩展名不决定格式。`native::read_with_progress` 返回 `(Recording, ContainerInfo)`，Info 包含块尺寸、表数量、页数、历史事件数与 local→source 映射。核心不依赖 Bevy/egui。
-- 文件上限 512 MiB；单块 metadata 64 MiB；解码 metadata 与辅助索引各有 64 MiB 分配预算；数组最多一百万、历史最多两千万事件，复用 RecordingBuilder 的 512 MiB 历史预算。未知事件即使边界可知也明确失败，避免悄悄产生不完整场景。长度、溢出、页顺序、事件偏移、跨边界引用、截断和取消均有检查。单属性解码以 64 MiB / 剩余历史预算作预检，字符串句柄展开在复制前累计实际字符串长度；2 KiB 低限用例拒绝重复字符串放大。属性更新检查 owner 属于实例本类或祖先类，真实事件单字段改成其他存活对象的用例也被拒绝。
-- 核心事件进度回调可取消。`from_path_with_progress` 的数值为文件读取进度；native 索引时保持字节已读完成并继续检查取消，不能把它当准确的索引百分比。非空初始 snapshot、原版裁剪容器、跨多个历史页的真实样例仍未验收。
+- `Recording::from_bytes` / `from_path` 按内容签名分派，扩展名不决定格式。`native::read_with_progress` 使用字节切片；`native::read_path_with_progress` 使用随机读取和配置的磁盘历史。两者返回 `(Recording, ContainerInfo)`，Info 包含源尺寸、表数量、页数、历史事件数及 local→source 映射。核心不依赖 Bevy/egui。
+- 字节切片入口上限 512 MiB；文件入口不整文件载入，以 u64 偏移读取目录、页偏移表及单个事件，单次 I/O 最多 64 KiB。磁盘历史须保留完整导入范围，配额不足或发生淘汰时明确失败。超过 512 MiB 的文件在导入前建立完整摘要和分块索引，随机读取及完成后复核源字节，供后续另存校验载入身份。真实大型原版文件仍待验收；大地址构造和追加 padding 的实际文件只验证规模与 I/O 边界。
+- 单块 metadata 64 MiB；解码 metadata 与辅助索引各有 64 MiB 分配预算；数组最多一百万、历史最多两千万事件。当前状态、分析与历史分别遵循各自预算，不构成进程总内存上限。未知事件即使边界可知也明确失败。长度、溢出、页顺序、事件偏移、跨边界引用、截断和取消均有检查。单属性及 packed 查询值在展开前检查预算，字符串句柄展开按实际长度收费。属性 owner 必须属于实例本类或祖先类。
+- 核心回调可取消，文件读取、目录扫描、元数据注册及事件恢复均有检查。`native::read_path_with_progress` 报告事件进度，`Recording::from_path_with_progress` 将事件比例映射到源字节范围；该值不是磁盘 I/O 吞吐测量。非空初始 snapshot、原版裁剪容器、跨多个历史页的真实样例仍未验收。
 - 对象 `events` 原始缓冲仍保留为 Bytes；性能/内存分析按上节范围重建。`UserCustomedEvent.Events` 的已验证 20 B 错误追加记录导入独立 `UntimedErrorEvent` 列表，保留消息、源码位置、Index、容器实例及接收顺序，不添加伪造时间戳或 Actor 关联。真实 rich 的 1 条错误与配套 raw 字段和接收帧一致；非追加数组编辑明确拒绝。详见 [原版无时间戳错误](native-errors.md)。调试绘制的范围见[原版绘制](native-debug-draw.md)。相关限制由 Recording diagnostics 传递到 CLI/桌面。
-- 不支持原版容器重新编码、裁剪为 SDK 流或变更后另存原版格式。`clip::trim_scene_frames` 在入口拒绝 native magic。原样副本与格式导出是不同能力；桌面保存必须根据源格式保护扩展名。
+- `native::export` 提供受限 v1 整份重写和区间裁剪，布局及事件历史边界见[原版容器保存](native-export.md)。SDK 转原版容器未支持；`clip::trim_scene_frames` 是 SDK 流 API，在入口拒绝 native magic。原版写出使用独立入口及 `.pxd2` 扩展名保护。
 - `.pxd` 旧格式、SDK 3.0–3.3 / 4.1 保存差异、其他 PVD3 发行版、原版全部分析事件、APEX/OmniPVD 都未由这些样例证明。下一步需要非空 snapshot、长录制多页，以及多 Scene/跨刷新性能事件、可辨识分配回调和错误位置的针对性配对样例。
 
 可重复验证：

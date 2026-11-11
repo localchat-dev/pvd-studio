@@ -166,6 +166,8 @@ fn official_sdk_camera_selection_tracks_displayed_frames_and_paused_live_history
     let (frame, update) = live.take_update().unwrap();
     assert_eq!(frame, 1);
     studio.accept_live_snapshot(LiveSnapshot {
+        source_frame: None,
+        display_updated: true,
         session: 901,
         frame,
         update,
@@ -178,6 +180,8 @@ fn official_sdk_camera_selection_tracks_displayed_frames_and_paused_live_history
     let (frame, update) = live.take_update().unwrap();
     assert_eq!(frame, expected.len() - 1);
     studio.accept_live_snapshot(LiveSnapshot {
+        source_frame: None,
+        display_updated: true,
         session: 901,
         frame,
         update,

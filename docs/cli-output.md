@@ -24,6 +24,10 @@ cargo run --locked --offline -p pvd-cli -- errors captures/native/rich-paired.pv
 
 真实配对测试需要按[原版验证](native-validation.md)准备同次 rich 容器和 TCP 流，再显式执行。默认测试覆盖时间戳、末帧后错误、无完成帧及控制字符转义；构造边界不独立证明原版兼容。
 
+## 帧来源与时间
+
+`frame` 参数使用全局捕获索引，输出同时报告来源与来源内序号。属性 `csv` 保留原有列，并在末尾追加 `section,source_id,source_frame`。`seconds` / `time_seconds` 以该来源首个可见帧为零点，Legacy 使用录制首个可见帧；隐藏恢复前缀不参与计时。各来源的经过时间不表示已同步的共同时间轴，完整规则见[帧来源](frame-sources.md)。该时间与 CSV 范围的专项验收见[验证说明](validation.md#帧来源与-apex)。
+
 ## 文件导出
 
 `trim`、`repx`、`csv`、`profile-csv`、`profile-event-csv` 和 `memory-csv` 使用相同的文件发布流程。命令参数、CSV 列、采样规则和 RepX 内容保持各命令的定义；只有完整写入、缓冲刷新、文件同步和发布均成功后，才打印 `exported_rows` / `file` 等成功结果。

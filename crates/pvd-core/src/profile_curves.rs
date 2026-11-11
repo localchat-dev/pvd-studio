@@ -96,7 +96,7 @@ fn reference_frame_indices(
         let mut frames = Vec::new();
         for frame in &recording.frames {
             check_cancelled(cancelled)?;
-            if frame.scene_id == scene.id
+            if recording.frame_matches_scene(frame, scene.id)
                 && recording.disk_scene_generation(frame.index) == Some(scene.generation)
             {
                 frames.push(frame.index);
@@ -136,7 +136,9 @@ fn reference_frame_indices(
             }
         }
         action_cursor = action_end;
-        if frame.scene_id == scene.id && live_generation == Some(scene.generation) {
+        if recording.frame_matches_scene(frame, scene.id)
+            && live_generation == Some(scene.generation)
+        {
             reference_frames.push(frame.index);
         }
     }
@@ -156,7 +158,15 @@ pub struct CatalogEntry {
 
 pub fn catalog(recording: &Recording, cancelled: &AtomicBool) -> Result<Vec<CatalogEntry>, Error> {
     check_cancelled(cancelled)?;
-    catalog_source(&recording.analysis, cancelled)
+    if !crate::native::analysis_history::available(recording) {
+        return catalog_source(&recording.analysis, cancelled);
+    }
+    let analysis = crate::native::analysis_history::end_analysis(recording)?;
+    let mut entries = BTreeMap::new();
+    for span in crate::native::analysis_history::Spans::new(recording, MAX_RECORDS, cancelled)? {
+        catalog_span(&mut entries, analysis, &span?)?;
+    }
+    finish_catalog(entries, analysis, cancelled)
 }
 
 fn catalog_source(
@@ -170,15 +180,32 @@ fn catalog_source(
     let mut entries = BTreeMap::new();
     for span in analysis.profile_spans() {
         check_cancelled(cancelled)?;
-        let key = ExactKey::from((span.zone, span.event, span.thread, span.context));
-        let entry = catalog_entry(&mut entries, key, analysis)?;
-        entry.complete_spans += 1;
-        entry.first_start = Some(
-            entry
-                .first_start
-                .map_or(span.start, |tick| tick.min(span.start)),
-        );
+        catalog_span(&mut entries, analysis, span)?;
     }
+    finish_catalog(entries, analysis, cancelled)
+}
+
+fn catalog_span(
+    entries: &mut BTreeMap<ExactKey, CatalogEntry>,
+    analysis: &impl ProfileSource,
+    span: &crate::analysis::ProfileSpan,
+) -> Result<(), Error> {
+    let key = ExactKey::from((span.zone, span.event, span.thread, span.context));
+    let entry = catalog_entry(entries, key, analysis)?;
+    entry.complete_spans += 1;
+    entry.first_start = Some(
+        entry
+            .first_start
+            .map_or(span.start, |tick| tick.min(span.start)),
+    );
+    Ok(())
+}
+
+fn finish_catalog(
+    mut entries: BTreeMap<ExactKey, CatalogEntry>,
+    analysis: &impl ProfileSource,
+    cancelled: &AtomicBool,
+) -> Result<Vec<CatalogEntry>, Error> {
     for event in analysis.open_profile_events() {
         check_cancelled(cancelled)?;
         let entry = catalog_entry(&mut entries, event.key.into(), analysis)?;
@@ -304,7 +331,7 @@ pub fn sample(
     let boundaries: Vec<_> = recording
         .frames
         .iter()
-        .filter(|frame| frame.scene_id == scene.id)
+        .filter(|frame| recording.frame_matches_scene(frame, scene.id))
         .collect();
     let reference_frames = reference_frame_indices(recording, scene, cancelled)?;
     let reference_times: Vec<_> = reference_frames
@@ -315,7 +342,7 @@ pub fn sample(
         recording.frame_info(pair[0]).unwrap().timestamp
             < recording.frame_info(pair[1]).unwrap().timestamp
     });
-    let analysis = &recording.analysis;
+    let analysis = crate::native::analysis_history::end_analysis(recording)?;
     let ambiguous = analysis.profile_metadata_ambiguous(key.zone, key.event);
     let unmatched = analysis.unmatched_profile_event(key.tuple()) != 0;
     let earliest_open = analysis
@@ -331,7 +358,9 @@ pub fn sample(
             .is_none_or(|boundary| boundary.index != frame)
         {
             Status::OtherScene
-        } else if frame < analysis.profile_summary().first_retained_frame {
+        } else if !crate::native::analysis_history::available(recording)
+            && frame < analysis.profile_summary().first_retained_frame
+        {
             Status::AnalysisExpired
         } else if ambiguous {
             Status::MetadataAmbiguous
@@ -368,8 +397,8 @@ pub fn sample(
     }
     let mut ticks = vec![0u128; points.len()];
     let mut crossing = vec![0i64; windows.len() + 1];
-    for span in analysis.profile_spans() {
-        check_cancelled(cancelled)?;
+    for span in crate::native::analysis_history::Spans::new(recording, MAX_RECORDS, cancelled)? {
+        let span = span?;
         if (span.zone, span.event, span.thread, span.context) != key.tuple() {
             continue;
         }

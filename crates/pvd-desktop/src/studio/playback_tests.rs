@@ -54,6 +54,7 @@ struct TcpProgressBoundary {
     live_session: Option<u64>,
     live_profile: Option<crate::network::LiveProfileSnapshot>,
     pending_snapshot: Option<crate::network::PendingSnapshotProgress>,
+    window: serde_json::Value,
 }
 
 struct TcpProgressBoundaries {
@@ -101,7 +102,7 @@ impl TcpProgressDump {
                 "record_capacity": MAX_PROGRESS_BOUNDARIES,
                 "dropped_boundaries": boundaries.dropped,
                 "truncated": boundaries.dropped != 0,
-                "scope": "counts only in core stages; boundary/profile clocks and non-atomic snapshots remain; pending-slot peek never waits or consumes; decoder input precedes feed; completed calls include failures; no per-boundary file IO",
+                "scope": "core progress counters; optional timing trace records stage clocks; boundary/profile clocks and non-atomic snapshots remain; pending-slot peek never waits or consumes; decoder input precedes feed; completed calls include failures; no per-boundary file IO",
                 "records": &boundaries.records,
             }),
         )?;
@@ -157,6 +158,7 @@ fn progress_boundaries_are_bounded_and_dump_on_unwind_without_swallowing_failure
             live_session: Some(1),
             live_profile: None,
             pending_snapshot: None,
+            window: serde_json::Value::Null,
         });
     }
     assert_eq!(boundaries.borrow().records.len(), MAX_PROGRESS_BOUNDARIES);
@@ -451,6 +453,7 @@ impl Probe {
         previous_frame: usize,
         last_frame: usize,
         live_counts: (usize, usize),
+        window: serde_json::Value,
     ) {
         if let Some(progress) = &self.progress {
             let (live_before, live_after) = live_counts;
@@ -477,8 +480,8 @@ impl Probe {
                 live_session: self.studio.live_session,
                 live_profile,
                 pending_snapshot,
+                window: window.clone(),
             });
-            return;
         }
         if self.studio.display_trace.is_none() {
             return;
@@ -511,12 +514,34 @@ impl Probe {
             "connected": self.studio.live_connected,
             "queued_bytes": self.studio.receive_status.as_ref().map(|s| s.queued_bytes),
             "live_profile": live_profile,
+            "window": window,
         });
         writeln!(file, "{sample}").unwrap();
         file.flush().unwrap();
     }
 
+    fn committed_frame(&self, session: u64) -> usize {
+        assert_eq!(self.studio.live_session, Some(session));
+        let profile = self
+            .studio
+            .server
+            .as_ref()
+            .and_then(NetworkSession::profile_snapshot)
+            .expect("TCP playback requires core progress counters");
+        assert_eq!(
+            profile.session, session,
+            "TCP session changed during playback"
+        );
+        assert!(profile.metrics.enabled);
+        profile
+            .metrics
+            .last_committed_frame
+            .expect("TCP playback requires a committed frame")
+    }
+
     fn play_frames(&mut self, direction: i32, count: usize) -> PlaybackSnapshot {
+        let observation_started = Instant::now();
+        let session = self.studio.live_session.expect("TCP session is required");
         let live_before = self.studio.count();
         let previous_frame = self.studio.frame;
         let mut previous = previous_frame;
@@ -526,14 +551,30 @@ impl Probe {
             previous_frame,
             previous,
             (live_before, live_before),
+            serde_json::json!({ "requested_steps": count, "session": session }),
         );
+        let commit_before = self.committed_frame(session);
+        let mut commit_after;
+        let mut live_after;
+        let mut extra_started: Option<Instant> = None;
         let mut frames = Vec::new();
         let mut rebases = 0;
         let mut adjacent_steps = 0;
         let mut edge_snapshot: Option<PlaybackSnapshot> = None;
         let mut terminal = None;
         let mut scene_only_steps = 0;
-        while frames.len() < count {
+        loop {
+            assert_eq!(self.studio.playing, direction);
+            assert!(!self.studio.follow_live);
+            commit_after = self.committed_frame(session);
+            live_after = self.studio.count();
+            if extra_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(5))
+                || (frames.len() >= count
+                    && commit_after > commit_before
+                    && live_after > live_before)
+            {
+                break;
+            }
             let before_frame = self.studio.frame;
             let before_pending = self.studio.seeking;
             let before_count = self.studio.count();
@@ -552,6 +593,7 @@ impl Probe {
             }
             self.pump();
             assert!(self.studio.live_connected, "producer ended during playback");
+            let committed = self.committed_frame(session);
             // The final disk seek can complete and return to Live within the same poll.
             if forward_history
                 && completed_history_step_at_live_edge(
@@ -570,6 +612,9 @@ impl Probe {
                     "pending_before": before_pending,
                     "saved_history_frame": before_frame,
                     "completed_adjacent_steps": 1,
+                    "minimum_steps_exception": "natural_live_edge",
+                    "commit_before_live": commit_after,
+                    "decoded_before_live": live_after,
                     "seconds": self.started.elapsed().as_secs_f64(),
                 }));
                 break;
@@ -591,6 +636,9 @@ impl Probe {
                     .map(|notice| notice.text(Language::English))
                     .collect::<Vec<_>>()
             );
+            assert!(!self.studio.follow_live);
+            commit_after = committed;
+            live_after = self.studio.count();
             for &(frame, first, witness) in &self.displayed_frames {
                 if self.mode == ProbeMode::UiDemand {
                     assert!(!self.studio.analysis_ready());
@@ -624,19 +672,41 @@ impl Probe {
                 frames.push(serde_json::json!({ "frame": frame, "first": first, "seconds": self.started.elapsed().as_secs_f64(), "rebase_witness": witness }));
                 previous = frame;
             }
+            if frames.len() >= count && (commit_after <= commit_before || live_after <= live_before)
+            {
+                extra_started.get_or_insert_with(Instant::now);
+            }
         }
-        let live_after = self.studio.count();
+        let observed_steps = frames.len() + usize::from(terminal.is_some());
+        let observation_seconds = observation_started.elapsed().as_secs_f64();
+        let extra_observation_seconds =
+            extra_started.map(|started| started.elapsed().as_secs_f64());
+        let window = serde_json::json!({
+            "requested_steps": count,
+            "observed_steps": observed_steps,
+            "observation_seconds": observation_seconds,
+            "extra_observation_seconds": extra_observation_seconds,
+            "session": session,
+            "commit_before": commit_before,
+            "commit_after": commit_after,
+            "decoded_at_return": self.studio.count(),
+            "natural_live_completion": terminal,
+        });
         self.trace_playback_boundary(
             "play_frames_before_progress_assert",
             direction,
             previous_frame,
             previous,
             (live_before, live_after),
+            window.clone(),
         );
         assert!(
-            live_after > live_before,
-            "TCP decoding did not advance while history played"
+            extra_observation_seconds.is_none_or(|seconds| seconds < 5.0)
+                && commit_after > commit_before
+                && live_after > live_before,
+            "TCP core commit and UI count must advance during same-session historical playback: {window}, decoded {live_before} -> {live_after}"
         );
+        assert!(frames.len() >= count || terminal.is_some());
         let mut snapshot = if terminal.is_some() {
             edge_snapshot.unwrap()
         } else {
@@ -652,6 +722,12 @@ impl Probe {
         snapshot.progress = serde_json::json!({
             "frames": frames,
             "requested_steps": count,
+            "observed_steps": observed_steps,
+            "observation_seconds": observation_seconds,
+            "extra_observation_seconds": extra_observation_seconds,
+            "session": session,
+            "commit_before": commit_before,
+            "commit_after": commit_after,
             "observed_adjacent_steps": adjacent_steps,
             "natural_live_completion": terminal,
             "decoded_before": live_before,
@@ -829,6 +905,7 @@ fn real_sdk_tcp_playback_survives_expired_pause_and_continues_receiving_in_both_
                 ..Default::default()
             },
             receive_budget_bytes: 128 << 20,
+            progress_only: true,
             ..Default::default()
         },
         context.clone(),
@@ -883,6 +960,14 @@ fn real_sdk_tcp_playback_survives_expired_pause_and_continues_receiving_in_both_
     studio.server = Some(server);
     studio.recorded_timing = false;
     studio.playback_fps = 60.0;
+    let progress = Rc::new(RefCell::new(TcpProgressBoundaries::new()));
+    let mut progress_dump = TcpProgressDump {
+        boundaries: progress.clone(),
+        output: output.clone(),
+        mode: ProbeMode::FullAnalysis,
+        seconds: 30,
+        dumped: false,
+    };
     let mut probe = Probe {
         studio,
         context,
@@ -895,7 +980,7 @@ fn real_sdk_tcp_playback_survives_expired_pause_and_continues_receiving_in_both_
         next_sample: started,
         phase: "short_capture",
         mode: ProbeMode::FullAnalysis,
-        progress: None,
+        progress: Some(progress),
     };
     while probe.studio.count() < 10 || !probe.studio.has_history() {
         assert!(
@@ -1004,6 +1089,7 @@ fn real_sdk_tcp_playback_survives_expired_pause_and_continues_receiving_in_both_
     )
     .unwrap();
     drop(probe);
+    progress_dump.finish();
 }
 
 #[derive(Default)]
@@ -1240,17 +1326,12 @@ fn run_long_tcp_playback(mode: ProbeMode) {
         );
         true
     });
-    let progress_enabled = std::env::var_os("PVD_TCP_PROGRESS_PROBE").is_some_and(|value| {
+    if let Some(value) = std::env::var_os("PVD_TCP_PROGRESS_PROBE") {
         assert!(
             value.to_str() == Some("1"),
             "PVD_TCP_PROGRESS_PROBE must be unset or 1"
         );
-        true
-    });
-    assert!(
-        !(trace_enabled && progress_enabled),
-        "PVD_TCP_PROGRESS_PROBE and PVD_TCP_REPLAY_TRACE are mutually exclusive"
-    );
+    }
     let sample = std::env::var_os("PVD_SDK34_SAMPLE").expect("PVD_SDK34_SAMPLE is required");
     let output = PathBuf::from(
         std::env::var_os("PVD_PLAYBACK_PROBE_OUTPUT")
@@ -1289,7 +1370,7 @@ fn run_long_tcp_playback(mode: ProbeMode) {
             },
             receive_budget_bytes: 128 << 20,
             live_profile: trace_enabled,
-            progress_only: progress_enabled,
+            progress_only: !trace_enabled,
             ..Default::default()
         },
         context.clone(),
@@ -1352,7 +1433,7 @@ fn run_long_tcp_playback(mode: ProbeMode) {
     studio.server = Some(server);
     studio.recorded_timing = false;
     studio.playback_fps = 60.0;
-    let progress = progress_enabled.then(|| Rc::new(RefCell::new(TcpProgressBoundaries::new())));
+    let progress = Some(Rc::new(RefCell::new(TcpProgressBoundaries::new())));
     let mut probe = Probe {
         studio,
         context,

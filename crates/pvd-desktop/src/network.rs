@@ -147,6 +147,11 @@ pub struct LiveSnapshot {
     pub recording: Recording,
     pub update: SceneUpdate,
     pub frame: usize,
+    pub source_frame: Option<(
+        pvd_core::frame_sources::FrameSourceKey,
+        pvd_core::frame_sources::SourceFrame,
+    )>,
+    pub display_updated: bool,
 }
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
@@ -284,6 +289,13 @@ impl RawCapture {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct FrameSelection {
+    session: Option<u64>,
+    source: Option<pvd_core::frame_sources::FrameSourceKey>,
+    revision: u64,
+}
+
 struct LiveClient {
     session: u64,
     peer: String,
@@ -293,6 +305,7 @@ struct LiveClient {
     raw_attempted: bool,
     received_bytes: u64,
     published_frames: usize,
+    selection_revision: u64,
     last_publish: Instant,
     profile: Option<Arc<LiveProfile>>,
 }
@@ -302,8 +315,16 @@ struct WorkerOutput {
     stop: Arc<AtomicBool>,
     context: egui::Context,
     snapshot: Arc<Mutex<Option<LiveSnapshot>>>,
+    frame_source: Arc<Mutex<FrameSelection>>,
 }
 impl WorkerOutput {
+    fn begin_frame_session(&self, session: u64) {
+        *self.frame_source.lock().unwrap() = FrameSelection {
+            session: Some(session),
+            ..Default::default()
+        };
+    }
+
     fn emit(&self, mut event: LiveEvent) -> bool {
         loop {
             if self.cancel.load(Ordering::Relaxed) {
@@ -332,12 +353,26 @@ impl WorkerOutput {
         if live.frame_count() == 0 || live.frame_count() == client.published_frames {
             return;
         }
+        let selection = self.frame_source.lock().unwrap();
+        if selection.session != Some(client.session) {
+            return;
+        }
+        let display_current = selection.revision == client.selection_revision
+            && selection
+                .source
+                .is_none_or(|source| live.selected_frame_source() == Some(source));
         let Ok(recording) = live.snapshot() else {
             return;
         };
-        let Some((frame, update)) = live.take_update() else {
-            return;
-        };
+        let source_frame = live.display_frame_source();
+        let display = display_current.then(|| live.take_update()).flatten();
+        let display_updated = display.is_some();
+        let (frame, update) = display.unwrap_or_else(|| {
+            (
+                source_frame.map_or(0, |(_, frame)| frame.index),
+                SceneUpdate::default(),
+            )
+        });
         client.published_frames = live.frame_count();
         client.last_publish = Instant::now();
         let mut slot = self.snapshot.lock().unwrap();
@@ -345,19 +380,37 @@ impl WorkerOutput {
             .as_mut()
             .filter(|previous| previous.session == client.session)
         {
-            previous.update.merge(update);
+            if display_updated {
+                previous.update.merge(update);
+                previous.frame = frame;
+                previous.source_frame = source_frame;
+                previous.display_updated = true;
+            }
             previous.recording = recording;
-            previous.frame = frame;
         } else {
             *slot = Some(LiveSnapshot {
                 session: client.session,
                 recording,
                 update,
                 frame,
+                source_frame,
+                display_updated,
             });
         }
         drop(slot);
         self.context.request_repaint();
+    }
+    fn sync_frame_source(&self, client: &mut LiveClient) {
+        if let Some(live) = client.live.as_mut() {
+            let selection = *self.frame_source.lock().unwrap();
+            if selection.session == Some(client.session)
+                && client.selection_revision != selection.revision
+            {
+                live.set_frame_source(selection.source);
+                live.refresh_frame_source();
+                client.selection_revision = selection.revision;
+            }
+        }
     }
     fn raw_error(&self, detail: impl std::fmt::Display) {
         self.emit(LiveEvent::Error(Message::new(
@@ -405,6 +458,7 @@ impl WorkerOutput {
 pub struct NetworkSession {
     pub receiver: Mutex<mpsc::Receiver<LiveEvent>>,
     snapshot: Arc<Mutex<Option<LiveSnapshot>>>,
+    frame_source: Arc<Mutex<FrameSelection>>,
     cancel: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -417,10 +471,15 @@ impl NetworkSession {
     #[cfg(test)]
     pub(crate) fn test_session(snapshot: LiveSnapshot) -> (Self, mpsc::SyncSender<LiveEvent>) {
         let (sender, receiver) = mpsc::sync_channel(4);
+        let session = snapshot.session;
         (
             Self {
                 receiver: Mutex::new(receiver),
                 snapshot: Arc::new(Mutex::new(Some(snapshot))),
+                frame_source: Arc::new(Mutex::new(FrameSelection {
+                    session: Some(session),
+                    ..Default::default()
+                })),
                 cancel: Arc::new(AtomicBool::new(false)),
                 stop: Arc::new(AtomicBool::new(false)),
                 worker: None,
@@ -501,6 +560,7 @@ impl NetworkSession {
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let snapshot = Arc::new(Mutex::new(None));
+        let frame_source = Arc::new(Mutex::new(FrameSelection::default()));
         let profile = Arc::new(Mutex::new(None));
         let worker_profile = profile.clone();
         let output = WorkerOutput {
@@ -509,6 +569,7 @@ impl NetworkSession {
             stop: stop.clone(),
             context,
             snapshot: snapshot.clone(),
+            frame_source: frame_source.clone(),
         };
         let shutdown = cancel.clone();
         let stop_receiver = receive_control.clone();
@@ -582,6 +643,7 @@ impl NetworkSession {
                             if options.progress_only {
                                 *worker_profile.lock().unwrap() = profile.clone();
                             }
+                            output.begin_frame_session(session);
                             output.emit(LiveEvent::Connected(session));
                             if let Some(error) = &failure {
                                 output.emit(LiveEvent::Error(Message::new(
@@ -609,6 +671,7 @@ impl NetworkSession {
                                 raw_attempted: false,
                                 received_bytes: 0,
                                 published_frames: 0,
+                                selection_revision: 0,
                                 last_publish: Instant::now() - interval,
                                 profile,
                             });
@@ -657,6 +720,7 @@ impl NetworkSession {
                             {
                                 output.raw_error(error);
                             }
+                            output.sync_frame_source(client);
                             if let Some(live) = client.live.as_mut()
                                 && let Err(error) = live.feed(&bytes)
                             {
@@ -737,6 +801,7 @@ impl NetworkSession {
         Ok(Self {
             receiver: Mutex::new(receiver),
             snapshot,
+            frame_source,
             cancel,
             stop,
             worker: Some(worker),
@@ -745,6 +810,28 @@ impl NetworkSession {
             receive_control,
             profile,
         })
+    }
+    pub fn set_frame_source(
+        &self,
+        session: u64,
+        source: Option<pvd_core::frame_sources::FrameSourceKey>,
+    ) -> bool {
+        let mut selected = self.frame_source.lock().unwrap();
+        if selected.session != Some(session) {
+            return false;
+        }
+        if selected.source != source {
+            selected.source = source;
+            selected.revision = selected.revision.wrapping_add(1);
+            let mut snapshot = self.snapshot.lock().unwrap();
+            if snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.session == session)
+            {
+                snapshot.take();
+            }
+        }
+        true
     }
     #[cfg(test)]
     pub fn take_snapshot(&self) -> Option<LiveSnapshot> {
@@ -819,6 +906,7 @@ impl Drop for NetworkSession {
 
 #[cfg(test)]
 mod tests {
+    mod frame_sources;
     use super::*;
     use std::{io::Write, net::TcpStream};
 
@@ -1401,6 +1489,8 @@ mod tests {
         bytes.extend(frame_group(1));
         let recording = Recording::from_bytes(&bytes).unwrap();
         let (session, _sender) = NetworkSession::test_session(LiveSnapshot {
+            source_frame: None,
+            display_updated: true,
             session: 7,
             frame: 9,
             recording,
@@ -1974,6 +2064,7 @@ mod tests {
         let session = NetworkSession {
             receiver: Mutex::new(receiver),
             snapshot: Arc::new(Mutex::new(None)),
+            frame_source: Arc::default(),
             cancel,
             stop: Arc::new(AtomicBool::new(false)),
             worker: Some(worker),

@@ -2,21 +2,43 @@ use crate::{Error, Object, SceneState, Value, error};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
+mod aggregate;
+mod articulation;
+mod particle;
+mod selection;
+
+#[cfg(test)]
+mod kinematic_tests;
 #[cfg(test)]
 mod shared_tests;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Selection {
     Frame,
+    /// Includes one Particle system or connected rigid Actors, complete Articulation trees, joints and Aggregates.
     Actor(u64),
+    /// Captured identities in one frame; duplicates share the same dependency closure.
+    Actors(Vec<ActorKey>),
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActorKey {
+    pub id: u64,
+    pub generation: u32,
+}
+
+pub const MAX_SELECTED_ACTORS: usize = 4096;
 
 pub struct Export {
     pub xml: String,
     pub actors: usize,
+    pub kinematic_actors: usize,
     pub shapes: usize,
     pub materials: usize,
     pub joints: usize,
+    pub aggregates: usize,
+    pub articulations: usize,
+    pub particle_systems: usize,
 }
 
 const ACTOR_FIELDS: &[&str] = &[
@@ -55,6 +77,7 @@ const BODY_FIELDS: &[&str] = &[
     "InvMass",
     "MassSpaceInvInertiaTensor",
     "IsSleeping",
+    "KinematicTarget",
 ];
 
 pub fn export(state: &SceneState, selection: Selection) -> Result<Export, Error> {
@@ -71,50 +94,17 @@ pub fn export(state: &SceneState, selection: Selection) -> Result<Export, Error>
             "RepX export is validated only for captured PhysX 3.4.2 objects",
         ));
     }
-    let actors: Vec<&Object> = match selection {
-        Selection::Actor(id) => vec![
-            state
-                .objects
-                .get(&id)
-                .ok_or_else(|| error(format!("Actor 0x{id:X} is absent in this frame")))?,
-        ],
-        Selection::Frame => state
-            .objects
-            .values()
-            .filter(|o| matches!(kind(o), "PxRigidDynamic" | "PxRigidStatic"))
-            .collect(),
-    };
-    if actors.is_empty() {
-        return Err(error("RepX export has no rigid actors"));
+    let selection::Plan {
+        actors,
+        joints,
+        aggregates,
+        articulations,
+        particles,
+    } = selection::Plan::new(state, selection)?;
+    if actors.is_empty() && particles.is_empty() {
+        return Err(error("RepX export has no supported actors"));
     }
-    let actor_ids: BTreeSet<u64> = actors.iter().map(|a| a.id).collect();
-    let joints: Vec<&Object> = state
-        .objects
-        .values()
-        .filter(|object| matches!(selection, Selection::Frame) && supported_joint(kind(object)))
-        .collect();
     let joint_ids: BTreeSet<u64> = joints.iter().map(|joint| joint.id).collect();
-    for object in state.objects.values() {
-        let name = kind(object);
-        let unsupported = (name.contains("Joint") && !joint_ids.contains(&object.id))
-            || name.contains("Articulation")
-            || name.contains("Cloth")
-            || name.contains("Particle")
-            || name == "PxAggregate"
-            || name == "PxConstraint";
-        if unsupported
-            && (matches!(selection, Selection::Frame)
-                || object
-                    .properties
-                    .values()
-                    .any(|v| references_any(v, &actor_ids)))
-        {
-            return Err(error(format!(
-                "RepX does not yet export dependency {} (0x{:X}); nothing was exported",
-                object.type_name, object.id
-            )));
-        }
-    }
     let mut materials = BTreeMap::<u64, &Object>::new();
     let mut meshes = BTreeMap::<u64, String>::new();
     let mut mesh_budget = 128 * 1024 * 1024usize;
@@ -127,7 +117,7 @@ pub fn export(state: &SceneState, selection: Selection) -> Result<Export, Error>
             write_shape(
                 state,
                 shape.object,
-                shape.dynamic,
+                shape.non_kinematic_dynamic,
                 &mut materials,
                 &mut meshes,
                 &mut mesh_budget,
@@ -135,7 +125,17 @@ pub fn export(state: &SceneState, selection: Selection) -> Result<Export, Error>
         );
     }
     let mut actor_xml = String::new();
+    let mut kinematic_actors = 0;
+    let mut link_xml = BTreeMap::new();
     for actor in &actors {
+        if kind(actor) == "PxArticulationLink" {
+            actor_joints.insert(actor.id, validate_actor_joints(state, actor, &joint_ids)?);
+            link_xml.insert(
+                actor.id,
+                articulation::write_link(state, actor, &shape_plan, &mut shape_xml)?,
+            );
+            continue;
+        }
         let dynamic = match kind(actor) {
             "PxRigidDynamic" => true,
             "PxRigidStatic" => false,
@@ -149,51 +149,23 @@ pub fn export(state: &SceneState, selection: Selection) -> Result<Export, Error>
         validate_fields(actor, ACTOR_FIELDS, if dynamic { BODY_FIELDS } else { &[] })?;
         validate_actor(actor, dynamic)?;
         actor_joints.insert(actor.id, validate_actor_joints(state, actor, &joint_ids)?);
-        if integer(actor, "ClientBehaviorFlags")? != 0 {
-            return Err(error("RepX client behavior flags are not supported"));
-        }
-        if actor
-            .properties
-            .get("Aggregate")
-            .is_some_and(|v| !matches!(v, Value::Ref(0)))
-        {
-            return Err(error("RepX aggregate membership is not supported"));
-        }
         writeln!(actor_xml, "<{}>", kind(actor)).unwrap();
         tag(&mut actor_xml, "Id", &actor.id.to_string())?;
-        property(&mut actor_xml, actor, "Name")?;
-        flag_property(
-            &mut actor_xml,
-            actor,
-            "ActorFlags",
-            &[
-                "eVISUALIZATION",
-                "eDISABLE_GRAVITY",
-                "eSEND_SLEEP_NOTIFIES",
-                "eDISABLE_SIMULATION",
-            ],
-        )?;
-        for field in ["DominanceGroup", "OwnerClient", "GlobalPose"] {
-            property(&mut actor_xml, actor, field)?;
-        }
-        actor_xml.push_str("<Shapes>\n");
-        for id in &shape_plan.actors[&actor.id] {
-            let shape = &shape_plan.shapes[id];
-            if shape.exclusive {
-                actor_xml.push_str("<PxShape>\n");
-                actor_xml.push_str(&shape_xml.remove(id).unwrap());
-                actor_xml.push_str("</PxShape>\n");
-            } else {
-                tag(&mut actor_xml, "PxShapeRef", &id.to_string())?;
-            }
-        }
-        actor_xml.push_str("</Shapes>\n");
+        write_actor_common(&mut actor_xml, actor, &shape_plan, &mut shape_xml)?;
         if dynamic {
             let body_flags = integer(actor, "RigidBodyFlags")?;
-            if body_flags & 3 != 0 {
+            if body_flags & 5 == 5 {
+                return Err(error("RepX kinematic actors cannot enable CCD"));
+            }
+            kinematic_actors += usize::from(body_flags & 1 != 0);
+            if body_flags & 36 == 36 {
                 return Err(error(
-                    "RepX kinematic targets are not captured by this exporter",
+                    "RepX dynamic actors cannot enable CCD and speculative CCD together",
                 ));
+            }
+            // PVD 目标使用 Body 坐标且没有有效标志；RepX 只保存 Actor 参数。
+            if actor.properties.contains_key("KinematicTarget") {
+                pose(actor, "KinematicTarget")?;
             }
             for field in &BODY_FIELDS[..14] {
                 property(&mut actor_xml, actor, field)?;
@@ -311,23 +283,83 @@ pub fn export(state: &SceneState, selection: Selection) -> Result<Export, Error>
         }
     }
     xml.push_str(&actor_xml);
+    for articulation in &articulations {
+        articulation::write(&mut xml, state, articulation, &link_xml)?;
+    }
+    for object in &particles {
+        particle::write(&mut xml, state, object, &mut mesh_budget)?;
+    }
     for joint in &joints {
         write_joint(&mut xml, state, joint, &actor_joints)?;
+    }
+    for aggregate in &aggregates {
+        aggregate::write(&mut xml, state, aggregate)?;
     }
     xml.push_str("</PhysX30Collection>\n");
     Ok(Export {
         xml,
         actors: actors.len(),
+        kinematic_actors,
         shapes: shape_plan.shapes.len(),
         materials: materials.len(),
         joints: joints.len(),
+        aggregates: aggregates.len(),
+        articulations: articulations.len(),
+        particle_systems: particles.len(),
     })
+}
+
+fn write_actor_common(
+    xml: &mut String,
+    actor: &Object,
+    shape_plan: &ShapePlan<'_>,
+    shape_xml: &mut BTreeMap<u64, String>,
+) -> Result<(), Error> {
+    property(xml, actor, "Name")?;
+    flag_property(
+        xml,
+        actor,
+        "ActorFlags",
+        &[
+            "eVISUALIZATION",
+            "eDISABLE_GRAVITY",
+            "eSEND_SLEEP_NOTIFIES",
+            "eDISABLE_SIMULATION",
+        ],
+    )?;
+    flag_property(
+        xml,
+        actor,
+        "ClientBehaviorFlags",
+        &[
+            "eREPORT_TO_FOREIGN_CLIENTS_TRIGGER_NOTIFY",
+            "eREPORT_TO_FOREIGN_CLIENTS_CONTACT_NOTIFY",
+            "eREPORT_TO_FOREIGN_CLIENTS_CONSTRAINT_BREAK_NOTIFY",
+            "eREPORT_TO_FOREIGN_CLIENTS_SCENE_QUERY",
+        ],
+    )?;
+    for field in ["DominanceGroup", "OwnerClient", "GlobalPose"] {
+        property(xml, actor, field)?;
+    }
+    xml.push_str("<Shapes>\n");
+    for id in &shape_plan.actors[&actor.id] {
+        let shape = &shape_plan.shapes[id];
+        if shape.exclusive {
+            xml.push_str("<PxShape>\n");
+            xml.push_str(&shape_xml.remove(id).unwrap());
+            xml.push_str("</PxShape>\n");
+        } else {
+            tag(xml, "PxShapeRef", &id.to_string())?;
+        }
+    }
+    xml.push_str("</Shapes>\n");
+    Ok(())
 }
 
 struct ShapeDependency<'a> {
     object: &'a Object,
     exclusive: bool,
-    dynamic: bool,
+    non_kinematic_dynamic: bool,
 }
 
 struct ShapePlan<'a> {
@@ -343,6 +375,8 @@ impl<'a> ShapePlan<'a> {
         };
         let mut shared_registrations = None;
         for actor in actors {
+            let non_kinematic_dynamic = kind(actor) == "PxArticulationLink"
+                || kind(actor) == "PxRigidDynamic" && integer(actor, "RigidBodyFlags")? & 1 == 0;
             let mut ids = Vec::new();
             let mut seen = BTreeSet::new();
             for shape in references(state, actor, "Shapes")? {
@@ -396,12 +430,12 @@ impl<'a> ShapePlan<'a> {
                 plan.shapes
                     .entry(shape.id)
                     .and_modify(|entry| {
-                        entry.dynamic |= kind(actor) == "PxRigidDynamic";
+                        entry.non_kinematic_dynamic |= non_kinematic_dynamic;
                     })
                     .or_insert(ShapeDependency {
                         object: shape,
                         exclusive,
-                        dynamic: kind(actor) == "PxRigidDynamic",
+                        non_kinematic_dynamic,
                     });
                 ids.push(shape.id);
             }
@@ -414,7 +448,7 @@ impl<'a> ShapePlan<'a> {
 fn write_shape<'a>(
     state: &'a SceneState,
     shape: &'a Object,
-    dynamic: bool,
+    non_kinematic_dynamic: bool,
     materials: &mut BTreeMap<u64, &'a Object>,
     meshes: &mut BTreeMap<u64, String>,
     mesh_budget: &mut usize,
@@ -478,7 +512,7 @@ fn write_shape<'a>(
         }
     };
     validate_fields(geometry, fields, &["Shape"])?;
-    validate_geometry(geometry, shape, dynamic)?;
+    validate_geometry(geometry, shape, non_kinematic_dynamic)?;
     writeln!(xml, "<{}>", kind(geometry)).unwrap();
     if kind(geometry) == "PxHeightFieldGeometry" {
         write_height_field_geometry(
@@ -563,7 +597,7 @@ fn validate_actor_joints(
     for joint in references(state, actor, "Joints")? {
         if !joint_ids.contains(&joint.id) {
             return Err(error(format!(
-                "RepX Actor 0x{:X} requires joint 0x{:X}; use a supported whole-frame export",
+                "RepX Actor 0x{:X} requires an unsupported or missing joint 0x{:X}",
                 actor.id, joint.id
             )));
         }
@@ -599,7 +633,10 @@ fn joint_actor<'a>(
                 joint.id
             ))
         })?;
-    if !matches!(kind(actor), "PxRigidDynamic" | "PxRigidStatic") {
+    if !matches!(
+        kind(actor),
+        "PxRigidDynamic" | "PxRigidStatic" | "PxArticulationLink"
+    ) {
         return Err(error("RepX joint requires rigid Actor dependencies"));
     }
     Ok(Some(actor))
@@ -756,7 +793,7 @@ fn write_joint(
         || !actors
             .iter()
             .flatten()
-            .any(|actor| kind(actor) == "PxRigidDynamic")
+            .any(|actor| matches!(kind(actor), "PxRigidDynamic" | "PxArticulationLink"))
     {
         return Err(error(
             "RepX joint requires distinct bodies and at least one dynamic Actor",
@@ -938,6 +975,9 @@ fn joint_flags(joint: &Object, field: &str, flags: &[(u64, &str)]) -> Result<Str
         return Err(error(format!(
             "RepX joint {field} contains unknown or unrestorable flag bits"
         )));
+    }
+    if bits == 0 {
+        return Ok("0".into());
     }
     Ok(flags
         .iter()
@@ -1675,7 +1715,8 @@ fn validate_shape(shape: &Object) -> Result<(), Error> {
             "RepX Shape offsets violate PhysX contact/rest bounds",
         ));
     }
-    if integer(shape, "Flags")? & 5 == 5 {
+    let flags = integer(shape, "Flags")?;
+    if flags & 5 == 5 {
         return Err(error(
             "A RepX Shape cannot be both a trigger and a simulation shape",
         ));
@@ -1695,7 +1736,21 @@ fn validate_shape(shape: &Object) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_geometry(geometry: &Object, shape: &Object, dynamic: bool) -> Result<(), Error> {
+fn validate_geometry(
+    geometry: &Object,
+    shape: &Object,
+    non_kinematic_dynamic: bool,
+) -> Result<(), Error> {
+    let shape_flags = integer(shape, "Flags")?;
+    if matches!(
+        kind(geometry),
+        "PxTriangleMeshGeometry" | "PxHeightFieldGeometry"
+    ) && shape_flags & 4 != 0
+    {
+        return Err(error(
+            "RepX triangle mesh and height field triggers are unsupported",
+        ));
+    }
     let expected = match kind(geometry) {
         "PxSphereGeometry" => {
             if real(geometry, "Radius")? <= 0.0 {
@@ -1704,8 +1759,10 @@ fn validate_geometry(geometry: &Object, shape: &Object, dynamic: bool) -> Result
             0
         }
         "PxPlaneGeometry" => {
-            if dynamic {
-                return Err(error("RepX dynamic actors cannot have plane geometry"));
+            if non_kinematic_dynamic && shape_flags & 1 != 0 {
+                return Err(error(
+                    "RepX non-kinematic dynamic actors cannot simulate plane geometry",
+                ));
             }
             1
         }
@@ -1726,7 +1783,7 @@ fn validate_geometry(geometry: &Object, shape: &Object, dynamic: bool) -> Result
         }
         "PxConvexMeshGeometry" => 4,
         "PxTriangleMeshGeometry" => {
-            if dynamic && integer(shape, "Flags")? & 1 != 0 {
+            if non_kinematic_dynamic && shape_flags & 1 != 0 {
                 return Err(error(
                     "RepX non-kinematic dynamic actors cannot simulate triangle meshes",
                 ));
@@ -1734,7 +1791,7 @@ fn validate_geometry(geometry: &Object, shape: &Object, dynamic: bool) -> Result
             5
         }
         "PxHeightFieldGeometry" => {
-            if dynamic && integer(shape, "Flags")? & 1 != 0 {
+            if non_kinematic_dynamic && shape_flags & 1 != 0 {
                 return Err(error(
                     "RepX non-kinematic dynamic actors cannot simulate height fields",
                 ));
@@ -1857,6 +1914,10 @@ fn flag_property(
             "RepX {name} has unknown flag bits 0x{bits:X}"
         )));
     }
+    // 3.4.2 读取器跳过空文本；非空零值使构造时的默认标志可以清零。
+    if bits == 0 {
+        return tag(xml, name, "0");
+    }
     let flags = names
         .iter()
         .enumerate()
@@ -1949,6 +2010,14 @@ mod tests {
     fn spherical_flag_gaps_and_sdk_limit_boundaries_are_enforced() {
         let mut joint = spherical_property_fixture();
         assert!(validate_joint_properties(&joint).is_ok());
+        assert_eq!(
+            joint_flags(&joint, "ConstraintFlags", CONSTRAINT_FLAGS).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            joint_flags(&joint, "SphericalJointFlags", &[(2, "eLIMIT_ENABLED")]).unwrap(),
+            "0"
+        );
         for flags in [0, 2, 4, 6, 8, 16, 32, 128, 256, 446] {
             joint
                 .properties

@@ -22,6 +22,11 @@ impl<Tab> DockArea<'_, Tab> {
         let id = format!("window {surf_index:?}").into();
         let bounds = self.window_bounds.unwrap();
         let open = true;
+        let focus_requested = self
+            .dock_state
+            .get_window_state_mut(surf_index)
+            .unwrap()
+            .take_focus_request();
         let window = self
             .dock_state
             .get_window_state_mut(surf_index)
@@ -80,7 +85,7 @@ impl<Tab> DockArea<'_, Tab> {
             .get_window_state(surf_index)
             .unwrap()
             .is_minimized();
-        if minimized {
+        let response = if minimized {
             let height = tab_bar_height;
             window
                 .resizable([true, false])
@@ -113,6 +118,12 @@ impl<Tab> DockArea<'_, Tab> {
                 self.render_nodes(ui, tab_viewer, state, surf_index, fade_style);
             }
         });
+
+        if focus_requested {
+            if let Some(response) = response {
+                ui.ctx().move_to_top(response.response.layer_id);
+            }
+        }
 
         if !open {
             self.to_remove.push(TabRemoval::Window(surf_index));

@@ -24,6 +24,21 @@ DEBUG 和 ALL、永久原始录制开关分别测试。同机回环与跨机器�
 
 正确性核对包括输入字节、帧数、同帧对象与分析、顺序/随机/反向恢复、检查点和淘汰边界。最终状态一致不能替代中间帧核对，字节数相等不能替代内容一致。
 
+## 并发回放检查
+
+构建 SDK 生产器后，可运行无窗口 TCP 专项：
+
+```powershell
+$env:PVD_SDK34_SAMPLE = (Resolve-Path '.deps/physx-sample-build/Release/pvd-physx-sample.exe').Path
+$env:PVD_PLAYBACK_PROBE_OUTPUT = Join-Path (Get-Location) ('output/tcp-playback-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$env:PVD_LONG_PLAYBACK_SECONDS = '300'
+cargo test --locked -p pvd-desktop studio::playback_tests::real_sdk_tcp_ui_demand_scene_playback_and_paused_analysis_match_permanent_raw -- --ignored --exact --nocapture --test-threads=1
+```
+
+每段历史回放要求同一会话的核心提交和界面帧计数均推进，持续核对相邻步、分析需求和淘汰边界。达到目标步数后最多再观察 5 秒，期间保持同向历史回放；自然到达实时边界时只接受转实时之前的进度。这是并发推进检查，不是固定帧延迟保证。
+
+输出包含阶段计数边界、原始捕获及重新解码的状态对照，结束时检查积压和所属历史文件释放。该路径不包含 GPU 或原生窗口；`PVD_TCP_REPLAY_TRACE=1` 额外记录详细计时，包含计时自身开销。
+
 ## 时间基准与资源
 
 同一接收进程使用单调时钟记录接收、解码、历史提交、发布和显示应用。数据块没有天然的物理帧标识，可按帧结束事件的字节偏移关联接收块，并明确测量粒度。

@@ -5,6 +5,7 @@ use std::fs;
 fn poll_until_idle(studio: &mut Studio, context: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while studio.job.is_some()
+        || studio.seeking.is_some()
         || studio.recording_export.is_some()
         || studio.clip_persistence.busy()
     {

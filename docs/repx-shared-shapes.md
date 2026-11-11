@@ -8,7 +8,7 @@
 
 SDK `PvdMetaDataPvdBinding.cpp:1045–1153` 仅在首次创建捕获 Shape 时写入 `Shape.Actor`；后续附着、解除附着不会将它重新绑定到剩余 Actor。因此共享 Shape 的 `Actor` 字段可能指向已经删除的首个拥有者。导出依赖以当前代际有效的 `Actor.Shapes` 与 `PxPhysics.SharedShapes` 为准，历史 Actor 提示只检查字段类型。exclusive Shape 仍要求唯一且有效的所属 Actor。
 
-选中 Actor 导出只保留所选 Actor 的附着关系，不引入其他共享者；共享 Shape 仍保持非 exclusive。整帧导出按唯一 Shape 计数，保留各 Actor 的 Shape 数组顺序。几何限制对所有选中拥有者生效，存在动态拥有者时不能借静态拥有者绕过限制。
+选中 Actor 导出只保留所选 Actor 的附着关系，不引入其他共享者；共享 Shape 仍保持非 exclusive。整帧导出按唯一 Shape 计数，保留各 Actor 的 Shape 数组顺序。几何限制对所有选中拥有者生效：Plane、TriangleMesh、HeightField 启用 simulation 时，任何非运动学 Dynamic 或 Articulation Link 都会拒绝导出，不能借 Static 或运动学共享者绕过限制。
 
 ## 实际验证
 
@@ -34,4 +34,4 @@ $env:PVD_REPX_SHARED_CAPTURE='output/repx-shared-check/shared.pvdstream'
 cargo test --locked -p pvd-core --lib repx::shared_tests -- --ignored --nocapture
 ```
 
-范围是 PhysX 3.4.2 的上述共享基础 Shape 场景；其他共享几何组合、SDK 版本、Articulation/Aggregate 与原版 PVD3 RepX 界面行为仍未验收。已有 128 MiB 上限约束网格 XML，不是整体 XML 或进程内存上限。RepX 导入不用于重放捕获或重新模拟展示。
+共享基础 Shape 的范围是上述 PhysX 3.4.2 场景；运动学与 Static 共享 TriangleMesh 另见[运动学几何专项](../tools/repx-kinematic-shapes/README.md)，验收状态集中在 [RepX](repx.md)。其他共享几何组合、SDK 版本、Articulation/Aggregate 与原版 PVD3 RepX 界面行为仍未验收。已有 128 MiB 上限约束网格 XML，不是整体 XML 或进程内存上限。RepX 导入不用于重放捕获或重新模拟展示。

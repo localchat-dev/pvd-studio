@@ -412,7 +412,7 @@ impl<Tab> DockArea<'_, Tab> {
                             self.to_detach.push((surface_index, node_index, tab_index));
                             ui.close();
                         }
-                        if show_close_button && ui.add(close_button).clicked() {
+                        if closeable && ui.add(close_button).clicked() {
                             match tab_viewer.on_close(tab) {
                                 OnCloseResponse::Close => self.to_remove.push(TabRemoval::Tab(
                                     surface_index,

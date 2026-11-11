@@ -60,9 +60,12 @@ normalized actions independently of presentation ECS entities. Class and
 property metadata, enum names, inheritance and unknown opaque payloads are
 retained. Large arrays/blobs use shared immutable storage.
 
-Only `EndSection(scene, "frame", timestamp)` creates a completed playback
-frame. A snapshot therefore means all changes through that frame's end.
-SDK 3.4 `ScbScenePvdClient.cpp` deliberately emits that marker **before** its
+`EndSection(source, "frame", timestamp)` and `ApexFrame` ends create
+completed frames in captured event order. The raw source and section name
+identify separate frame sequences; other section names are not playback frames.
+Object state includes changes through the selected End. Renderer drawing uses
+the previous End of the same source as its lower bound; see [frame sources](frame-sources.md).
+SDK 3.4 `ScbScenePvdClient.cpp` deliberately emits its `frame` marker **before** its
 current dynamic-actor update block, aligning contact data with the preceding
 actor pose. The independent SDK truth CSV samples immediately before
 `simulate`, matching this observed convention. The decoder does not shift

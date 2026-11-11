@@ -12,6 +12,10 @@ pub(crate) struct SceneChanges {
 }
 
 impl SceneChanges {
+    pub(crate) fn changed(&self, from: u64, to: u64) -> Option<&HashSet<u64>> {
+        (!self.full && self.range == Some((from, to))).then_some(&self.objects)
+    }
+
     pub(crate) fn record(&mut self, update: &SceneUpdate, revision: u64) {
         match self.range {
             Some((_, end)) if end != revision => self.full = true,
@@ -142,14 +146,37 @@ impl SourceResources {
     }
 }
 
-pub(super) fn actor_visible(studio: &Studio, object: &RenderObject) -> bool {
+pub(super) fn object_visible(studio: &Studio, object: &RenderObject) -> bool {
     (studio.prefs.show_kinematic || !object.dynamic || !is_kinematic(&studio.state, object.id))
-        && (studio.prefs.show_sleeping || !object.sleeping)
+        && (!object.sleeping
+            || (studio.prefs.show_sleeping
+                && studio
+                    .prefs
+                    .sleeping_scope
+                    .includes(studio.is_selected(object.id))))
         && if object.dynamic {
             studio.prefs.show_dynamic
         } else {
             studio.prefs.show_static
         }
+        && trigger_visible(studio, object)
+}
+
+fn trigger_visible(studio: &Studio, object: &RenderObject) -> bool {
+    let selected = studio.is_selected(object.id) || studio.is_selected(object.shape_id);
+    if studio.prefs.show_triggers && studio.prefs.trigger_scope.includes(selected) {
+        return true;
+    }
+    studio
+        .state
+        .resolve_reference(object.id, "Shapes", object.shape_id)
+        .and_then(|shape| shape.properties.get("Flags"))
+        .and_then(|value| match value {
+            Value::U64(value) => u8::try_from(*value).ok(),
+            Value::I64(value) => u8::try_from(*value).ok(),
+            _ => None,
+        })
+        .is_none_or(|flags| flags & 4 == 0)
 }
 
 fn actor(object: &Object) -> bool {
@@ -384,7 +411,7 @@ pub(super) fn sync_actors(
                     valid: true,
                 });
         }
-        if !actor_visible(studio, &object) {
+        if !object_visible(studio, &object) {
             continue;
         }
         let key = (object.id, object.shape_id);

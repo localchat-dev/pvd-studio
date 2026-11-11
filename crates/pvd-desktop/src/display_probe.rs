@@ -413,11 +413,12 @@ fn drive(
                     }
                 && synced =>
         {
-            studio.selected = viewport
+            let selected = viewport
                 .objects
                 .iter()
                 .find(|object| object.dynamic)
                 .map(|object| object.id);
+            studio.select_object(selected, false);
             probe.phase = Phase::Warm;
             probe.phase_tick = probe.tick;
             probe.trace.set_phase(1);

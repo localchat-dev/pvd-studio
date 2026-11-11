@@ -83,6 +83,7 @@ pub fn sample_streaming<R: Read + Seek + ?Sized>(
         id: scene,
         generation,
     } = scene;
+    source_context(recording, scene, generation)?;
     let mut bytes = 0;
     charge(
         &mut bytes,
@@ -134,7 +135,7 @@ pub fn sample_streaming<R: Read + Seek + ?Sized>(
         recording
             .frames
             .iter()
-            .filter(|frame| frame.scene_id == scene),
+            .filter(|frame| recording.frame_matches_scene(frame, scene)),
     );
     let scale = recording.header.timestamp_numerator as f64
         / recording.header.timestamp_denominator as f64
@@ -157,7 +158,7 @@ pub fn sample_streaming<R: Read + Seek + ?Sized>(
     };
     for &frame in frames {
         check(cancelled)?;
-        let status = if recording.frames[frame].scene_id != scene {
+        let status = if !recording.frame_matches_scene(&recording.frames[frame], scene) {
             Status::OtherScene
         } else if !monotonic {
             Status::NonMonotonicClock

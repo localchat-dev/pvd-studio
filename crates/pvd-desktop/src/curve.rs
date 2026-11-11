@@ -17,8 +17,50 @@ pub const MAX_SAMPLES: usize = 5000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Property,
+    PropertyElement {
+        index: usize,
+        value_type: ElementType,
+    },
     Performance(pvd_core::frame_metrics::Metric),
     ProfileEvent(pvd_core::profile_curves::ExactKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElementType {
+    I64,
+    U64,
+    F32,
+    F64,
+    Vec3,
+    Quat,
+    Transform,
+}
+
+impl ElementType {
+    pub fn of(value: &Value) -> Option<Self> {
+        Some(match value {
+            Value::I64(_) => Self::I64,
+            Value::U64(_) => Self::U64,
+            Value::F32(_) => Self::F32,
+            Value::F64(_) => Self::F64,
+            Value::Vec3(_) => Self::Vec3,
+            Value::Quat(_) => Self::Quat,
+            Value::Transform { .. } => Self::Transform,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::I64 => "i64",
+            Self::U64 => "u64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::Vec3 => "vec3",
+            Self::Quat => "quat",
+            Self::Transform => "transform",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,8 +77,25 @@ impl Spec {
     pub fn needs_analysis(&self) -> bool {
         !matches!(
             self.source,
-            Source::Property | Source::Performance(pvd_core::frame_metrics::Metric::FrameInterval)
+            Source::Property
+                | Source::PropertyElement { .. }
+                | Source::Performance(pvd_core::frame_metrics::Metric::FrameInterval)
         )
+    }
+
+    fn property_value<'a>(&self, value: &'a Value) -> Option<&'a Value> {
+        match self.source {
+            Source::Property => Some(value),
+            Source::PropertyElement { index, value_type } => {
+                let Value::Array(values) = value else {
+                    return None;
+                };
+                values
+                    .get(index)
+                    .filter(|value| ElementType::of(value) == Some(value_type))
+            }
+            _ => None,
+        }
     }
 
     pub fn label(&self) -> Message {
@@ -68,16 +127,20 @@ impl Spec {
                 ),
             );
         }
+        let property = match self.source {
+            Source::PropertyElement { index, .. } => format!("{}[{index}]", self.property),
+            _ => self.property.clone(),
+        };
         Message::new(
             format!(
                 "0x{:x} · generation {} · {}.{}",
-                self.object, self.generation, self.property, self.component_name
+                self.object, self.generation, property, self.component_name
             ),
             format!(
                 "0x{:x} · 代际 {} · {}.{}",
                 self.object,
                 self.generation,
-                self.property,
+                property,
                 component_label(&self.component_name, Language::Chinese)
             ),
         )
@@ -169,6 +232,9 @@ impl Workspace {
             self.next_id += 1;
             let export_path = match spec.source {
                 Source::Property => format!("property-{id}.csv"),
+                Source::PropertyElement { index, .. } => {
+                    format!("property-{id}-element-{index}.csv")
+                }
                 Source::Performance(_) => format!("performance-{id}.csv"),
                 Source::ProfileEvent(_) => format!("profile-event-{id}.csv"),
             };
@@ -552,13 +618,14 @@ fn sample_with_source(
             return Err(Message::new("Curve indexing cancelled", "已取消曲线索引"));
         }
         let state = recording
-            .state_at(frame)
+            .state_at_with_cancel(frame, || cancel.load(Ordering::Relaxed))
             .map_err(|error| Message::detail("Curve indexing failed", "曲线索引失败", error))?;
         let value = state
             .objects
             .get(&spec.object)
             .filter(|object| object.generation == spec.generation)
             .and_then(|object| object.properties.get(&spec.property))
+            .and_then(|value| spec.property_value(value))
             .filter(|value| {
                 components(value)
                     .get(spec.component)
@@ -582,7 +649,7 @@ fn sample_with_source(
 pub fn csv(curve: &Curve) -> Option<String> {
     let data = curve.data.as_ref()?;
     let mut csv = String::from(
-        "frame,value,object_id,generation,property,component,stride,captured_frame_count,source,unit,status,association,zone,event,thread,context,occurrence_count,aggregation,reference_scene,reference_scene_generation,stride_basis,reference_frame_count\r\n",
+        "frame,value,object_id,generation,property,component,stride,captured_frame_count,source,unit,status,association,zone,event,thread,context,occurrence_count,aggregation,reference_scene,reference_scene_generation,stride_basis,reference_frame_count,array_index,element_type\r\n",
     );
     let quote = |value: &str| format!("\"{}\"", value.replace('"', "\"\""));
     for (index, (frame, value)) in data.samples.iter().enumerate() {
@@ -591,6 +658,12 @@ pub fn csv(curve: &Curve) -> Option<String> {
                 "property",
                 "property_value",
                 "recorded_frame_state",
+                "recorded_value",
+            ),
+            Source::PropertyElement { .. } => (
+                "property_element",
+                "property_value",
+                "recorded_fixed_array_index",
                 "recorded_value",
             ),
             Source::Performance(pvd_core::frame_metrics::Metric::FrameInterval) => (
@@ -618,6 +691,8 @@ pub fn csv(curve: &Curve) -> Option<String> {
             .map(String::as_str)
             .unwrap_or(if value.is_some() {
                 "recorded"
+            } else if matches!(curve.spec.source, Source::PropertyElement { .. }) {
+                "unavailable_element_value"
             } else {
                 "missing_property_or_generation"
             });
@@ -636,7 +711,7 @@ pub fn csv(curve: &Curve) -> Option<String> {
             _ => ",,,,".into(),
         };
         let reference_scene = match curve.spec.source {
-            Source::Property => ",".into(),
+            Source::Property | Source::PropertyElement { .. } => ",".into(),
             _ => format!("0x{:x},{}", curve.spec.object, curve.spec.generation),
         };
         let stride_basis = if matches!(curve.spec.source, Source::ProfileEvent(_)) {
@@ -648,8 +723,12 @@ pub fn csv(curve: &Curve) -> Option<String> {
             .reference_frame_count
             .map(|count| count.to_string())
             .unwrap_or_default();
+        let (array_index, element_type) = match curve.spec.source {
+            Source::PropertyElement { index, value_type } => (index.to_string(), value_type.name()),
+            _ => (String::new(), ""),
+        };
         csv.push_str(&format!(
-            "{frame},{},0x{:x},{},{},{},{},{},{source},{unit},{status},{association},{identity},{aggregation},{reference_scene},{stride_basis},{reference_frame_count}\r\n",
+            "{frame},{},0x{:x},{},{},{},{},{},{source},{unit},{status},{association},{identity},{aggregation},{reference_scene},{stride_basis},{reference_frame_count},{array_index},{element_type}\r\n",
             value.map(|v| v.to_string()).unwrap_or_default(),
             curve.spec.object,
             curve.spec.generation,
@@ -823,7 +902,7 @@ mod tests {
             diagnostics: None,
         });
         let csv = csv(curve).unwrap();
-        assert!(csv.contains("0,1.25,0x123,7,\"quoted,\"\"property\"\"\",\"position.y\",3,6,property,property_value,recorded,recorded_frame_state,,,,,,recorded_value,,,captured_frames,\r\n"));
+        assert!(csv.contains("0,1.25,0x123,7,\"quoted,\"\"property\"\"\",\"position.y\",3,6,property,property_value,recorded,recorded_frame_state,,,,,,recorded_value,,,captured_frames,,,\r\n"));
         assert!(csv.contains("3,,0x123,7,"));
         assert!(csv.contains("5,-2.5,0x123,7,"));
         assert_eq!(number(&Value::F32(f32::NAN), 0), None);
@@ -888,7 +967,7 @@ mod tests {
         });
         let csv = csv(curve).unwrap();
         let rows: Vec<Vec<_>> = csv.lines().map(|line| line.split(',').collect()).collect();
-        assert!(rows.iter().all(|row| row.len() == 22));
+        assert!(rows.iter().all(|row| row.len() == 24));
         assert_eq!(
             &rows[0][12..20],
             &[
@@ -928,7 +1007,10 @@ mod tests {
         assert_eq!(rows[3][1], "");
         assert_eq!(rows[3][10], "span_crosses_frame_boundary");
         assert_eq!(rows[3][16], "1");
-        assert_eq!(&rows[2][20..], &["reference_scene_generation_frames", "3"]);
+        assert_eq!(
+            &rows[2][20..],
+            &["reference_scene_generation_frames", "3", "", ""]
+        );
     }
 
     #[test]
@@ -956,7 +1038,7 @@ mod tests {
             let row: Vec<_> = csv.lines().nth(1).unwrap().split(',').collect();
             assert_eq!(&row[12..17], &["", "", "", "", ""]);
             assert_eq!(row[17], aggregation);
-            assert_eq!(&row[18..], &["0x456", "0", "captured_frames", ""]);
+            assert_eq!(&row[18..], &["0x456", "0", "captured_frames", "", "", ""]);
         }
     }
 
@@ -1197,6 +1279,9 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod element_tests;
 
 #[cfg(test)]
 mod streaming_stage_tests {

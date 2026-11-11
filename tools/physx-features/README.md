@@ -19,6 +19,8 @@ The script builds all three producers, creates fresh SDK streams and truth files
 
 Each executable takes two positional paths: capture and truth JSON. See `docs/heightfield.md`, `docs/query-shapes.md` and `docs/joint-limits.md` for exact evidence, commands and remaining limitations. These samples establish no claim about PVD3-saved `.pxd` / `.pxd2` containers or other SDK versions.
 
+`pvd-query-shapes --host ADDRESS --port PORT truth.json` uses a fresh SDK socket connection and writes truth for that connection. PhysX 4.1 terrain and complex-query checks use the separately built [4.1 producers](../physx41-sample/README.md).
+
 `pvd-joint-limits` also supports a fresh SDK socket connection. Start the intended listener before running:
 
 ```powershell

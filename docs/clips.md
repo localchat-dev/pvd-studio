@@ -1,12 +1,12 @@
-# 场景帧裁剪与调试绘制缓存
+# SDK 帧区间裁剪
 
-`pvd_core::clip::trim_scene_frames_streaming(source, output, first, last, progress)` 导出含首尾边界、从零编号的场景帧区间。桌面与 CLI 使用此流式入口；内存接口 `trim_scene_frames` 保留。输入与输出均为已支持的 SDK 原始 PVD communication stream；扩展名使用 `.pvdstream`，不能声称输出原版 PVD3 保存的 `.pxd/.pxd2` 容器。
+`pvd_core::clip::trim_scene_frames_streaming(source, output, first, last, progress)` 按 `frame` / `ApexFrame` End 的全局捕获顺序导出含首尾的区间，输出全局索引和各来源序号重新从零计数。这与工具栏的来源内帧号不同，见[帧来源](frame-sources.md)。桌面与 CLI 使用此流式入口；内存接口 `trim_scene_frames` 保留。输入与输出均为已支持的 SDK 原始 PVD communication stream；扩展名使用 `.pvdstream`，不能声称输出原版 PVD3 保存的 `.pxd/.pxd2` 容器。
 
 ## 磁盘文件工作流
 
-当前源码支持完整 SDK 文件的内存和磁盘加载模式：编辑及保存片段定义、重开恢复、流式另存、阶段进度与取消。磁盘加载时边解码边计算完整源身份；导出再次核对源 BLAKE3、大小和完整帧数，文件被替换时拒绝发布。仍在接收的滚动历史需先完成并保存原始录制，停止监听后重开；原版数据库的片段格式仍未实现。
+当前源码支持完整 SDK 文件的内存和磁盘加载模式：编辑及保存片段定义、重开恢复、流式另存、阶段进度与取消。磁盘加载时边解码边计算完整源身份；导出再次核对源 BLAKE3、大小和完整帧数，文件被替换时拒绝发布。仍在接收的滚动历史需先完成并保存原始录制，停止监听后重开；原版数据库使用独立的[保存与裁剪入口](native-export.md)。
 
-导出分 Inspect 和 Export 两遍完整扫描，包括选定末帧之后的尾部。第一遍验证完整流并计算 renderer 重写计划；第二遍比较所选帧的完整场景状态，并验证两遍源摘要相同。分析字节按原顺序保留，第一遍完整解码验证；不另存两份完整分析历史进行比较。流式入口不累计动作历史、帧目录和检查点，也不受总文件 512 MiB 限制。
+导出分 Inspect 和 Export 两遍完整扫描，包括选定末帧之后的尾部。第一遍验证完整流并建立原始边界与 renderer 重写计划；第二遍按各来源窗口比较所选帧的完整场景状态，并验证两遍源摘要相同。分析字节按原顺序保留，第一遍完整解码验证；不另存两份完整分析历史进行比较。流式入口不累计动作历史、帧目录和检查点，也不受总文件 512 MiB 限制。
 
 录制导出后台任务最多同时存活两个，关闭录制或换源会请求取消，晚到结果不会套用到另一录制。取消可在每 64 KiB 输入及每 512 个事件被检查；系统 I/O、单条解码或文件同步期间不能即时中断。已完成发布的文件不能被取消回滚。临时文件在同目录写入、刷新并同步，成功后无覆盖发布；取消或失败会清理本任务的暂存文件。强制结束进程可能留下暂存文件。
 
@@ -20,13 +20,13 @@ cargo test --locked --offline -p pvd-desktop studio::clip_tests:: -- --ignored
 
 ## 保留规则
 
-- 保留区间前的类型、属性元数据、对象创建与销毁、属性赋值、对象引用和错误事件，使对象代际、资源共享及第一帧的状态能够重建。仅去除区间前名为 `frame` 的 BeginSection/EndSection，不插入额外可见帧。
+- 保留区间前的元数据、对象生命周期、属性、引用和错误，使第一帧的状态能够重建。仅按原始 source 和已知名称配对 `frame` / `ApexFrame` 的 Begin/End；被选 End 的 Begin 即使位于前史也保留原位。没有保留 End 的 Begin 被移除，End-only 输入不补造 Begin。同 key 重叠 Begin 无法唯一配对时明确拒绝，不以 stream ID 猜测归属。
 - 保留性能与内存数据，包括区间前的字符串表、分配、释放和跨区间的性能事件起点。原始时间戳及事件顺序不变。`received_frame` 是接收关联帧号，区间前的分析事件归到输出第 0 帧，其他事件为原帧号减去 `first`；这不是重新计时后的区间统计。首帧内存分配/释放总数包含初始化与 preroll，跨界 span 可以早于可见区间开始。
-- 已完成的 preroll `PvdUserRenderer.events` 数据保留最后一个 SetInstanceId，并去除 Point、Line、Triangle、Text、JointFrames、四类限位及 DebugRender 批次。Renderer 的 instance 状态跨数据缓冲保留；绘制缓存则在每个可见帧结束后清空。这样不会把区间前的绘制累积到首帧。
-- 区间内 renderer payload 逐字节保留，包含完整原始 `events` 属性。协议组只重写实际受影响的长度和事件数，保持原 stream ID、时间戳及事件相对顺序。
-- Begin/Append/EndSetPropertyValue 以提交的 End 归属帧判断。完整提交于 preroll 的事务仅在最后一个 Append 中保留 instance 状态，其余 Append 为空；Begin/End 和 stream ID 不变。跨起始边界提交的事务完整保留，因此不会丢失第一帧才生效的批次。
+- 各来源首个保留帧需要从前一个同源 End 恢复绘制。共享前史只剥离早于所有来源所需窗口的绘制；任一来源没有前驱时从流头保留。被剥离的 `PvdUserRenderer.events` 只保留最后一个 SetInstanceId，来源窗口见[帧来源](frame-sources.md#绘制窗口)。
+- 必要绘制窗口及区间内的 renderer payload 逐字节保留，包含完整原始 `events` 属性。协议组只重写受影响的长度和事件数，保留原 source、section 名称、ticks、stream ID 和事件相对顺序。末个选定 End 之后的绘制不移入该帧。
+- Begin/Append/EndSetPropertyValue 以 EndSetPropertyValue 的完整提交位置判断。提交早于所需窗口的事务仅在最后一个 Append 中保留 instance 状态，其余 Append 为空；跨越窗口下界的事务完整保留，Begin/End 和 stream ID 不变。
 
-返回前重新解析输出，并逐帧比较原区间与输出的完整 `SceneState`，包含对象全部属性原始字节、引用代际、错误、接触点和调试绘制；任何差异返回错误。不能通过省略 `debug_draw` 或原始 `events` 属性来通过验收。
+输出按原区间逐帧核对；流式入口先在两侧投影对应来源的绘制窗口，再比较完整 `SceneState`，包含对象全部属性原始字节、引用代际、错误、接触点和调试绘制；任何差异返回错误。不能通过省略 `debug_draw` 或原始 `events` 属性来通过验收。
 
 ## 协议证据
 
@@ -39,9 +39,9 @@ PhysX 3.4.2 官方 SDK 固定提交 `5e42a5f112351a223c19c17bb331e6c55037b8eb`�
 
 这些源码给出可靠事件边界。未知 renderer 事件没有外层单事件长度，裁剪直接拒绝；不能猜测跳过长度。该证据不等于已经观察过原版 PVD3 的片段导出文件或界面行为。
 
-## 已执行验收
+## 验证范围
 
-`crates/pvd-core/tests/clips.rs` 显式运行的三个测试全部通过：
+既有 PhysX 3.4.2 验收记录包括：
 
 | 真实输入 | 场景帧 | 区间数 | 核对内容 |
 | --- | ---: | ---: | --- |
@@ -67,6 +67,8 @@ cargo run --locked -p pvd-cli -- trim captures/physx-3.4-rich.pvdstream 70 100 o
 ```
 
 真实输入生成方式分别见 `tools/verify-sdk.ps1`、`docs/joint-limits.md`、`docs/heightfield.md` 和 `docs/query-shapes.md`；测试允许用 `PVD_SDK34_CAPTURE`、`PVD_SDK34_RICH_CAPTURE`、`PVD_JOINT_LIMIT_CAPTURE`、`PVD_HEIGHTFIELD_CAPTURE`、`PVD_QUERY_SHAPES_CAPTURE`、`PVD_CLIP_ERROR_CAPTURE`、`PVD_CLIP_ANALYSIS_CAPTURE` 指向其他相应真实输入。没有输入时保持 ignored；不能把默认测试报告为真实验收已通过。
+
+`apex_clips` 已覆盖双端序、同 raw source 的不同名称、嵌套与未配对边界、分块提交、连续裁剪、取消、资源限制和独立图元真值。真实 APEX 同步/异步前缀另核对原始 payload、事件组元数据、来源端点和完整帧状态；不可表示的中段保持拒绝。命令与输入见[APEX 生产器](../tools/physx-apex-clothing/README.md)。
 
 ## 边界与限制
 
@@ -102,7 +104,7 @@ cargo test --locked --offline -p pvd-desktop camera_controller::tests::modal_can
 
 ## 裁剪格式边界
 
-- 流式入口的瞬时场景及元数据预算为每个验证器 512 MiB，第一遍分析预算为 128 MiB；这些不是整个进程 RSS 上限。单协议组最多 64 MiB。Renderer 临时事务数据总量不超过 64 MiB，待提交 Append 索引总数不超过 1,000,000；重写计划最多 524,288 项。数组最多 1,000,000 个元素，文本最多 1 MiB。所有偏移与乘法检查溢出和截断。
-- 若首个选定帧没有新的 renderer payload，原状态可能同时包含旧 `events` 原始属性和已清空的绘制缓存。当前已证实的流事件不能同时表达这两个条件，完整比较会明确拒绝。零字节 payload 和没有 payload 是不同情况：前者会更新原始属性，后者不会。
+- 流式入口的瞬时场景及元数据预算为每个验证器 512 MiB，第一遍分析预算为 128 MiB；这些不是整个进程 RSS 上限。单协议组最多 64 MiB。Renderer 临时事务数据总量不超过 64 MiB，待提交 Append 索引总数不超过 1,000,000；重写计划最多 524,288 项，section 边界计划最多 65,536 项。绘制日志还有[独立窗口预算](frame-sources.md#绘制窗口)。数组最多 1,000,000 个元素，文本最多 1 MiB。所有偏移与乘法检查溢出和截断。
+- 多来源中段可能需要不同的前驱 End；移除这些 End 后，共享事件前史不能总是表达各自的初始绘制窗口。完整状态比较会拒绝这类区间，不增加、移位或伪造边界。首帧同时要求旧 `events` 原始属性和空绘制窗口时也可能不可表示。零字节 payload 与没有 payload 不同：前者更新原始属性，后者不会。
 - 截止边界留下尚未提交的属性事务，或其他不能重建的依赖时，重新解析或完整比较返回错误。流式调用方必须写入暂存文件，仅在返回成功后发布目标文件。
 - 这是保留初始化历史的场景帧裁剪，文件不保证按帧数同比变小，也不保证删除区间外全部分析数据。原版保存容器、字节最小化重写、多 SDK 裁剪与原版 PVD3 导出行为尚未独立验收。

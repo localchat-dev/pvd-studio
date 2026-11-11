@@ -152,7 +152,7 @@ fn height_field_scale(geometry: &Object) -> Option<[f32; 3]> {
         .then_some(scale)
 }
 
-fn height_field_geometry(mesh: &Object, geometry: &Object) -> Option<Geometry> {
+fn height_field_geometry(mesh: &Object, geometry: &Object, thickness: f32) -> Option<Geometry> {
     if integer(mesh.properties.get("Format")?)? != 1 {
         return None;
     }
@@ -167,10 +167,6 @@ fn height_field_geometry(mesh: &Object, geometry: &Object) -> Option<Geometry> {
         return None;
     }
     let scale = height_field_scale(geometry)?;
-    let thickness = scalar(mesh.properties.get("Thickness"))?;
-    if !thickness.is_finite() {
-        return None;
-    }
     let Value::Array(samples) = mesh.properties.get("Samples")? else {
         return None;
     };
@@ -237,12 +233,30 @@ fn height_field_geometry(mesh: &Object, geometry: &Object) -> Option<Geometry> {
 }
 
 impl SceneState {
+    fn height_field_thickness(&self, mesh: &Object) -> Option<f32> {
+        if let Some(value) = mesh.properties.get("Thickness") {
+            let thickness = scalar(Some(value))?;
+            return thickness.is_finite().then_some(thickness);
+        }
+        let Value::Ref(id) = mesh.properties.get("Physics")? else {
+            return None;
+        };
+        let physics = self.resolve_reference(mesh.id, "Physics", *id)?;
+        // 4.1.2 不发送 Thickness；其他来源缺少字段时不能推断三角面绕序。
+        (physics.type_name.ends_with("::PxPhysics")
+            && physics.properties.get("Version.Major") == Some(&Value::U64(4))
+            && physics.properties.get("Version.Minor") == Some(&Value::U64(1))
+            && physics.properties.get("Version.Bugfix") == Some(&Value::U64(2)))
+        .then_some(0.0)
+    }
+
     pub(crate) fn mesh_key(&self, geometry: &Object) -> Option<MeshKey> {
         let kind = MeshKind::for_geometry(geometry)?;
         let property = kind.property();
         let id = *refs(geometry.properties.get(property)).first()?;
         let resource = self.resolve_reference(geometry.id, property, id)?;
         let (scale, rotation) = if kind == MeshKind::HeightField {
+            self.height_field_thickness(resource)?;
             (height_field_scale(geometry)?, [0.0, 0.0, 0.0, 1.0])
         } else {
             let scale = vec3(geometry.properties.get("Scale.Scale"))?;
@@ -265,7 +279,7 @@ impl SceneState {
         let id = *refs(geometry.properties.get(property)).first()?;
         let mesh = self.resolve_reference(geometry.id, property, id)?;
         if kind == MeshKind::HeightField {
-            return height_field_geometry(mesh, geometry);
+            return height_field_geometry(mesh, geometry, self.height_field_thickness(mesh)?);
         }
         let Value::Array(points) = mesh.properties.get("Points")? else {
             return None;
@@ -535,6 +549,77 @@ mod tests {
     }
 
     #[test]
+    fn height_fields_without_thickness_preserve_standard_winding_and_cache_identity() {
+        let mut state = height_field_state();
+        let mut cache = MeshCache::default();
+        Action::Set(4, "Thickness".into(), Value::F32(1.0)).apply(&mut state);
+        let Geometry::TriangleMesh { indices, .. } =
+            cache.decode(&state, &state.objects[&3]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(&*indices, &[2, 3, 0]);
+        state
+            .objects
+            .get_mut(&4)
+            .unwrap()
+            .properties
+            .remove("Thickness");
+        assert!(cache.decode(&state, &state.objects[&3]).is_none());
+        let physics = Object {
+            id: 5,
+            generation: 0,
+            type_name: "physx::PxPhysics".into(),
+            properties: BTreeMap::from([
+                ("Version.Major".into(), Value::U64(4)),
+                ("Version.Minor".into(), Value::U64(1)),
+                ("Version.Bugfix".into(), Value::U64(2)),
+            ]),
+        };
+        Action::Create(physics.clone()).apply(&mut state);
+        Action::Set(4, "Physics".into(), Value::Ref(5)).apply(&mut state);
+        let Geometry::TriangleMesh { indices, .. } =
+            cache.decode(&state, &state.objects[&3]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(&*indices, &[2, 0, 3]);
+        assert_eq!(state.render_scene().objects.len(), 1);
+        for (name, invalid) in [
+            ("Version.Major", Value::U64(3)),
+            ("Version.Minor", Value::U64(0)),
+            ("Version.Bugfix", Value::U64(1)),
+            ("Version.Major", Value::String("4".into())),
+        ] {
+            Action::Set(5, name.into(), invalid).apply(&mut state);
+            assert!(cache.decode(&state, &state.objects[&3]).is_none());
+            Action::Set(5, name.into(), physics.properties[name].clone()).apply(&mut state);
+            assert!(cache.decode(&state, &state.objects[&3]).is_some());
+        }
+        for thickness in [Value::F32(f32::NAN), Value::String("0".into())] {
+            Action::Set(4, "Thickness".into(), thickness).apply(&mut state);
+            assert!(cache.decode(&state, &state.objects[&3]).is_none());
+        }
+        state
+            .objects
+            .get_mut(&4)
+            .unwrap()
+            .properties
+            .remove("Thickness");
+        Action::Destroy(5).apply(&mut state);
+        let replacement = Object {
+            generation: 1,
+            ..physics
+        };
+        Action::Create(replacement).apply(&mut state);
+        assert!(cache.decode(&state, &state.objects[&3]).is_none());
+        Action::Set(4, "Physics".into(), Value::Ref(5)).apply(&mut state);
+        assert!(cache.decode(&state, &state.objects[&3]).is_some());
+        state.objects.get_mut(&5).unwrap().type_name = "custom::Version".into();
+        assert!(cache.decode(&state, &state.objects[&3]).is_none());
+    }
+
+    #[test]
     fn height_fields_reject_truncation_invalid_dimensions_scalars_and_excessive_resources() {
         let original = height_field_state();
         for (id, property, value) in [
@@ -564,6 +649,7 @@ mod tests {
             (4, "NbColumns", Value::U64(1)),
             (4, "Format", Value::U64(2)),
             (4, "Thickness", Value::F32(f32::NAN)),
+            (4, "Thickness", Value::String("0".into())),
             (3, "HeightScale", Value::F32(f32::INFINITY)),
             (3, "RowScale", Value::F32(-1.0)),
             (3, "ColumnScale", Value::F32(0.0)),

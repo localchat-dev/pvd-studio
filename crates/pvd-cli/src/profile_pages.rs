@@ -3,7 +3,7 @@ use pvd_core::profile_curves::{
     CatalogCursor, CatalogPageReport, ExactKey, MAX_CATALOG_PAGE, SourceIdentity,
     catalog_page_streaming,
 };
-use std::{fs::File, io::Write};
+use std::io::Write;
 
 pub fn run(path: &str, limit: usize, token: Option<&str>) -> Result<()> {
     crate::project_capture::require_full_source(path)?;
@@ -12,13 +12,13 @@ pub fn run(path: &str, limit: usize, token: Option<&str>) -> Result<()> {
     }
     let cursor = token.map(decode_cursor).transpose()?;
     let cancel = cancellation::Cancellation::install()?;
-    if crate::is_native_capture(path)? {
+    let mut file = crate::input::Input::open(path, |_, _| !cancel.requested())?;
+    if file.is_native()? {
         return Err(
             "profile-events-page requires an SDK stream; use profile-events for a native capture"
                 .into(),
         );
     }
-    let mut file = File::open(path)?;
     let mut last = None;
     let page =
         catalog_page_streaming(&mut file, cursor.as_ref(), limit, cancel.flag(), |status| {

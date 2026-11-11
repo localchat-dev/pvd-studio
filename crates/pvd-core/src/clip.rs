@@ -1,4 +1,4 @@
-use crate::{Error, Recording, error};
+use crate::{Error, Recording, error, frame_sources::FrameSection};
 use pvd_protocol::{Decoder, Endian, Event, Name, rewrite::map_group_events};
 use std::{
     borrow::Cow,
@@ -9,6 +9,7 @@ mod validation;
 pub use streaming::{TrimPhase, TrimProgress, TrimReport, trim_scene_frames_streaming};
 pub(crate) use validation::ValidationState;
 
+/// Selects an inclusive global range of SDK `frame` / `ApexFrame` End events.
 pub fn trim_scene_frames(bytes: &[u8], first: usize, last: usize) -> Result<Vec<u8>, Error> {
     if bytes.starts_with(&crate::native::MAGIC.to_le_bytes()) {
         return Err(error(
@@ -23,7 +24,8 @@ pub fn trim_scene_frames(bytes: &[u8], first: usize, last: usize) -> Result<Vec<
         )));
     }
     let endian = source.header.endian;
-    let patches = preroll_renderer_patches(bytes, endian, first)?;
+    let sections = section_plan(bytes, first, last)?;
+    let patches = preroll_renderer_patches(bytes, endian, sections.renderer_frame())?;
     let mut output = bytes
         .get(..28)
         .ok_or_else(|| error("truncated header"))?
@@ -48,7 +50,8 @@ pub fn trim_scene_frames(bytes: &[u8], first: usize, last: usize) -> Result<Vec<
                 .get(offset..offset + 24 + length)
                 .ok_or_else(|| error("invalid source group boundary"))?;
             let retained = map_group_events(raw, endian, |event, raw| {
-                let patch = patches.get(&ordinal);
+                let event_ordinal = ordinal;
+                let patch = patches.get(&event_ordinal).map(|patch| &patch.data);
                 ordinal += 1;
                 if done {
                     return Ok(None);
@@ -59,13 +62,11 @@ pub fn trim_scene_frames(bytes: &[u8], first: usize, last: usize) -> Result<Vec<
                         true
                     }
                     Event::BeginSection { name, .. }
-                        if strings.get(name).is_some_and(|s| s == "frame") =>
+                        if frame_section(&strings, *name).is_some() =>
                     {
-                        frame >= first
+                        sections.retain_begin(event_ordinal, frame >= first)
                     }
-                    Event::EndSection { name, .. }
-                        if strings.get(name).is_some_and(|s| s == "frame") =>
-                    {
+                    Event::EndSection { name, .. } if frame_section(&strings, *name).is_some() => {
                         let keep = frame >= first;
                         done = frame == last;
                         frame += 1;
@@ -92,9 +93,23 @@ pub fn trim_scene_frames(bytes: &[u8], first: usize, last: usize) -> Result<Vec<
         return Err(error("trimmed frame count differs from requested range"));
     }
     for frame in 0..trimmed.frame_count() {
+        let expected = source.frame_info(first + frame).unwrap();
+        let actual = trimmed.frame_info(frame).unwrap();
+        if expected.timestamp != actual.timestamp
+            || expected.scene_id != actual.scene_id
+            || source
+                .frame_sources
+                .frame(first + frame)
+                .map(|(source, _)| source)
+                != trimmed.frame_sources.frame(frame).map(|(source, _)| source)
+        {
+            return Err(error(
+                "trimmed frame source or timestamp differs from the captured endpoint",
+            ));
+        }
         if trimmed.state_at(frame)? != source.state_at(first + frame)? {
             return Err(error(format!(
-                "trim cannot preserve complete scene state at source frame {}; a renderer with no replacement payload may retain an earlier raw event buffer, or the selected boundary may have another unrepresentable dependency",
+                "trim cannot preserve complete scene state at source frame {}; the source rendering window, renderer raw data or another boundary dependency is not representable",
                 first + frame
             )));
         }
@@ -107,11 +122,185 @@ struct RendererTransaction {
     appends: Vec<usize>,
 }
 
+struct RendererPatch {
+    data: Vec<u8>,
+    completed: usize,
+}
+
+fn frame_section(strings: &BTreeMap<u32, String>, name: u32) -> Option<FrameSection> {
+    strings
+        .get(&name)
+        .and_then(|name| FrameSection::from_name(name))
+}
+
+const MAX_SECTION_PLAN_ENTRIES: usize = 65_536;
+
+struct OpenSection {
+    ordinal: usize,
+    frame: usize,
+}
+
+#[derive(Default)]
+struct SectionPlan {
+    open: BTreeMap<(u64, FrameSection), OpenSection>,
+    keep_before: BTreeSet<usize>,
+    drop_after: BTreeSet<usize>,
+    last_ends: BTreeMap<(u64, FrameSection), (usize, usize)>,
+    first_sources: BTreeSet<(u64, FrameSection)>,
+    renderer_boundary: Option<(usize, usize)>,
+}
+
+impl SectionPlan {
+    fn observe(
+        &mut self,
+        event: &Event,
+        strings: &BTreeMap<u32, String>,
+        ordinal: usize,
+        frame: usize,
+        first: usize,
+        last: usize,
+    ) -> Result<(), Error> {
+        match event {
+            Event::BeginSection { id, name, .. } => {
+                let Some(section) = frame_section(strings, *name) else {
+                    return Ok(());
+                };
+                let key = (*id, section);
+                if self.open.contains_key(&key) {
+                    return Err(error(format!(
+                        "overlapping {} sections for source 0x{id:X} cannot be trimmed unambiguously",
+                        section.name()
+                    )));
+                }
+                self.reserve_marker()?;
+                self.open.insert(key, OpenSection { ordinal, frame });
+            }
+            Event::EndSection { id, name, .. } => {
+                let Some(section) = frame_section(strings, *name) else {
+                    return Ok(());
+                };
+                let key = (*id, section);
+                if (first..=last).contains(&frame) && !self.first_sources.contains(&key) {
+                    let previous = self.last_ends.get(&key).copied();
+                    self.renderer_boundary = if self.first_sources.is_empty() {
+                        previous
+                    } else {
+                        self.renderer_boundary
+                            .zip(previous)
+                            .map(|(left, right)| left.min(right))
+                    };
+                    self.reserve_marker()?;
+                    self.first_sources.insert(key);
+                }
+                if let Some(begin) = self.open.remove(&key)
+                    && (first..=last).contains(&frame)
+                    && begin.frame < first
+                {
+                    self.reserve_marker()?;
+                    self.keep_before.insert(begin.ordinal);
+                }
+                if frame == last {
+                    self.last_ends.clear();
+                    self.first_sources.clear();
+                    let pending = self
+                        .open
+                        .values()
+                        .filter(|begin| begin.frame >= first)
+                        .count();
+                    if pending > MAX_SECTION_PLAN_ENTRIES.saturating_sub(self.marker_count()) {
+                        return Err(error("section trim plan exceeds its boundary budget"));
+                    }
+                    self.drop_after.extend(
+                        self.open
+                            .values()
+                            .filter(|begin| begin.frame >= first)
+                            .map(|begin| begin.ordinal),
+                    );
+                } else if frame < last {
+                    if !self.last_ends.contains_key(&key) {
+                        self.reserve_marker()?;
+                    }
+                    self.last_ends.insert(
+                        key,
+                        (
+                            frame
+                                .checked_add(1)
+                                .ok_or_else(|| error("section frame count overflow"))?,
+                            ordinal,
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn marker_count(&self) -> usize {
+        self.open.len()
+            + self.keep_before.len()
+            + self.drop_after.len()
+            + self.last_ends.len()
+            + self.first_sources.len()
+    }
+
+    fn reserve_marker(&self) -> Result<(), Error> {
+        if self.marker_count() >= MAX_SECTION_PLAN_ENTRIES {
+            return Err(error("section trim plan exceeds its boundary budget"));
+        }
+        Ok(())
+    }
+
+    fn retain_begin(&self, ordinal: usize, within_range: bool) -> bool {
+        self.keep_before.contains(&ordinal) || (within_range && !self.drop_after.contains(&ordinal))
+    }
+
+    fn finish(&mut self) {
+        self.open.clear();
+        self.last_ends.clear();
+        self.first_sources.clear();
+    }
+
+    fn renderer_frame(&self) -> usize {
+        self.renderer_boundary.map_or(0, |(frame, _)| frame)
+    }
+}
+
+fn section_plan(bytes: &[u8], first: usize, last: usize) -> Result<SectionPlan, Error> {
+    let mut decoder = Decoder::default();
+    let mut strings = BTreeMap::new();
+    let mut plan = SectionPlan::default();
+    let mut ordinal = 0usize;
+    let mut frame = 0usize;
+    for chunk in bytes.chunks(64 << 10) {
+        for group in decoder.feed(chunk)? {
+            for event in group.events {
+                if let Event::StringHandle { handle, value } = &event {
+                    strings.insert(*handle, value.clone());
+                }
+                plan.observe(&event, &strings, ordinal, frame, first, last)?;
+                if matches!(event, Event::EndSection { name, .. } if frame_section(&strings, name).is_some())
+                {
+                    frame = frame
+                        .checked_add(1)
+                        .ok_or_else(|| error("section frame count overflow"))?;
+                }
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| error("event ordinal overflow"))?;
+            }
+        }
+    }
+    decoder.finish()?;
+    plan.finish();
+    Ok(plan)
+}
+
 fn preroll_renderer_patches(
     bytes: &[u8],
     endian: Endian,
     first: usize,
-) -> Result<BTreeMap<usize, Vec<u8>>, Error> {
+) -> Result<BTreeMap<usize, RendererPatch>, Error> {
     if first == 0 {
         return Ok(BTreeMap::new());
     }
@@ -156,7 +345,7 @@ fn preroll_renderer_patches(
                         }
                         let filtered = renderer_instance_state(&data, endian)?;
                         let patch = encode_set(id, property, datatype, &filtered, endian);
-                        insert_patch(&mut patches, ordinal, patch)?;
+                        insert_patch(&mut patches, ordinal, ordinal, patch)?;
                     }
                     Event::BeginSetPropertyValue {
                         id,
@@ -200,19 +389,23 @@ fn preroll_renderer_patches(
                             pending_bytes -= transaction.data.len();
                             pending_appends -= transaction.appends.len();
                             let filtered = renderer_instance_state(&transaction.data, endian)?;
+                            let completed = ordinal;
                             for (index, ordinal) in transaction.appends.iter().enumerate() {
                                 let data = if index + 1 == transaction.appends.len() {
                                     &filtered[..]
                                 } else {
                                     &[][..]
                                 };
-                                insert_patch(&mut patches, *ordinal, encode_append(data, endian))?;
+                                insert_patch(
+                                    &mut patches,
+                                    *ordinal,
+                                    completed,
+                                    encode_append(data, endian),
+                                )?;
                             }
                         }
                     }
-                    Event::EndSection { name, .. }
-                        if strings.get(&name).is_some_and(|name| name == "frame") =>
-                    {
+                    Event::EndSection { name, .. } if frame_section(&strings, name).is_some() => {
                         frame += 1;
                         if frame == first {
                             return Ok(patches);
@@ -228,14 +421,15 @@ fn preroll_renderer_patches(
 }
 
 fn insert_patch(
-    patches: &mut BTreeMap<usize, Vec<u8>>,
+    patches: &mut BTreeMap<usize, RendererPatch>,
     ordinal: usize,
+    completed: usize,
     data: Vec<u8>,
 ) -> Result<(), Error> {
     if patches.len() >= (64usize << 20) / 128 {
         return Err(error("renderer rewrite plan exceeds 64 MiB"));
     }
-    patches.insert(ordinal, data);
+    patches.insert(ordinal, RendererPatch { data, completed });
     Ok(())
 }
 

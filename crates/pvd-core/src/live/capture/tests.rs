@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 mod key_schema;
 mod reexport_tests;
+mod source_tests;
 
 struct FrameClock {
     origin: u64,
@@ -161,6 +162,11 @@ impl Fixture {
         .snapshot()
         .unwrap();
         recording.frames = disk.frames.clone();
+        recording.frame_sources = crate::frame_sources::FrameDirectory::from_legacy(
+            &recording.frames,
+            Default::default(),
+        )
+        .unwrap();
         recording.disk = Some(disk);
         recording.streamed_frame_end = Some(8);
         Self {

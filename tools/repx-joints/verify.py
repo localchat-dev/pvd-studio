@@ -82,6 +82,23 @@ def validate_dependencies(values, expected_count):
         assert any(actors.get(identifier, {}).get("type") == "PxRigidDynamic" for identifier in joint["actors"]), joint
 
 
+def connected_component(values, selected):
+    actors, joints = {selected}, set()
+    while True:
+        before = len(actors), len(joints)
+        for joint in values["joints"]:
+            if any(identifier in actors for identifier in joint["actors"]):
+                joints.add(joint["id"])
+                actors.update(identifier for identifier in joint["actors"] if identifier)
+        if before == (len(actors), len(joints)):
+            break
+    return {
+        **values,
+        "actors": [actor for actor in values["actors"] if actor["id"] in actors],
+        "joints": [joint for joint in values["joints"] if joint["id"] in joints],
+    }
+
+
 def import_and_compare(producer, input_path, expected, output_prefix, named_ids=False):
     observed = output_prefix.with_suffix(".json")
     roundtrip = output_prefix.with_suffix(".xml")
@@ -91,6 +108,41 @@ def import_and_compare(producer, input_path, expected, output_prefix, named_ids=
     if named_ids:
         expected, actual = by_names(expected), by_names(actual)
     return compare(expected, actual)
+
+
+def check_zero_flag_reader(producer, reference, original, output):
+    fields = {"constraint_flags", "spherical_flags", "distance_flags", "revolute_flags", "prismatic_flags"}
+    rows = []
+    for mode in ("zero", "empty", "omitted"):
+        document = ET.parse(reference)
+        expected = copy.deepcopy(original)
+        for joint in expected["joints"]:
+            for name in fields.intersection(joint):
+                joint[name] = 0
+            if mode != "zero":
+                if "distance_flags" in joint:
+                    joint["distance_flags"] = 2
+            for drive in joint.get("drives", []):
+                drive["flags"] = 0
+        count = 0
+        for joint in document.getroot():
+            if not joint.tag.endswith("Joint"):
+                continue
+            for parent in joint.iter():
+                for child in list(parent):
+                    if child.tag.endswith("Flags"):
+                        count += 1
+                        if mode == "omitted":
+                            parent.remove(child)
+                        else:
+                            child.text = "0" if mode == "zero" else ""
+        assert count >= len(original["joints"])
+        candidate = output / f"joint-flags-{mode}.xml"
+        document.write(candidate, encoding="utf-8")
+        values = import_and_compare(producer, candidate, expected, output / f"joint-flags-{mode}-import")
+        rows.append({"mode": mode, "fields": count, "getter_values": values,
+                     "xml_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest()})
+    return {"scope": "controlled SDK reader inputs; nonempty zero is not a general numeric flag syntax", "cases": rows}
 
 
 def main():
@@ -111,7 +163,7 @@ def main():
         replay = execute([args.cli, "verify", capture])
         assert "verified_frames: 3\n" in replay.stdout, replay.stdout
     expected_frames = []
-    official_values, exported_values = 0, 0
+    official_values, exported_values, selected_values = 0, 0, 0
     counts = (8, 8, 2) if args.expanded else (3, 3, 2)
     for frame, count in enumerate(counts):
         expected = load(output / f"frame-{frame}-truth.json")
@@ -130,6 +182,14 @@ def main():
             exported_values += import_and_compare(
                 args.producer, exported, expected, output / f"frame-{frame}-exported-import"
             )
+            for index, actor in enumerate(expected["actors"]):
+                component = connected_component(expected, actor["id"])
+                selected_path = output / f"frame-{frame}-actor-{index}.xml"
+                execute([args.cli, "repx", capture, frame, selected_path, actor["id"]])
+                selected_values += import_and_compare(
+                    args.producer, selected_path, component,
+                    output / f"frame-{frame}-actor-{index}-import",
+                )
         print(f"frame {frame}: {count} joints; actor dependencies, poses, limits and flags match SDK getters")
     first = {joint["name"]: joint for joint in expected_frames[0]["joints"]}
     second = {joint["name"]: joint for joint in expected_frames[1]["joints"]}
@@ -152,12 +212,6 @@ def main():
     assert first["world-joint"]["actors"][0] == 0
     assert all(types[identifier] == "PxRigidDynamic" for identifier in first["body-joint"]["actors"])
     assert [types[identifier] for identifier in first["static-joint"]["actors"]] == ["PxRigidStatic", "PxRigidDynamic"]
-    if not args.producer_only:
-        rejected = output / "connected-actor-rejected.xml"
-        selected = first["world-joint"]["actors"][1]
-        result = execute([args.cli, "repx", capture, 0, rejected, selected], succeed=False)
-        assert "RepX" in result.stderr, result.stderr
-        assert not rejected.exists(), "Rejected Actor export left an output file"
     rich_values = 0
     if args.rich_producer:
         rich_capture, reference = output / "rich.pvdstream", output / "rich-reference.xml"
@@ -173,6 +227,7 @@ def main():
             assert len(ET.parse(exported).getroot().findall("PxSphericalJoint")) == 1
             rich_values = import_and_compare(args.producer, exported, expected, output / "rich-exported-import", named_ids=True)
             print("rich frame: spherical joint and Actor dependencies match getters from independent SDK reference XML")
+    zero_flags = check_zero_flag_reader(args.producer, output / "frame-0-reference.xml", expected_frames[0], output)
     result = {
         "sdk_commit": "5e42a5f112351a223c19c17bb331e6c55037b8eb",
         "sdk_version": "3.4.2", "producer_configuration": "Debug with checked SDK libraries",
@@ -183,7 +238,10 @@ def main():
         "replay_verified_frames": 0 if args.producer_only else 3,
         "official_roundtrip_getter_values": official_values,
         "rust_export_getter_values": exported_values,
+        "selected_actor_getter_values": selected_values,
+        "selected_actor_exports": 0 if args.producer_only else sum(len(frame["actors"]) for frame in expected_frames),
         "rich_export_getter_values": rich_values,
+        "zero_flag_reader": zero_flags,
     }
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     scope = "SDK producer/importer self-check" if args.producer_only else "Rust export -> SDK importer"

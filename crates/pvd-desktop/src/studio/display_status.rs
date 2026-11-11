@@ -78,7 +78,7 @@ impl DisplayReason {
 impl Studio {
     pub fn display_mode(&self) -> DisplayMode {
         if self.follow_live {
-            if self.count() == 0 {
+            if self.count() == 0 || self.source_selection_pending() {
                 DisplayMode::Waiting
             } else {
                 DisplayMode::Live
@@ -100,7 +100,7 @@ impl Studio {
         match self.display_mode() {
             DisplayMode::Live => language.text("Following latest decoded frame", "跟随最新解码帧"),
             DisplayMode::Waiting => {
-                language.text("Waiting for a completed frame", "等待首个完整帧")
+                language.text("Waiting for the selected frame source", "等待所选帧源")
             }
             DisplayMode::Forward | DisplayMode::Reverse => {
                 language.text("Recorded history", "历史回放")
@@ -115,15 +115,22 @@ impl Studio {
         if self.count() == 0 {
             return String::new();
         }
-        let frame = self.frame;
-        if let Some(target) = self.seeking {
+        let frame = self.frame_ordinal(self.frame);
+        if let Some(index) = self.seeking {
+            let target = self.frame_ordinal(index);
             return match language {
                 Language::English => format!("Frame {frame} → {target}"),
                 Language::Chinese => format!("帧 {frame} → {target}"),
             };
         }
-        if self.live_connected && !self.follow_live {
-            let latest = self.live_frame;
+        if self.live_connected
+            && !self.follow_live
+            && self
+                .displayed_frame_source
+                .zip(self.live_frame_source)
+                .is_none_or(|((displayed, _), (live, _))| displayed == live)
+        {
+            let latest = self.frame_ordinal(self.live_frame);
             let behind = latest.saturating_sub(frame);
             return match language {
                 Language::English => format!("Frame {frame} · {behind} behind live ({latest})"),
@@ -152,6 +159,7 @@ impl Studio {
         self.leave_live(reason);
         self.playing = 0;
         self.cancel_seek();
+        self.restore_display_frame_source();
     }
 
     pub(super) fn seek_paused(&mut self, target: usize, reason: DisplayReason) {

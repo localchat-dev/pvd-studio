@@ -4,6 +4,7 @@ pub(super) const BLOB: u8 = 2;
 pub(super) const RECORD: u8 = 3;
 pub(super) const SEGMENT: u8 = 4;
 pub(super) const METADATA: u8 = 5;
+pub(super) const FRAME_SOURCES: u8 = 6;
 pub(super) const FOOTER: u8 = 255;
 pub(super) const ENTRY_HEADER: usize = 41;
 pub(super) const MAX_ENTRY: usize = MAX_RECORD + 128;

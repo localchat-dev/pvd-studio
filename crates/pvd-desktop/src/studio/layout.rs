@@ -2,19 +2,6 @@ use egui_dock::{DockState, Node, NodeIndex, Surface, SurfaceIndex};
 
 use super::{Panel, Preferences};
 
-const PANELS: [Panel; 10] = [
-    Panel::Objects,
-    Panel::Viewport,
-    Panel::Inspector,
-    Panel::Timeline,
-    Panel::Clips,
-    Panel::Performance,
-    Panel::Memory,
-    Panel::Curves,
-    Panel::Diagnostics,
-    Panel::Display,
-];
-
 fn validate_structure(dock: &DockState<Panel>) -> Result<(), &'static str> {
     if !matches!(
         dock.get_surface(SurfaceIndex::main()),
@@ -22,10 +9,16 @@ fn validate_structure(dock: &DockState<Panel>) -> Result<(), &'static str> {
     ) {
         return Err("dock layout has no main surface");
     }
-    for surface in dock.iter_surfaces() {
+    for (surface_index, surface) in dock.iter_surfaces().enumerate() {
+        if surface_index > 0 && matches!(surface, Surface::Main(_)) {
+            return Err("dock floating surface has no window state");
+        }
         let Some(tree) = surface.node_tree() else {
             continue;
         };
+        if matches!(surface, Surface::Window(_, _)) && tree.is_empty() {
+            return Err("dock floating surface is empty");
+        }
         for (index, node) in tree.iter().enumerate() {
             if node.is_empty() {
                 continue;
@@ -47,7 +40,8 @@ fn validate_structure(dock: &DockState<Panel>) -> Result<(), &'static str> {
                     }
                 }
                 Node::Leaf(leaf) => {
-                    if (!leaf.tabs.is_empty() && leaf.active.0 >= leaf.tabs.len())
+                    if leaf.tabs.is_empty()
+                        || leaf.active.0 >= leaf.tabs.len()
                         || !leaf.scroll.is_finite()
                     {
                         return Err("dock leaf state is invalid");
@@ -67,10 +61,42 @@ fn validate_structure(dock: &DockState<Panel>) -> Result<(), &'static str> {
 
 pub(super) fn validate(dock: &DockState<Panel>) -> Result<(), &'static str> {
     validate_structure(dock)?;
-    if PANELS.iter().any(|panel| dock.find_tab(panel).is_none()) {
-        return Err("dock layout is missing required panels");
+    if dock.find_tab(&Panel::Viewport).is_none() {
+        return Err("dock layout is missing the scene panel");
+    }
+    if has_duplicates(dock) {
+        return Err("dock layout contains duplicate panels");
     }
     Ok(())
+}
+
+fn has_duplicates(dock: &DockState<Panel>) -> bool {
+    Panel::ALL.iter().any(|panel| {
+        dock.iter_all_tabs()
+            .filter(|(_, tab)| *tab == panel)
+            .take(2)
+            .count()
+            > 1
+    })
+}
+
+pub(super) fn show_panel(dock: &mut DockState<Panel>, panel: Panel) {
+    if dock.find_tab(&panel).is_none() {
+        let neighbor = match panel {
+            Panel::Inspector => Panel::Display,
+            Panel::Display => Panel::Inspector,
+            Panel::Objects | Panel::Viewport => Panel::Viewport,
+            _ => Panel::Timeline,
+        };
+        if let Some((surface, node, _)) = dock.find_tab(&neighbor) {
+            dock[surface][node].append_tab(panel);
+        } else {
+            dock.main_surface_mut().push_to_first_leaf(panel);
+        }
+    }
+    if let Some(location) = dock.find_tab(&panel) {
+        dock.reveal_tab(location);
+    }
 }
 
 pub(super) fn repair(dock: &mut DockState<Panel>) {
@@ -92,16 +118,20 @@ pub(super) fn repair(dock: &mut DockState<Panel>) {
             Node::Empty => {}
         }
     }
-    if validate_structure(dock).is_err() || dock.iter_all_tabs().next().is_none() {
+    if validate_structure(dock).is_err()
+        || dock.iter_all_tabs().next().is_none()
+        || has_duplicates(dock)
+    {
         *dock = Preferences::default().dock;
         return;
     }
-    for panel in PANELS {
-        if dock.find_tab(&panel).is_none() {
-            dock.main_surface_mut().push_to_first_leaf(panel);
-        }
+    if dock.find_tab(&Panel::Viewport).is_none() {
+        show_panel(dock, Panel::Viewport);
     }
 }
+
+#[cfg(test)]
+mod interactions;
 
 #[cfg(test)]
 mod tests {
@@ -204,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_layout_keeps_existing_panel_positions_and_split() {
+    fn hidden_panels_keep_existing_panel_positions_and_split() {
         let mut dock = DockState::new(vec![Panel::Viewport]);
         dock.main_surface_mut()
             .split_left(NodeIndex::root(), 0.31, vec![Panel::Objects]);
@@ -214,10 +244,153 @@ mod tests {
         validate(&dock).unwrap();
         assert_eq!(dock.find_tab(&Panel::Viewport), Some(viewport));
         assert_eq!(dock.find_tab(&Panel::Objects), Some(objects));
+        assert!(dock.find_tab(&Panel::Memory).is_none());
         let Node::Horizontal(split) = &dock.main_surface()[NodeIndex::root()] else {
             panic!("expected preserved split")
         };
         assert_eq!(split.fraction, 0.31);
+    }
+
+    #[test]
+    fn hidden_panels_survive_preferences_and_reopen_without_duplicates() {
+        let mut prefs = Preferences::default();
+        for panel in Panel::ALL {
+            prefs.hide_panel(panel);
+        }
+        assert_eq!(prefs.dock.iter_all_tabs().count(), 1);
+        validate(&prefs.dock).unwrap();
+        let mut restored = Preferences::from_bytes(&serde_json::to_vec(&prefs).unwrap());
+        assert_eq!(restored.dock.iter_all_tabs().count(), 1);
+        for panel in Panel::ALL {
+            restored.show_panel(panel);
+            restored.show_panel(panel);
+            validate(&restored.dock).unwrap();
+        }
+        assert_eq!(restored.dock.iter_all_tabs().count(), Panel::ALL.len());
+    }
+
+    #[test]
+    fn duplicate_panels_cannot_share_viewport_or_input_state() {
+        let mut prefs = Preferences::default();
+        prefs
+            .dock
+            .main_surface_mut()
+            .push_to_first_leaf(Panel::Viewport);
+        assert!(validate(&prefs.dock).is_err());
+        assert!(serde_json::to_vec(&prefs).is_err());
+        repair(&mut prefs.dock);
+        validate(&prefs.dock).unwrap();
+        assert_eq!(prefs.dock.iter_all_tabs().count(), Panel::ALL.len());
+    }
+
+    #[test]
+    fn invalid_saved_surface_focus_does_not_reach_dock_indexing() {
+        let mut value = serde_json::to_value(Preferences::default()).unwrap();
+        value["dock"]["focused_surface"] = 999.into();
+        let mut prefs = Preferences::from_bytes(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(prefs.dock.focused_leaf(), None);
+        assert!(prefs.dock.find_active_focused().is_none());
+        paint(
+            &mut prefs.dock,
+            &egui::Context::default(),
+            egui::vec2(1200.0, 800.0),
+        );
+        validate(&prefs.dock).unwrap();
+        prefs.show_panel(Panel::Memory);
+        assert!(prefs.dock.focused_leaf().is_some());
+    }
+
+    #[test]
+    fn malformed_floating_surfaces_restore_a_paintable_layout() {
+        for empty_leaf in [true, false] {
+            let mut prefs = Preferences::default();
+            let location = prefs.dock.find_tab(&Panel::Memory).unwrap();
+            let surface = prefs.dock.detach_tab(
+                location,
+                egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 400.0)),
+            );
+            let mut value = serde_json::to_value(&prefs).unwrap();
+            let floating = &mut value["dock"]["surfaces"][surface.0];
+            if empty_leaf {
+                floating["Window"][0]["nodes"][0]["Leaf"]["tabs"] = serde_json::json!([]);
+            } else {
+                *floating = serde_json::json!({"Main": floating["Window"][0].clone()});
+            }
+            value["listen_port"] = 15447.into();
+            let mut restored = Preferences::from_bytes(&serde_json::to_vec(&value).unwrap());
+            validate(&restored.dock).unwrap();
+            assert_eq!(restored.dock.iter_all_tabs().count(), Panel::ALL.len());
+            assert_eq!(restored.listener.port, 15447);
+            paint(
+                &mut restored.dock,
+                &egui::Context::default(),
+                egui::vec2(1200.0, 800.0),
+            );
+        }
+    }
+
+    #[test]
+    fn floating_split_reorder_and_close_preserve_remaining_layout() {
+        use egui_dock::{Split, TabIndex, TabInsert};
+
+        let mut prefs = Preferences::default();
+        let memory = prefs.dock.find_tab(&Panel::Memory).unwrap();
+        let surface = prefs.dock.detach_tab(
+            memory,
+            egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 400.0)),
+        );
+        let curves = prefs.dock.find_tab(&Panel::Curves).unwrap();
+        prefs.dock.move_tab(
+            curves,
+            (surface, NodeIndex::root(), TabInsert::Split(Split::Right)),
+        );
+        validate(&prefs.dock).unwrap();
+        let timeline = prefs.dock.find_tab(&Panel::Timeline).unwrap();
+        let diagnostics = prefs.dock.find_tab(&Panel::Diagnostics).unwrap();
+        prefs.dock.move_tab(
+            diagnostics,
+            (timeline.0, timeline.1, TabInsert::Insert(TabIndex(0))),
+        );
+        validate(&prefs.dock).unwrap();
+        let objects = prefs.dock.find_tab(&Panel::Objects);
+        let mut restored = Preferences::from_bytes(&serde_json::to_vec(&prefs).unwrap());
+        assert_eq!(restored.dock.find_tab(&Panel::Memory).unwrap().0, surface);
+        assert_eq!(restored.dock.find_tab(&Panel::Curves).unwrap().0, surface);
+        assert_eq!(
+            restored.dock.find_tab(&Panel::Diagnostics).unwrap().2,
+            TabIndex(0)
+        );
+        restored.hide_panel(Panel::Memory);
+        restored.hide_panel(Panel::Curves);
+        validate(&restored.dock).unwrap();
+        assert!(!restored.dock.is_surface_valid(surface));
+        assert_eq!(restored.dock.find_tab(&Panel::Objects), objects);
+        restored.show_panel(Panel::Curves);
+        validate(&restored.dock).unwrap();
+        assert!(restored.dock.find_tab(&Panel::Memory).is_none());
+    }
+
+    #[test]
+    fn requested_tab_expands_collapsed_floating_group() {
+        let mut prefs = Preferences::default();
+        let memory = prefs.dock.find_tab(&Panel::Memory).unwrap();
+        let surface = prefs.dock.detach_tab(
+            memory,
+            egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 400.0)),
+        );
+        let mut value = serde_json::to_value(&prefs).unwrap();
+        value["dock"]["surfaces"][surface.0]["Window"][1]["minimized"] = true.into();
+        let mut restored = Preferences::from_bytes(&serde_json::to_vec(&value).unwrap());
+        let location = restored.dock.find_tab(&Panel::Memory).unwrap();
+        restored.dock[location.0][location.1].set_collapsed(true);
+        restored.show_panel(Panel::Memory);
+        assert!(!restored.dock[location.0][location.1].is_collapsed());
+        let state = serde_json::to_value(&restored).unwrap();
+        assert_eq!(
+            state["dock"]["surfaces"][surface.0]["Window"][1]["minimized"],
+            false
+        );
+        assert_eq!(restored.dock.focused_leaf(), Some((location.0, location.1)));
     }
 
     #[test]

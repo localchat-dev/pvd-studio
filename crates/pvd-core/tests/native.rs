@@ -1,5 +1,7 @@
 #[path = "support/analysis.rs"]
 mod analysis_support;
+#[path = "support/native_initial.rs"]
+mod native_initial;
 use analysis_support::legacy_fixture;
 use pvd_core::{
     Recording, RecordingSource, Value,
@@ -52,6 +54,7 @@ fn mapped(value: &Value, ids: &BTreeMap<u64, u64>) -> Value {
 fn verify_pair(stem: &str) {
     let bytes = std::fs::read(fixture(stem, "-native.pxd2")).unwrap();
     let ids = source_ids(&bytes);
+    let initial = native_initial::NativeInitialValues::parse(&bytes);
     let native = Recording::from_bytes(&bytes).unwrap();
     let raw = Recording::from_path(fixture(stem, ".pvdstream")).unwrap();
     assert_eq!(native.frame_count(), 120);
@@ -124,17 +127,37 @@ fn verify_pair(stem: &str) {
                 object.type_name.rsplit("::").next(),
                 source.type_name.rsplit("::").next()
             );
+            for (key, expected) in &source.properties {
+                if key == "events" || matches!(expected, Value::Bytes(_)) {
+                    continue;
+                }
+                let actual = object.properties.get(key).unwrap_or_else(|| {
+                    panic!(
+                        "missing native field: {stem} frame {frame} {}.{key}",
+                        object.type_name
+                    )
+                });
+                assert_eq!(
+                    &mapped(actual, &ids),
+                    expected,
+                    "SDK field: {stem} frame {frame} {}.{key}",
+                    object.type_name
+                );
+            }
             for (key, value) in &object.properties {
                 if key == "events" || matches!(value, Value::Bytes(_)) {
                     continue;
                 }
-                let other = &source.properties[key];
-                assert_eq!(
-                    &mapped(value, &ids),
-                    other,
-                    "{stem} frame {frame}, {}::{key}",
-                    object.type_name
-                );
+                if let Some(other) = source.properties.get(key) {
+                    assert_eq!(
+                        &mapped(value, &ids),
+                        other,
+                        "{stem} frame {frame}, {}::{key}",
+                        object.type_name
+                    );
+                } else {
+                    initial.assert_value(object.id, &object.type_name, key, value);
+                }
                 properties += 1;
             }
         }
@@ -392,6 +415,209 @@ fn original_rich_analysis_matches_every_raw_event_flush_and_frame() {
         a.spans.len(),
         recorded
     );
+}
+
+#[test]
+#[ignore = "requires original PVD3 rich container and exact same TCP capture"]
+fn original_rich_disk_history_preserves_all_frames_analysis_and_complete_csv() {
+    use pvd_core::analysis::view::{MemorySource, MemoryViewCursor, ProfileSource};
+    use pvd_core::analysis_export::{AnalysisCsvKind, write_analysis_csv};
+    let path = fixture("rich", "-native.pxd2");
+    let bytes = std::fs::read(&path).unwrap();
+    let expected = Recording::from_bytes(&bytes).unwrap();
+    let raw = Recording::from_path(fixture("rich", ".pvdstream")).unwrap();
+    let root = std::env::temp_dir().join(format!(
+        "pvd-native-disk-rich-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config = pvd_core::live::HistoryConfig {
+        directory: root.clone(),
+        disk_budget_bytes: 256 << 20,
+        segment_frames: 17,
+        min_free_disk_bytes: 0,
+        ..Default::default()
+    };
+    let (mut disk, info) = native::read_path_with_progress(&path, config, |_, _| true).unwrap();
+    assert_eq!(info.source_bytes, bytes.len() as u64);
+    assert_eq!(info.source_blake3, Some(*blake3::hash(&bytes).as_bytes()));
+    assert!(disk.is_disk_backed());
+    assert_eq!(disk.frame_count(), expected.frame_count());
+    assert_eq!(disk.first_frame(), 0);
+    disk.verify_replay().unwrap();
+    assert_eq!(disk.untimed_error_events(), expected.untimed_error_events());
+    let ids = info.source_ids;
+    for frame in (0..=120)
+        .chain((0..120).rev())
+        .chain((0..120).map(|index| index * 73 % 120))
+    {
+        let analysis = if frame == 120 {
+            disk.analysis.clone()
+        } else {
+            disk.analysis_at(frame).unwrap()
+        };
+        if frame < 120 {
+            assert_eq!(
+                disk.state_at(frame).unwrap(),
+                expected.state_at(frame).unwrap()
+            );
+        }
+        let mut cursor = MemoryViewCursor::default();
+        let memory = analysis.memory_snapshot();
+        memory.seek(&mut cursor, frame).unwrap();
+        let state: MemoryState =
+            postcard::from_bytes(&postcard::to_stdvec(&cursor).unwrap()).unwrap();
+        assert_eq!(
+            map_memory_state(state, &ids),
+            legacy_fixture(&raw).memory.state_at_frame(frame)
+        );
+        assert_eq!(
+            memory.churn(frame),
+            legacy_fixture(&raw).memory.churn_at_frame(frame)
+        );
+        let spans: Vec<_> = analysis
+            .profile_spans()
+            .map(|span| {
+                (
+                    ids[&span.zone],
+                    span.event,
+                    span.thread,
+                    span.context,
+                    span.start,
+                    span.end,
+                    span.received_frame,
+                )
+            })
+            .collect();
+        let raw_spans: Vec<_> = raw
+            .analysis
+            .profile_spans()
+            .filter(|span| span.received_frame <= frame)
+            .map(|span| {
+                (
+                    span.zone,
+                    span.event,
+                    span.thread,
+                    span.context,
+                    span.start,
+                    span.end,
+                    span.received_frame,
+                )
+            })
+            .collect();
+        assert_eq!(spans, raw_spans);
+        for scene in disk
+            .frames
+            .iter()
+            .map(|frame| frame.scene_id)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            assert_eq!(
+                pvd_core::frame_metrics::source_context(&disk, scene, 0).unwrap(),
+                ids[&scene]
+            );
+        }
+    }
+    disk.analysis.retain_recent(119).unwrap();
+    assert_eq!(disk.analysis.first_retained_frame(), 119);
+    disk.analysis = disk.analysis_at(0).unwrap();
+    let end_memory = disk
+        .native_end_analysis()
+        .unwrap()
+        .memory_snapshot()
+        .summary();
+    assert_eq!(end_memory, expected.analysis.memory_snapshot().summary());
+    assert_ne!(
+        disk.analysis.memory_snapshot().summary().allocations,
+        end_memory.allocations
+    );
+    assert!(expected.native_end_analysis().is_none());
+    assert!(raw.native_end_analysis().is_none());
+    let cancel = AtomicBool::new(false);
+    let frames: Vec<_> = (0..120).collect();
+    let catalog = profile_curves::catalog(&disk, &cancel).unwrap();
+    assert_eq!(
+        catalog,
+        profile_curves::catalog(&expected, &cancel).unwrap()
+    );
+    let scene = ReferenceScene {
+        id: disk.frames[0].scene_id,
+        generation: 0,
+    };
+    let raw_scene = ReferenceScene {
+        id: ids[&scene.id],
+        generation: 0,
+    };
+    for entry in catalog.iter().take(8) {
+        let mut raw_key = entry.key;
+        raw_key.zone = ids[&raw_key.zone];
+        let actual = profile_curves::sample(&disk, entry.key, scene, &frames, &cancel).unwrap();
+        assert_eq!(
+            actual,
+            profile_curves::sample(&raw, raw_key, raw_scene, &frames, &cancel).unwrap()
+        );
+    }
+    for metric in [
+        pvd_core::frame_metrics::Metric::FrameInterval,
+        pvd_core::frame_metrics::Metric::Simulate,
+        pvd_core::frame_metrics::Metric::Collision,
+        pvd_core::frame_metrics::Metric::Solver,
+    ] {
+        let actual =
+            pvd_core::frame_metrics::sample(&disk, scene.id, 0, metric, &frames, &cancel).unwrap();
+        let reference =
+            pvd_core::frame_metrics::sample(&raw, raw_scene.id, 0, metric, &frames, &cancel)
+                .unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|point| (point.frame, point.milliseconds, point.status))
+                .collect::<Vec<_>>(),
+            reference
+                .iter()
+                .map(|point| (point.frame, point.milliseconds, point.status))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            actual
+                .iter()
+                .take(119)
+                .any(|point| point.milliseconds.is_some()),
+            "{metric:?}"
+        );
+    }
+    for kind in [AnalysisCsvKind::Profile, AnalysisCsvKind::Memory] {
+        let mut full = Vec::new();
+        let full_report = write_analysis_csv(&expected, &mut full, kind, |_| true).unwrap();
+        let mut paged = Vec::new();
+        let paged_report = write_analysis_csv(&disk, &mut paged, kind, |_| true).unwrap();
+        assert_eq!(paged, full);
+        assert_eq!(paged_report.exported_rows, full_report.exported_rows);
+        assert_eq!(
+            paged_report.summary.profile_spans,
+            full_report.summary.profile_spans
+        );
+        assert_eq!(
+            paged_report.summary.profile_values,
+            full_report.summary.profile_values
+        );
+        assert_eq!(
+            paged_report.summary.memory_allocations,
+            full_report.summary.memory_allocations
+        );
+    }
+    let failure =
+        write_analysis_csv(&disk, &mut Vec::new(), AnalysisCsvKind::Memory, |_| false).unwrap_err();
+    assert_eq!(
+        failure.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::Interrupted
+    );
+    drop(disk);
+    assert!(root.starts_with(std::env::temp_dir()));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

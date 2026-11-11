@@ -124,6 +124,24 @@ Remove-Item Env:PVD_MIXED_STATIC_CAPTURE
 
 Rust 导出器的范围、运行方式和 398 个属性的 SDK 互验见 [RepX 说明](../../docs/repx.md)。
 
+多对象导出使用同次 SDK 位姿 CSV 校验所选 Actor 集合、ID、名称及姿态，再经官方 importer 重读、重导；同时检查重复 ID 去重和无效 ID 不发布部分文件。先按上文生成 rich 捕获，然后执行：
+
+```powershell
+cargo build --locked -p pvd-cli
+./tools/physx-sample/verify-multiselection.ps1 -Capture captures/physx-3.4-rich.pvdstream -OutputDirectory output/multiselection-check
+```
+
+默认验证第 0 帧的 `PvdStudioBox`、`PvdStudioSphere`，CSV 使用捕获同名的 `.csv`。可通过 `-Frame`、`-ActorNames`、`-Truth`、`-CliPath` 和 `-SdkExecutable` 指定其他输入；所选 Actor 必须互相独立，没有额外连通 Actor。输出目录必须不存在，脚本在其中保存导出 XML、SDK 重导 XML、日志、比较结果和哈希，不构建或下载依赖。
+
+多选显示可用同一 rich 捕获进行无窗口检查。`multi-selection` 在第 0 帧选择 Box 和 Sphere，显示所选包围盒及半透明效果，并聚焦两者的合并范围：
+
+```powershell
+cargo run --locked -p pvd-desktop -- --render-check captures/physx-3.4-rich.pvdstream output/multiselection-check/scene-zh.png 0 multi-selection 1440 960 --language zh-CN
+cargo run --locked -p pvd-desktop -- --render-check captures/physx-3.4-rich.pvdstream output/multiselection-check/scene-en-small.png 0 multi-selection 640 480 --language en
+```
+
+检查输出图中的两组选中几何、包围盒、属性面板选择数量和底部 Shift 操作提示。成功退出只表示状态检查和图像输出成功，不代表显示验收；中文、英文及小尺寸布局应分别检查。
+
 ## TCP
 
 先启动项目监听器，再运行：

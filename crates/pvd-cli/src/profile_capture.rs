@@ -1,13 +1,15 @@
-use crate::Result;
+use crate::{Result, input::Input};
 use pvd_core::{
     LiveRecording, Recording,
-    analysis::ProfileZone,
+    analysis::{
+        ProfileZone,
+        view::{ProfileMetadataSource, ProfileSource},
+    },
     live::HistoryConfig,
     profile_curves::{self, CatalogEntry, ExactKey, Point, ReferenceScene, SourceIdentity},
 };
 use std::{
     collections::BTreeMap,
-    fs::File,
     io::{self, Read, Seek},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -20,7 +22,7 @@ pub struct Catalog {
 
 pub struct Capture {
     pub recording: Recording,
-    source: Option<(File, SourceIdentity)>,
+    source: Option<(Input, SourceIdentity)>,
 }
 
 fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
@@ -60,10 +62,10 @@ fn validate_history(recording: &Recording) -> Result<()> {
     Ok(())
 }
 
-fn load_sdk(mut file: File, history: HistoryConfig, cancel: &AtomicBool) -> Result<Capture> {
+fn load_sdk(mut file: Input, history: HistoryConfig, cancel: &AtomicBool) -> Result<Capture> {
     check_cancelled(cancel)?;
     file.rewind()?;
-    let total = file.metadata()?.len();
+    let total = file.length();
     let mut live = LiveRecording::with_history(history)?;
     let mut digest = blake3::Hasher::new();
     let mut bytes = [0; 64 << 10];
@@ -115,23 +117,12 @@ fn load_sdk(mut file: File, history: HistoryConfig, cancel: &AtomicBool) -> Resu
 pub fn catalog(path: &str, cancel: &AtomicBool) -> Result<Catalog> {
     crate::project_capture::require_full_source(path)?;
     check_cancelled(cancel)?;
-    if crate::is_native_capture(path)? {
-        let recording = Recording::from_path_with_progress(
-            path,
-            progress("loading native profile source", cancel),
-        )?;
+    let mut file = Input::open(path, progress("opening profile source", cancel))?;
+    if file.is_native()? {
+        let recording = file.native_recording(progress("loading native profile source", cancel))?;
         crate::report_diagnostics(&recording);
-        return Ok(Catalog {
-            entries: profile_curves::catalog(&recording, cancel)?,
-            zones: recording
-                .analysis
-                .legacy()
-                .ok_or("native profile catalog requires legacy analysis storage")?
-                .zones
-                .clone(),
-        });
+        return native_catalog(&recording, cancel);
     }
-    let mut file = File::open(path)?;
     let mut report = progress("indexing complete profile catalog", cancel);
     let catalog = profile_curves::catalog_streaming(&mut file, cancel, |status| {
         report(status.bytes_read, status.total_bytes)
@@ -142,35 +133,61 @@ pub fn catalog(path: &str, cancel: &AtomicBool) -> Result<Catalog> {
     })
 }
 
+fn native_catalog(recording: &Recording, cancel: &AtomicBool) -> Result<Catalog> {
+    let entries = profile_curves::catalog(recording, cancel)?;
+    let analysis = recording
+        .native_end_analysis()
+        .unwrap_or(&recording.analysis);
+    let mut remaining = analysis.profile_metadata_budget();
+    let mut zones = BTreeMap::new();
+    for (id, name) in analysis.profile_zones() {
+        check_cancelled(cancel)?;
+        zones.insert(
+            id,
+            ProfileZone {
+                name: catalog_name(name, &mut remaining)?,
+                events: BTreeMap::new(),
+            },
+        );
+    }
+    for event in analysis.profile_names() {
+        check_cancelled(cancel)?;
+        zones
+            .get_mut(&event.zone)
+            .ok_or("native profile catalog zone is unavailable")?
+            .events
+            .insert(event.event, catalog_name(event.event_name, &mut remaining)?);
+    }
+    check_cancelled(cancel)?;
+    Ok(Catalog { entries, zones })
+}
+
+fn catalog_name(name: &str, remaining: &mut usize) -> Result<String> {
+    *remaining = remaining
+        .checked_sub(name.len().saturating_add(128))
+        .ok_or("native profile catalog metadata exceeds its analysis budget")?;
+    Ok(name.to_owned())
+}
+
 impl Capture {
     pub fn open(path: &str, cancel: &AtomicBool) -> Result<Self> {
         crate::project_capture::require_full_source(path)?;
         check_cancelled(cancel)?;
-        if crate::is_native_capture(path)? {
+        let mut file = Input::open(path, progress("opening profile source", cancel))?;
+        if file.is_native()? {
             Ok(Self {
-                recording: Recording::from_path_with_progress(
-                    path,
-                    progress("loading native profile source", cancel),
-                )?,
+                recording: file
+                    .native_recording(progress("loading native profile source", cancel))?,
                 source: None,
             })
         } else {
-            load_sdk(File::open(path)?, HistoryConfig::default(), cancel)
+            load_sdk(file, HistoryConfig::default(), cancel)
         }
     }
 
     pub fn catalog(&mut self, cancel: &AtomicBool) -> Result<Catalog> {
         let Some((file, expected)) = &mut self.source else {
-            return Ok(Catalog {
-                entries: profile_curves::catalog(&self.recording, cancel)?,
-                zones: self
-                    .recording
-                    .analysis
-                    .legacy()
-                    .ok_or("native profile catalog requires legacy analysis storage")?
-                    .zones
-                    .clone(),
-            });
+            return native_catalog(&self.recording, cancel);
         };
         let mut report = progress("indexing complete profile catalog", cancel);
         let catalog = profile_curves::catalog_streaming(file, cancel, |status| {
@@ -337,7 +354,12 @@ mod tests {
         assert_eq!(original.len(), changed.len());
         std::fs::write(&path, &original).unwrap();
         let cancel = AtomicBool::new(false);
-        let mut source = load_sdk(File::open(&path).unwrap(), scratch.history(), &cancel).unwrap();
+        let mut source = load_sdk(
+            Input::open(&path, |_, _| true).unwrap(),
+            scratch.history(),
+            &cancel,
+        )
+        .unwrap();
         assert!(source.catalog(&cancel).is_ok());
         let key = ExactKey {
             zone: 1,
@@ -379,8 +401,18 @@ mod tests {
         std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
         for cancelled in [true, false] {
             let cancel = AtomicBool::new(cancelled);
-            assert!(load_sdk(File::open(&path).unwrap(), scratch.history(), &cancel).is_err());
+            assert!(
+                load_sdk(
+                    Input::open(&path, |_, _| true).unwrap(),
+                    scratch.history(),
+                    &cancel
+                )
+                .is_err()
+            );
             scratch.assert_history_empty();
         }
     }
 }
+
+#[cfg(test)]
+mod native_tests;

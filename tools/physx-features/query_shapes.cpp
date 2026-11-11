@@ -87,13 +87,32 @@ static PxRigidStatic* target(FeatureContext& context) {
     return actor;
 }
 
+struct QueryOptions {
+    FeatureConnection connection;
+    const char* truth;
+};
+
+static QueryOptions query_options(int argc, char** argv) {
+    if (argc == 3) return { FeatureConnection::file(argv[1]), argv[2] };
+    if (argc == 6 && std::string(argv[1]) == "--host" && std::string(argv[3]) == "--port") {
+        const std::string value(argv[4]);
+        if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+            throw std::runtime_error("Port must be an integer between 1 and 65535");
+        }
+        const auto port = std::stoul(value);
+        if (!port || port > 65535) throw std::runtime_error("Port must be between 1 and 65535");
+        return { FeatureConnection::socket(argv[2], static_cast<unsigned>(port)), argv[5] };
+    }
+    throw std::runtime_error("Usage: pvd-query-shapes capture.pvdstream truth.json | --host ADDRESS --port PORT truth.json");
+}
+
 int main(int argc, char** argv) {
     try {
-        if (argc != 3) throw std::runtime_error("Usage: pvd-query-shapes capture.pvdstream truth.json");
-        FeatureContext context(argv[1]);
-        std::ofstream truth(argv[2]);
+        const auto options = query_options(argc, argv);
+        FeatureContext context(options.connection);
+        std::ofstream truth(options.truth);
         if (!truth) throw std::runtime_error("Cannot create query truth JSON");
-        truth << std::setprecision(9) << "{\"sdk\":\"3.4.2\",\"frames\":12,\"queries\":[";
+        truth << std::setprecision(9) << "{\"sdk\":\"" << feature_sdk_version() << "\",\"frames\":12,\"queries\":[";
         bool first = true;
         auto* actor = target(context);
         auto* second_actor = target(context);
@@ -178,6 +197,7 @@ int main(int argc, char** argv) {
         truth << "]}";
         truth.close();
         if (!truth) throw std::runtime_error("Query truth write failed");
+        if (options.connection.host) context.flush_and_require_connected();
         std::cout << "12 frames, 204 sweeps, 192 overlaps and 24 batch rays\n";
         return 0;
     } catch (const std::exception& error) {

@@ -81,6 +81,10 @@ fn assert_joint_failures(state: &SceneState) {
             repx::export(&invalid, Selection::Frame).is_err(),
             "accepted corrupt {field}"
         );
+        assert!(
+            repx::export(&invalid, Selection::Actor(actor)).is_err(),
+            "selected closure accepted corrupt {field}"
+        );
     }
     for id in [actor, joint_id] {
         let mut stale = state.clone();
@@ -89,12 +93,14 @@ fn assert_joint_failures(state: &SceneState) {
             repx::export(&stale, Selection::Frame).is_err(),
             "accepted stale reference to {id}"
         );
+        assert!(repx::export(&stale, Selection::Actor(actor)).is_err());
         let mut missing = state.clone();
         missing.objects.remove(&id);
         assert!(
             repx::export(&missing, Selection::Frame).is_err(),
             "accepted missing dependency {id}"
         );
+        assert!(repx::export(&missing, Selection::Actor(actor)).is_err());
     }
     let mut orphan = state.clone();
     orphan
@@ -104,6 +110,7 @@ fn assert_joint_failures(state: &SceneState) {
         .properties
         .remove("Joints");
     assert!(repx::export(&orphan, Selection::Frame).is_err());
+    assert!(repx::export(&orphan, Selection::Actor(actor)).is_err());
     let mut missing_limit = state.clone();
     missing_limit
         .objects
@@ -126,10 +133,9 @@ fn assert_joint_failures(state: &SceneState) {
     );
     unsupported.objects.get_mut(&joint_id).unwrap().type_name = "physx3::PxSphericalJoint".into();
     assert!(repx::export(&unsupported, Selection::Frame).is_err());
-    assert!(
-        repx::export(state, Selection::Actor(actor)).is_err(),
-        "connected Actor export dropped its joint"
-    );
+    let selected = repx::export(state, Selection::Actor(actor)).unwrap();
+    assert!(selected.joints > 0);
+    assert!(selected.xml.contains(&format!("<Id>{joint_id}</Id>")));
 }
 
 #[test]
@@ -243,7 +249,9 @@ fn all_sdk_extension_joint_snapshots_preserve_types_changes_and_destruction() {
                     _ => None,
                 })
                 .unwrap();
-            assert!(repx::export(&state, Selection::Actor(actor)).is_err());
+            let selected = repx::export(&state, Selection::Actor(actor)).unwrap();
+            assert!(selected.xml.contains(&format!("<Id>{}</Id>", joint.id)));
+            assert!(selected.joints > 0);
         }
         assert!(!exported.xml.contains("<PxConstraint>"));
         if frame < 2 {

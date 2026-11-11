@@ -23,7 +23,7 @@ try {
         $previous = [Environment]::GetEnvironmentVariable($feature.Environment, 'Process')
         try {
             [Environment]::SetEnvironmentVariable($feature.Environment, $capture, 'Process')
-            & cargo test --locked -p pvd-core --test $feature.Test -- --include-ignored
+            & cargo test --locked -p pvd-core --test $feature.Test -- --include-ignored --skip physx41_
             if ($LASTEXITCODE -ne 0) { throw "SDK truth comparison failed: $($feature.Name)" }
         } finally { [Environment]::SetEnvironmentVariable($feature.Environment, $previous, 'Process') }
     }

@@ -25,6 +25,25 @@ const CHILD_PROPERTIES: &[&str] = &[
     "HeightField",
 ];
 
+pub(crate) fn exact_object_id(state: &SceneState, query: &str) -> Option<u64> {
+    let query = query.trim();
+    let id = if let Some(hex) = query
+        .strip_prefix("0x")
+        .or_else(|| query.strip_prefix("0X"))
+    {
+        if hex.is_empty() || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(hex, 16).ok()?
+    } else {
+        if query.is_empty() || !query.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        query.parse().ok()?
+    };
+    state.objects.contains_key(&id).then_some(id)
+}
+
 pub struct Row {
     pub id: Option<u64>,
     pub generation: u32,
@@ -75,7 +94,7 @@ impl TreeCache {
             };
             if previous.type_name != next.type_name
                 || update.changes_object_properties(state, id, CHILD_PROPERTIES)
-                || update.changes_object_properties(state, id, &["Name"])
+                || update.changes_object_properties(state, id, &["Name", "$top_level"])
             {
                 return;
             }
@@ -130,11 +149,13 @@ impl TreeCache {
         self.rows.clear();
         if !filter.is_empty() {
             let query = filter.to_lowercase();
+            let exact = exact_object_id(state, filter);
             for object in state.objects.values() {
                 let row = row(object, 0, false);
-                if format!("{} {} {}", row.label, row.detail, object.id)
-                    .to_lowercase()
-                    .contains(&query)
+                if exact == Some(object.id)
+                    || format!("{} {} {}", row.label, row.detail, object.id)
+                        .to_lowercase()
+                        .contains(&query)
                 {
                     self.rows.push(row);
                 }
@@ -151,7 +172,7 @@ impl TreeCache {
         for object in state
             .objects
             .values()
-            .filter(|o| o.type_name.ends_with("::PxScene"))
+            .filter(|o| o.type_name.ends_with("::PxScene") || is_top_level(o))
         {
             builder.append(object.id, 0, false);
         }
@@ -166,9 +187,7 @@ impl TreeCache {
                 id: None,
                 generation: 0,
                 depth: 0,
-                label: language
-                    .text("Resources & other objects", "资源及其他对象")
-                    .into(),
+                label: language.text("Other objects", "其他对象").into(),
                 detail: String::new(),
                 children: false,
             });
@@ -218,13 +237,21 @@ fn children(state: &SceneState, object: &Object) -> Vec<u64> {
                 _ => Vec::new(),
             };
             for id in targets {
-                if state.resolve_reference(object.id, name, id).is_some() && visited.insert(id) {
+                if state
+                    .resolve_reference(object.id, name, id)
+                    .is_some_and(|child| !is_top_level(child))
+                    && visited.insert(id)
+                {
                     children.push(id);
                 }
             }
         }
     }
     children
+}
+
+fn is_top_level(object: &Object) -> bool {
+    object.properties.get("$top_level") == Some(&Value::Bool(true))
 }
 
 struct TreeBuilder<'a> {
@@ -267,6 +294,303 @@ impl TreeBuilder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires tools/physx41-articulation capture and same-run SDK getter truth"]
+    fn captured_sdk41_base_tree_follows_links_joints_and_collapse() {
+        let capture = std::path::PathBuf::from(
+            std::env::var_os("PVD_ARTICULATION41_CAPTURE").expect("set PVD_ARTICULATION41_CAPTURE"),
+        );
+        let truth: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(capture.with_extension("articulation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(truth["sdk"], "4.1.2");
+        let frames = truth["frames"].as_array().unwrap();
+        let recording = pvd_core::Recording::from_path(capture).unwrap();
+        assert_eq!(recording.frame_count(), 12);
+        let mut cache = TreeCache::default();
+        for (revision, frame) in [0, 4, 9, 10, 11, 9, 2, 0].into_iter().enumerate() {
+            let state = recording.state_at(frame).unwrap();
+            for language in [Language::Chinese, Language::English] {
+                cache.update(&state, revision as u64, "", language);
+                let expected = &frames[frame]["before_simulate"];
+                if expected.is_null() {
+                    let prior = &truth["initial"];
+                    for link in prior["links"].as_array().unwrap() {
+                        let id = link["id"].as_u64().unwrap();
+                        assert!(!cache.rows.iter().any(|row| row.id == Some(id)));
+                    }
+                    assert!(!cache.rows.iter().any(|row| row.id == prior["id"].as_u64()));
+                    continue;
+                }
+                let root_id = expected["id"].as_u64().unwrap();
+                let root = cache
+                    .rows
+                    .iter()
+                    .find(|row| row.id == Some(root_id))
+                    .unwrap();
+                assert!(root.detail.starts_with("PxArticulationBase ·"));
+                assert_eq!(root.label, expected["name"].as_str().unwrap());
+                assert_eq!(root.depth, 1);
+                for link in expected["links"].as_array().unwrap() {
+                    let id = link["id"].as_u64().unwrap();
+                    let parent = link["parent"].as_u64().unwrap();
+                    let index = cache
+                        .rows
+                        .iter()
+                        .position(|row| row.id == Some(id))
+                        .unwrap();
+                    let row = &cache.rows[index];
+                    let ancestor = cache.rows[..index]
+                        .iter()
+                        .rev()
+                        .find(|ancestor| ancestor.depth < row.depth)
+                        .unwrap();
+                    assert_eq!(ancestor.id, Some(parent));
+                    assert_eq!(ancestor.depth + 1, row.depth);
+                    assert_eq!(row.label, link["name"].as_str().unwrap());
+                    if let Some(joint) = link["joint"]["id"].as_u64() {
+                        let index = cache
+                            .rows
+                            .iter()
+                            .position(|row| row.id == Some(joint))
+                            .unwrap();
+                        let row = &cache.rows[index];
+                        let ancestor = cache.rows[..index]
+                            .iter()
+                            .rev()
+                            .find(|ancestor| ancestor.depth < row.depth)
+                            .unwrap();
+                        assert_eq!(ancestor.id, Some(id));
+                        assert_eq!(ancestor.depth + 1, row.depth);
+                        assert!(row.detail.starts_with("PxArticulationJointBase ·"));
+                    }
+                }
+            }
+        }
+        let state = recording.state_at(0).unwrap();
+        let root = truth["initial"]["id"].as_u64().unwrap();
+        cache
+            .collapsed
+            .insert((root, state.objects[&root].generation));
+        cache.dirty = true;
+        cache.update(&state, 100, "", Language::English);
+        assert!(cache.rows.iter().any(|row| row.id == Some(root)));
+        for link in truth["initial"]["links"].as_array().unwrap() {
+            let id = link["id"].as_u64().unwrap();
+            assert!(!cache.rows.iter().any(|row| row.id == Some(id)));
+        }
+    }
+
+    fn id_search_state() -> SceneState {
+        let mut state = SceneState::default();
+        for (id, label) in [
+            (1, "Native scene"),
+            (42, "Actor 12345"),
+            (0x2ab, "Box"),
+            (u64::MAX, "Last ID"),
+        ] {
+            state.objects.insert(
+                id,
+                Object {
+                    id,
+                    generation: 3,
+                    type_name: if id == 1 {
+                        "physx3::PxScene"
+                    } else {
+                        "physx3::PxRigidDynamic"
+                    }
+                    .into(),
+                    properties: [("Name".into(), Value::String(label.into()))].into(),
+                },
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn exact_id_lookup_accepts_copied_padding_case_and_short_native_ids() {
+        let state = id_search_state();
+        for id in [1, 42, 0x2ab, u64::MAX] {
+            for query in [
+                format!("0x{id:016x}"),
+                format!("0X{id:016X}"),
+                id.to_string(),
+                format!("  0x{id:016x}  "),
+            ] {
+                assert_eq!(exact_object_id(&state, &query), Some(id), "{query}");
+            }
+        }
+    }
+
+    #[test]
+    fn exact_id_lookup_does_not_select_name_matches_or_invalid_and_absent_ids() {
+        let state = id_search_state();
+        for query in [
+            "",
+            " ",
+            "0x",
+            "0X",
+            "0xGG",
+            "-1",
+            "+42",
+            "4 2",
+            "２",
+            "18446744073709551616",
+            "0x10000000000000000",
+            "12345",
+            "0x000000000000002b",
+            "Actor 12345",
+        ] {
+            assert_eq!(exact_object_id(&state, query), None, "{query}");
+        }
+        let mut cache = TreeCache::default();
+        cache.update(&state, 0, "12345", Language::English);
+        assert_eq!(
+            cache.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![Some(42)]
+        );
+        assert_eq!(exact_object_id(&state, "12345"), None);
+    }
+
+    #[test]
+    fn copied_ids_match_tree_rows_without_changing_text_or_prefix_searches() {
+        let state = id_search_state();
+        let mut cache = TreeCache::default();
+        for id in [1, 42, u64::MAX] {
+            for query in [format!("0x{id:016x}"), format!("0X{id:016X}")] {
+                cache.update(&state, 7, &query, Language::English);
+                assert_eq!(
+                    cache.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    vec![Some(id)],
+                    "{query}"
+                );
+            }
+        }
+        for (query, expected) in [
+            ("actor", vec![Some(42)]),
+            ("0x2", vec![Some(42), Some(0x2ab)]),
+            ("rigiddynamic", vec![Some(42), Some(0x2ab), Some(u64::MAX)]),
+        ] {
+            cache.update(&state, 7, query, Language::English);
+            assert_eq!(
+                cache.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                expected,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_top_level_objects_are_independent_roots_without_inheriting_the_flag() {
+        use pvd_protocol::{Endian, Event, EventGroup, Header, Name};
+        let mut builder = pvd_core::RecordingBuilder::new(Header {
+            version: 1,
+            timestamp_numerator: 1,
+            timestamp_denominator: 1,
+            flags: 0,
+            endian: Endian::Little,
+        });
+        let mut events: Vec<_> = [
+            (1, "physx3"),
+            (2, "PxScene"),
+            (3, "Actor"),
+            (4, "Actors"),
+            (5, "Shapes"),
+            (6, "frame"),
+        ]
+        .into_iter()
+        .map(|(handle, value)| Event::StringHandle {
+            handle,
+            value: value.into(),
+        })
+        .collect();
+        for name in [2, 3] {
+            events.push(Event::CreateClass {
+                name: Name { namespace: 1, name },
+            });
+        }
+        for (id, name) in [(1, 2), (7, 3), (8, 3)] {
+            events.push(Event::CreateInstance {
+                id,
+                class: Name { namespace: 1, name },
+            });
+        }
+        events.extend([
+            Event::PushBackObjectRef {
+                id: 1,
+                property: 4,
+                target: 7,
+            },
+            Event::PushBackObjectRef {
+                id: 7,
+                property: 5,
+                target: 8,
+            },
+            Event::SetIsTopLevel { id: 7, value: true },
+            Event::SetIsTopLevel {
+                id: 8,
+                value: false,
+            },
+            Event::EndSection {
+                id: 1,
+                name: 6,
+                timestamp: 10,
+            },
+        ]);
+        builder
+            .push(EventGroup {
+                stream_id: 0,
+                timestamp: 0,
+                offset: 0,
+                events,
+            })
+            .unwrap();
+        let state = builder.snapshot().unwrap().state_at(0).unwrap();
+        let mut cache = TreeCache::default();
+        cache.collapsed.insert((1, 0));
+        cache.update(&state, 10, "", Language::English);
+        let rows: Vec<_> = cache.rows.iter().map(|row| (row.id, row.depth)).collect();
+        assert_eq!(rows, [(Some(1), 0), (Some(7), 0), (Some(8), 1)]);
+        builder
+            .push(EventGroup {
+                stream_id: 0,
+                timestamp: 0,
+                offset: 0,
+                events: vec![
+                    Event::SetIsTopLevel {
+                        id: 7,
+                        value: false,
+                    },
+                    Event::EndSection {
+                        id: 1,
+                        name: 6,
+                        timestamp: 20,
+                    },
+                ],
+            })
+            .unwrap();
+        let next = builder.snapshot().unwrap().state_at(1).unwrap();
+        let mut update = pvd_core::live::SceneUpdate::full(&next);
+        update.replace_all = false;
+        cache.retain_for_update(&update, &state, 10);
+        assert_eq!(cache.revision, 10);
+        cache.update(&next, 11, "", Language::English);
+        assert_eq!(cache.rows.len(), 1);
+        assert_eq!(cache.rows[0].id, Some(1));
+        cache.collapsed.clear();
+        cache.dirty = true;
+        cache.update(&next, 11, "", Language::English);
+        assert_eq!(
+            cache
+                .rows
+                .iter()
+                .map(|row| (row.id, row.depth))
+                .collect::<Vec<_>>(),
+            [(Some(1), 0), (Some(7), 1), (Some(8), 2)]
+        );
+    }
 
     #[test]
     fn isolated_leaf_generation_updates_preserve_rows_but_metadata_changes_rebuild() {
@@ -557,11 +881,11 @@ mod tests {
         let mut cache = TreeCache::default();
         cache.collapsed.insert((42, 3));
         cache.update(&state, 8, "", Language::English);
-        assert_eq!(cache.rows[0].label, "Resources & other objects");
+        assert_eq!(cache.rows[0].label, "Other objects");
         let object_detail = cache.rows[1].detail.clone();
 
         cache.update(&state, 8, "", Language::Chinese);
-        assert_eq!(cache.rows[0].label, "资源及其他对象");
+        assert_eq!(cache.rows[0].label, "其他对象");
         assert_eq!(cache.rows[1].id, Some(42));
         assert_eq!(cache.rows[1].generation, 3);
         assert_eq!(cache.rows[1].label, "SDK actor 名称");

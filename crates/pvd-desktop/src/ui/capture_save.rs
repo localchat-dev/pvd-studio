@@ -7,14 +7,6 @@ fn raw_detail(studio: &Studio) -> &'static str {
             "Wait for the current save to finish.",
             "请等待当前保存任务完成。",
         )
-    } else if studio
-        .timeline_recording()
-        .is_some_and(|recording| recording.source == pvd_core::RecordingSource::Pvd3Database)
-    {
-        language.text(
-            "Saving original PVD3 containers is not supported.",
-            "暂不支持另存原版 PVD3 容器。",
-        )
     } else if studio.is_project_capture() {
         language.text(
             "This project capture does not contain the original SDK stream.",
@@ -47,6 +39,10 @@ fn raw_detail(studio: &Studio) -> &'static str {
 }
 
 pub(crate) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
+    if studio.is_native_recording() {
+        studio.native_export_controls(ui);
+        return;
+    }
     let language = studio.prefs.language;
     let history = studio.recording_saves_history();
     let enabled = studio.can_save_recording();

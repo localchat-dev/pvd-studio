@@ -252,7 +252,7 @@ fn classify(state: &SceneState, object: &Object) -> Option<Actor> {
         "PxArticulationLink" => {
             let mut current = object;
             let mut category = Category::Unknown;
-            // PhysX 3.4 limits an articulation to 64 links. Reference generations
+            // The SDK limits an articulation to 64 links. Reference generations
             // must still be checked when a parent ID has been destroyed and reused.
             for _ in 0..64 {
                 let Some(Value::Ref(parent_id)) = current.properties.get("Parent") else {
@@ -266,7 +266,7 @@ fn classify(state: &SceneState, object: &Object) -> Option<Actor> {
                     break;
                 };
                 match class_name(parent) {
-                    "PxArticulation" => {
+                    "PxArticulation" | "PxArticulationBase" => {
                         category = sleeping(parent);
                         break;
                     }
@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(cache.summary(), ActivityCounts::default());
     }
 
-    fn articulation_recording() -> Recording {
+    fn articulation_recording(root_type: &str) -> Recording {
         let mut builder = RecordingBuilder::new(Header {
             version: 1,
             timestamp_numerator: 1,
@@ -506,7 +506,7 @@ mod tests {
         };
         let mut initial: Vec<_> = [
             "physx3",
-            "PxArticulation",
+            root_type,
             "PxArticulationLink",
             "Parent",
             "IsSleeping",
@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn consuming_updates_match_borrowed_activity_for_parent_reuse_and_multiple_scenes() {
-        let recording = articulation_recording();
+        let recording = articulation_recording("PxArticulation");
         let mut borrowed = SceneState::default();
         let mut owned = SceneState::default();
         let mut borrowed_cache = ActivityCache::default();
@@ -612,35 +612,99 @@ mod tests {
 
     #[test]
     fn articulation_owner_changes_propagate_through_parent_chains_and_generations() {
-        let recording = articulation_recording();
+        for root_type in ["PxArticulation", "PxArticulationBase"] {
+            let recording = articulation_recording(root_type);
+            let mut cache = ActivityCache::default();
+            cache.rebuild(&recording.state_at(0).unwrap());
+            assert_eq!(cache.summary().awake_dynamic, 2);
+            assert_eq!(cache.summary().sleeping_dynamic, 0);
+            let mut unknown = recording.state_at(0).unwrap();
+            unknown
+                .objects
+                .get_mut(&10)
+                .unwrap()
+                .properties
+                .remove("IsSleeping");
+            cache.update_ids([10], &unknown);
+            assert_eq!(cache.summary().unknown, 2);
+            assert_eq!(cache.summary().awake_dynamic, 0);
+            assert_matches_rebuild(&cache, &unknown);
+            cache.rebuild(&recording.state_at(0).unwrap());
+            let expected = [
+                (1, 10, 0, 2, 0),
+                (2, 10, 0, 0, 2),
+                (3, 20, 2, 0, 0),
+                (4, 20, 0, 0, 1),
+                (5, 21, 1, 0, 0),
+                (6, 21, 0, 0, 1),
+            ];
+            for (frame, changed, awake, sleeping, unknown) in expected {
+                let state = recording.state_at(frame).unwrap();
+                cache.update_ids([changed], &state);
+                assert_eq!(
+                    (
+                        cache.summary().awake_dynamic,
+                        cache.summary().sleeping_dynamic,
+                        cache.summary().unknown
+                    ),
+                    (awake, sleeping, unknown),
+                    "frame {frame}"
+                );
+                assert_matches_rebuild(&cache, &state);
+            }
+            assert_eq!(cache.summary().static_actors, 1);
+            assert_eq!(cache.summary().articulation_links, 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires tools/physx41-articulation capture and same-run SDK getter truth"]
+    fn captured_sdk41_articulation_activity_uses_captured_base_sleep() {
+        let capture = std::path::PathBuf::from(
+            std::env::var_os("PVD_ARTICULATION41_CAPTURE").expect("set PVD_ARTICULATION41_CAPTURE"),
+        );
+        let truth: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(capture.with_extension("articulation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(truth["sdk"], "4.1.2");
+        let frames = truth["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 12);
+        let recording = Recording::from_path(capture).unwrap();
+        assert_eq!(recording.frame_count(), frames.len());
         let mut cache = ActivityCache::default();
         cache.rebuild(&recording.state_at(0).unwrap());
-        assert_eq!(cache.summary().awake_dynamic, 2);
-        assert_eq!(cache.summary().sleeping_dynamic, 0);
-        let expected = [
-            (1, 10, 0, 2, 0),
-            (2, 10, 0, 0, 2),
-            (3, 20, 2, 0, 0),
-            (4, 20, 0, 0, 1),
-            (5, 21, 1, 0, 0),
-            (6, 21, 0, 0, 1),
-        ];
-        for (frame, changed, awake, sleeping, unknown) in expected {
+        let mut prior = std::collections::BTreeSet::new();
+        for frame in (0..frames.len())
+            .chain((0..frames.len()).rev())
+            .chain([2, 9, 5, 11, 0, 7])
+        {
             let state = recording.state_at(frame).unwrap();
-            cache.update_ids([changed], &state);
+            let current: std::collections::BTreeSet<_> = state.objects.keys().copied().collect();
+            let changed: Vec<_> = prior.union(&current).copied().collect();
+            cache.update_ids(changed, &state);
+            prior = current;
+            let expected =
+                (!frames[frame]["after_fetch"].is_null()).then_some(&frames[frame]["after_fetch"]);
+            let (awake, sleeping) = expected.map_or((0, 0), |expected| {
+                let count = expected["links"].as_array().unwrap().len();
+                if expected["sleeping"].as_bool().unwrap() {
+                    (0, count)
+                } else {
+                    (count, 0)
+                }
+            });
+            let counts = cache.summary();
             assert_eq!(
-                (
-                    cache.summary().awake_dynamic,
-                    cache.summary().sleeping_dynamic,
-                    cache.summary().unknown
-                ),
-                (awake, sleeping, unknown),
+                (counts.awake_dynamic, counts.sleeping_dynamic),
+                (awake, sleeping),
                 "frame {frame}"
             );
+            assert_eq!(counts.unknown, 0, "frame {frame}");
+            assert_eq!(counts.total_actors, awake + sleeping);
+            assert_eq!(counts.articulation_links, awake + sleeping);
             assert_matches_rebuild(&cache, &state);
         }
-        assert_eq!(cache.summary().static_actors, 1);
-        assert_eq!(cache.summary().articulation_links, 1);
     }
 
     #[test]

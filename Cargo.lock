@@ -3187,6 +3187,8 @@ name = "pvd-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "crc32fast",
+ "flate2",
  "postcard",
  "pvd-protocol",
  "serde",

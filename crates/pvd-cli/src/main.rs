@@ -1,18 +1,25 @@
 use pvd_core::analysis::view::{MemorySource, ProfileSource};
+#[cfg(test)]
+#[path = "../../pvd-core/tests/support/pvd_archive.rs"]
+mod archive_fixture;
 mod atomic_output;
 mod cancellation;
+mod input;
+mod memory_totals;
+mod native_export;
 mod profile_capture;
 mod profile_pages;
 mod project_capture;
+#[cfg(test)]
+mod source_clock_tests;
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use pvd_core::Recording;
+use pvd_core::{Recording, frame_sources::FrameSourceKey};
 use pvd_protocol::{Decoder, Event};
 use pvd_transport::{CaptureServer, ListenConfig, ReceiverEvent};
 
@@ -39,12 +46,22 @@ fn run() -> Result<()> {
         Some("trim") if args.len() == 5 => {
             trim(&args[1], args[2].parse()?, args[3].parse()?, &args[4])
         }
-        Some("repx") if (4..=5).contains(&args.len()) => repx(
+        Some("native-save") if args.len() == 3 => native_export::run(
             &args[1],
-            args[2].parse()?,
-            &args[3],
-            args.get(4).map(|s| parse_id(s)).transpose()?,
+            &args[2],
+            pvd_core::native::export::Selection::Whole,
         ),
+        Some("native-trim") if args.len() == 5 => native_export::run(
+            &args[1],
+            &args[4],
+            pvd_core::native::export::Selection::Frames {
+                first: args[2].parse()?,
+                last: args[3].parse()?,
+            },
+        ),
+        Some("repx") if (4..=4 + pvd_core::repx::MAX_SELECTED_ACTORS).contains(&args.len()) => {
+            repx(&args[1], args[2].parse()?, &args[3], &args[4..])
+        }
         Some("csv") if args.len() == 5 => csv(&args[1], parse_id(&args[2])?, &args[3], &args[4]),
         Some("profile-csv") if args.len() == 3 => profile_csv(&args[1], &args[2]),
         Some("profile-events") if args.len() == 2 => profile_events(&args[1]),
@@ -71,6 +88,9 @@ fn run() -> Result<()> {
             &args[8],
         ),
         Some("memory-csv") if args.len() == 3 => memory_csv(&args[1], &args[2]),
+        Some("memory-totals") if (2..=3).contains(&args.len()) => {
+            memory_totals::run(&args[1], args.get(2).map(String::as_str))
+        }
         Some("listen") if (3..=4).contains(&args.len()) => listen(
             &args[1],
             &args[2],
@@ -103,8 +123,11 @@ fn usage() {
   pvd-cli profile-event-csv <capture> <series-index> <scene-id> <scene-generation> <output.csv>
   pvd-cli profile-key-csv <capture> <zone-id> <event-id> <thread-id> <context-id> <scene-id> <scene-generation> <output.csv>
   pvd-cli memory-csv <capture> <output.csv>
+  pvd-cli memory-totals <native-capture> [initial|end|frame]
   pvd-cli trim <capture> <first-frame> <last-frame> <output.pvdstream>
-  pvd-cli repx <capture> <frame> <output.repx> [actor-id]
+  pvd-cli native-save <native-capture> <output.pxd2>
+  pvd-cli native-trim <native-capture> <first-frame> <last-frame> <output.pxd2>
+  pvd-cli repx <capture> <frame> <output.repx> [actor-id ...]
   pvd-cli listen <ip:port> <capture-directory> [timeout-seconds]
 
 verify compares independent sequential reconstruction with checkpoint seeks.
@@ -112,8 +135,16 @@ bench measures file indexing and deterministic random seeks in this build.
 Frame numbers are zero-based original indices; project captures preserve their visible absolute range.
 Project captures (.pvdcapture) are not original PVD3 files or complete raw SDK streams.
 Full-source CSV/profile catalog/raw trim commands reject project captures. trim includes both endpoints.
+native-save preserves the supported PVD3 database-v1 layout; it does not convert SDK streams.
+native-trim preserves complete frame boundaries within the supported snapshot/undo layouts.
+Supported prefix and middle ranges are documented in docs/native-export.md.
+Native frame trims are bounded to 512 MiB input/output; unknown layouts are rejected.
+PVD ZIP wrappers require one supported .pxd2 member within the 512 MiB archive/member limits.
+Read, analysis and export commands use its validated inner bytes and format; ZIP output is not written.
 errors prints source fields and receive positions; native errors have no timestamp.
 received_frame is the number of completed scene frames, not an error timestamp.
+memory-totals prints captured signed source bytes; the default position is end.
+Initial/end totals have no frame or timestamp and do not reconstruct allocation addresses.
 profile-events lists exact event keys ordered by first recorded start tick.
 profile-events-page scans the complete SDK source for each identity-ordered page;
 its next_cursor binds the file hash/size/frame count. page_row is not a series index.
@@ -153,7 +184,10 @@ fn trim(path: &str, first: usize, last: usize, output: &str) -> Result<()> {
                 .into(),
         );
     }
-    let mut source = File::open(path)?;
+    let mut source = input::Input::open(path, |_, _| !cancel.requested())?;
+    if source.is_native()? {
+        return Err("native recordings require native-trim with a .pxd2 output".into());
+    }
     let mut previous = None;
     let mut updated = Instant::now();
     let report = atomic_output::write_new_cancellable(output, &cancel, |destination| {
@@ -186,19 +220,44 @@ fn trim(path: &str, first: usize, last: usize, output: &str) -> Result<()> {
     Ok(())
 }
 
-fn repx(path: &str, frame: usize, output: &str, actor: Option<u64>) -> Result<()> {
+fn repx(path: &str, frame: usize, output: &str, actors: &[String]) -> Result<()> {
     let recording = Recording::from_path(path)?;
     let state = recording.state_at(frame)?;
-    let selection = actor.map_or(
-        pvd_core::repx::Selection::Frame,
-        pvd_core::repx::Selection::Actor,
-    );
+    let selection = if actors.is_empty() {
+        pvd_core::repx::Selection::Frame
+    } else {
+        let keys = actors
+            .iter()
+            .map(|text| {
+                let id = parse_id(text)?;
+                let object = state
+                    .objects
+                    .get(&id)
+                    .ok_or_else(|| format!("Actor 0x{id:X} is absent in this frame"))?;
+                Ok(pvd_core::repx::ActorKey {
+                    id,
+                    generation: object.generation,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        pvd_core::repx::Selection::Actors(keys)
+    };
     let export = pvd_core::repx::export(&state, selection)?;
     atomic_output::write_bytes_new(output, export.xml.as_bytes())?;
     println!(
-        "file: {output}\nactors: {}\nshapes: {}\nmaterials: {}\njoints: {}\nformat: RepX validated snapshot subset, PhysX 3.4.2 schema",
-        export.actors, export.shapes, export.materials, export.joints
+        "file: {output}\nactors (including articulation links): {}\nshapes: {}\nmaterials: {}\njoints: {}\naggregates: {}\narticulations: {}\nparticle_systems: {}\nformat: RepX validated snapshot subset, PhysX 3.4.2 schema",
+        export.actors,
+        export.shapes,
+        export.materials,
+        export.joints,
+        export.aggregates,
+        export.articulations,
+        export.particle_systems
     );
+    println!("kinematic_actors: {}", export.kinematic_actors);
+    if export.kinematic_actors != 0 {
+        println!("kinematic_state: targets, velocities and wake counters are not restored");
+    }
     Ok(())
 }
 
@@ -290,11 +349,8 @@ fn frame(path: &str, index: usize) -> Result<()> {
     let recording = Recording::from_path(path)?;
     project_capture::print_range(&recording);
     let state = recording.state_at(index)?;
-    println!(
-        "frame: {index}\nseconds: {:.9}\nsdk_timed_errors_in_state: {}",
-        recording.seconds_at(index).unwrap_or(0.0),
-        state.errors.len(),
-    );
+    write_frame_position(&mut std::io::stdout().lock(), &recording, index)?;
+    println!("sdk_timed_errors_in_state: {}", state.errors.len());
     print_recording_error_summary(&recording);
     for object in state.objects.values() {
         println!(
@@ -311,6 +367,28 @@ fn frame(path: &str, index: usize) -> Result<()> {
     Ok(())
 }
 
+fn write_frame_position(
+    output: &mut impl Write,
+    recording: &Recording,
+    index: usize,
+) -> Result<()> {
+    if let Some((source, frame)) = recording.frame_sources.frame(index) {
+        match source {
+            FrameSourceKey::Captured { section, source } => {
+                writeln!(output, "frame_source: {} 0x{source:X}", section.name())?;
+            }
+            FrameSourceKey::Legacy => writeln!(output, "frame_source: recording")?,
+        }
+        writeln!(output, "source_frame: {}", frame.ordinal)?;
+    }
+    writeln!(output, "frame: {index}")?;
+    match recording.seconds_at(index) {
+        Some(seconds) => writeln!(output, "seconds: {seconds:.9}")?,
+        None => writeln!(output, "seconds: unavailable")?,
+    }
+    Ok(())
+}
+
 fn csv_cell(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -323,9 +401,10 @@ fn report_diagnostics(recording: &Recording) {
 
 fn print_recording_error_summary(recording: &Recording) {
     println!(
-        "recording_timed_errors: {}\nrecording_untimed_errors: {}",
+        "recording_timed_errors: {}\nrecording_untimed_errors: {}\nrecording_initial_untimed_errors: {}",
         recording.error_events().count(),
         recording.untimed_error_events().len(),
+        recording.initial_untimed_errors().len(),
     );
     if !recording.untimed_error_events().is_empty() {
         println!(
@@ -385,13 +464,31 @@ fn write_untimed_error(
     )
 }
 
+fn write_initial_untimed_error(
+    output: &mut impl Write,
+    error: &pvd_core::InitialUntimedError,
+) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "native_initial_error:\n  code: {}\n  message: {:?}\n  file: {:?}\n  line: {}\n  index: {}\n  timestamp_ticks: unknown\n  receive_position: initial-snapshot\n  container_instance: {:#x}\n  container_generation: {}",
+        error.code,
+        error.message,
+        error.file,
+        error.line,
+        error.index,
+        error.container_instance,
+        error.container_generation,
+    )
+}
+
 fn write_errors(output: &mut impl Write, recording: &Recording) -> std::io::Result<()> {
     let timed_count = recording.error_events().count();
     writeln!(
         output,
-        "timed_errors: {}\nuntimed_errors: {}\ncompleted_frames: {}\nreceived_frame_semantics: completed_frame_count\naffected_actor_id: unavailable",
+        "timed_errors: {}\nuntimed_errors: {}\ninitial_untimed_errors: {}\ncompleted_frames: {}\nreceived_frame_semantics: completed_frame_count\naffected_actor_id: unavailable",
         timed_count,
         recording.untimed_error_events().len(),
+        recording.initial_untimed_errors().len(),
         recording.frame_count(),
     )?;
     if timed_count > 0 {
@@ -417,6 +514,9 @@ fn write_errors(output: &mut impl Write, recording: &Recording) -> std::io::Resu
     }
     for error in recording.untimed_error_events() {
         write_untimed_error(output, error, recording.frame_count())?;
+    }
+    for error in recording.initial_untimed_errors() {
+        write_initial_untimed_error(output, error)?;
     }
     Ok(())
 }
@@ -545,31 +645,58 @@ fn csv(path: &str, id: u64, property: &str, output: &str) -> Result<()> {
     let recording = Recording::from_path(path)?;
     report_diagnostics(&recording);
     let rows = atomic_output::write_new(output, |file| {
-        writeln!(
-            file,
-            "frame,time_seconds,object_id,generation,property,value"
-        )?;
-        let mut rows = 0;
-        for frame in 0..recording.frame_count() {
-            let state = recording.state_at(frame)?;
-            if let Some(object) = state.objects.get(&id)
-                && let Some(value) = object.properties.get(property)
-            {
-                writeln!(
-                    file,
-                    "{frame},{:.9},0x{id:X},{},{},{}",
-                    recording.seconds_at(frame).unwrap_or(0.0),
-                    object.generation,
-                    csv_cell(property),
-                    csv_cell(&format!("{value:?}"))
-                )?;
-                rows += 1;
-            }
-        }
-        Ok(rows)
+        write_property_csv(file, &recording, id, property)
     })?;
     println!("exported_rows: {rows}\nfile: {output}");
     Ok(())
+}
+
+fn write_property_csv(
+    file: &mut dyn Write,
+    recording: &Recording,
+    id: u64,
+    property: &str,
+) -> Result<usize> {
+    recording
+        .frame_sources
+        .validate_frames(&recording.frames)
+        .map_err(|error| format!("inconsistent recording frame-source directory: {error}"))?;
+    writeln!(
+        file,
+        "frame,time_seconds,object_id,generation,property,value,section,source_id,source_frame"
+    )?;
+    let mut rows = 0;
+    for frame in 0..recording.frame_count() {
+        let state = recording.state_at(frame)?;
+        if let Some(object) = state.objects.get(&id)
+            && let Some(value) = object.properties.get(property)
+        {
+            let (source, source_frame) = recording
+                .frame_sources
+                .frame(frame)
+                .ok_or("inconsistent recording frame-source directory")?;
+            let (section, source_id) = match source {
+                FrameSourceKey::Captured { section, source } => {
+                    (section.name(), format!("0x{source:X}"))
+                }
+                FrameSourceKey::Legacy => ("recording", String::new()),
+            };
+            let seconds = recording
+                .seconds_at(frame)
+                .map(|seconds| format!("{seconds:.9}"))
+                .unwrap_or_default();
+            writeln!(
+                file,
+                "{frame},{seconds},0x{id:X},{},{},{},{section},{source_id},{}",
+                object.generation,
+                csv_cell(property),
+                csv_cell(&format!("{value:?}")),
+                source_frame.ordinal,
+            )?;
+            rows += 1;
+        }
+    }
+    Ok(rows)
 }
 
 fn profile_csv(path: &str, output: &str) -> Result<()> {
@@ -594,23 +721,29 @@ fn analysis_csv(
     kind: pvd_core::analysis_export::AnalysisCsvKind,
 ) -> Result<()> {
     project_capture::require_full_source(path)?;
-    if !is_native_capture(path)? {
-        return analysis_csv_streaming(path, output, kind);
-    }
-    let recording = Recording::from_path(path)?;
-    report_diagnostics(&recording);
     let cancel = cancellation::Cancellation::install()?;
+    let mut source = input::Input::open(path, |_, _| !cancel.requested())?;
+    if !source.is_native()? {
+        return analysis_csv_streaming(source, output, kind, &cancel);
+    }
+    let recording = source.native_recording(|_, _| !cancel.requested())?;
+    report_diagnostics(&recording);
+    let mut previous = None;
     let mut updated = Instant::now();
     let report = atomic_output::write_new_cancellable(output, &cancel, |destination| {
         pvd_core::analysis_export::write_analysis_csv(&recording, destination, kind, |progress| {
-            if progress.rows_written == 0
-                || progress.rows_written == progress.total_rows
+            let position = (progress.rows_written, progress.total_rows);
+            if previous.is_none_or(|(_, total)| total != progress.total_rows)
+                || (progress.total_rows != 0
+                    && progress.rows_written == progress.total_rows
+                    && previous != Some(position))
                 || updated.elapsed() >= Duration::from_secs(1)
             {
                 eprintln!(
                     "exporting loaded analysis: {} / {} rows",
                     progress.rows_written, progress.total_rows
                 );
+                previous = Some(position);
                 updated = Instant::now();
             }
             !cancel.requested()
@@ -621,23 +754,16 @@ fn analysis_csv(
     Ok(())
 }
 
-fn is_native_capture(path: &str) -> Result<bool> {
-    let mut signature = [0; 4];
-    File::open(path)?.read_exact(&mut signature)?;
-    Ok(signature == pvd_core::native::MAGIC.to_le_bytes())
-}
-
 fn analysis_csv_streaming(
-    path: &str,
+    mut source: input::Input,
     output: &str,
     kind: pvd_core::analysis_export::AnalysisCsvKind,
+    cancel: &cancellation::Cancellation,
 ) -> Result<()> {
     use pvd_core::analysis_export::{AnalysisExportPhase, export_analysis_csv_streaming};
-    let cancel = cancellation::Cancellation::install()?;
-    let mut source = File::open(path)?;
     let mut previous = None;
     let mut updated = Instant::now();
-    let report = atomic_output::write_new_cancellable(output, &cancel, |destination| {
+    let report = atomic_output::write_new_cancellable(output, cancel, |destination| {
         export_analysis_csv_streaming(&mut source, destination, kind, |progress| {
             if previous != Some(progress.phase) || updated.elapsed() >= Duration::from_secs(1) {
                 let phase = match progress.phase {
@@ -718,8 +844,11 @@ fn inspect(path: &str) -> Result<()> {
         return project_capture::inspect(path);
     }
     let started = Instant::now();
-    let mut file = File::open(path)?;
-    let length = file.metadata()?.len();
+    let mut file = input::Input::open(path, |_, _| true)?;
+    let length = file.length();
+    if let Some((member, archive_bytes)) = file.archive() {
+        println!("wrapper: PVD ZIP\narchive_bytes: {archive_bytes}\nmember: {member}");
+    }
     let mut decoder = Decoder::default();
     let mut buffer = vec![0u8; 64 * 1024];
     let mut groups = 0u64;
@@ -739,12 +868,13 @@ fn inspect(path: &str) -> Result<()> {
     };
     file.rewind()?;
     if has_signature && signature == pvd_core::native::MAGIC.to_le_bytes() {
-        return inspect_native(path, length, started);
+        return inspect_native(path, &mut file, started);
     }
     let mut loaded = 0u64;
     let mut text_bytes = 0usize;
     let mut handles = BTreeMap::<u32, std::sync::Arc<str>>::new();
     let mut classes = BTreeMap::<std::sync::Arc<str>, u64>::new();
+    let mut frame_sources = BTreeMap::new();
     let mut errors = Vec::new();
     loop {
         let count = file.read(&mut buffer)?;
@@ -774,10 +904,14 @@ fn inspect(path: &str) -> Result<()> {
                         *classes.entry(name).or_default() += 1;
                     }
                     Event::DestroyInstance { .. } => destroys += 1,
-                    Event::EndSection { name, .. }
-                        if handles.get(&name).is_some_and(|s| s.as_ref() == "frame") =>
-                    {
-                        frames += 1
+                    Event::EndSection { id, name, .. } => {
+                        if let Some(section) = handles
+                            .get(&name)
+                            .and_then(|name| pvd_core::frame_sources::FrameSection::from_name(name))
+                        {
+                            frames += 1;
+                            *frame_sources.entry((section, id)).or_insert(0u64) += 1;
+                        }
                     }
                     Event::ErrorMessage {
                         code,
@@ -792,7 +926,8 @@ fn inspect(path: &str) -> Result<()> {
                     }
                     _ => {}
                 }
-                if text_bytes > 64 << 20 || handles.len() + classes.len() + streams.len() > 200_000
+                if text_bytes > 64 << 20
+                    || handles.len() + classes.len() + streams.len() + frame_sources.len() > 200_000
                 {
                     return Err(
                         "inspection metadata exceeds the 64 MiB text / 200000 entries budget"
@@ -813,6 +948,9 @@ fn inspect(path: &str) -> Result<()> {
         header.timestamp_denominator,
         streams.len()
     );
+    for ((section, id), count) in frame_sources {
+        println!("frame_source {} 0x{id:X}: {count}", section.name());
+    }
     for (class, count) in classes {
         println!("class {class}: {count}");
     }
@@ -823,8 +961,9 @@ fn inspect(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn inspect_native(path: &str, length: u64, started: Instant) -> Result<()> {
-    let recording = Recording::from_path(path)?;
+fn inspect_native(path: &str, source: &mut input::Input, started: Instant) -> Result<()> {
+    let length = source.length();
+    let recording = source.native_recording(|_, _| true)?;
     print_history_memory_usage(&recording);
     let final_state = if recording.frame_count() == 0 {
         recording.initial_state().clone()
@@ -982,7 +1121,9 @@ mod error_tests {
     #[test]
     fn sdk_errors_preserve_group_ticks_and_receive_boundaries() {
         let output = error_text(&sdk_errors(true));
-        assert!(output.contains("timed_errors: 2\nuntimed_errors: 0\ncompleted_frames: 1"));
+        assert!(output.contains(
+            "timed_errors: 2\nuntimed_errors: 0\ninitial_untimed_errors: 0\ncompleted_frames: 1"
+        ));
         assert_eq!(output.matches("timestamp_ticks: 12345").count(), 2);
         assert!(output.contains("sdk_timestamp_source: event-group"));
         assert!(!output.contains("timestamp_ticks: 999"));
@@ -1036,6 +1177,36 @@ mod error_tests {
                 .unwrap()
                 .contains("receive_position: no-completed-frames")
         );
+    }
+
+    #[test]
+    fn initial_errors_preserve_container_identity_without_receive_positions() {
+        let error = pvd_core::InitialUntimedError {
+            code: 4,
+            message: "earlier error\n\u{1b}[31m".into(),
+            file: "source\nexample.cpp".into(),
+            line: 248,
+            index: 9,
+            container_instance: 29,
+            container_generation: 3,
+        };
+        let mut bytes = Vec::new();
+        write_initial_untimed_error(&mut bytes, &error).unwrap();
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(output.starts_with("native_initial_error:\n  code: 4\n"));
+        assert!(output.contains("message: \"earlier error\\n\\u{1b}[31m\""));
+        assert!(output.contains("file: \"source\\nexample.cpp\"\n  line: 248\n  index: 9"));
+        assert!(output.contains("timestamp_ticks: unknown\n  receive_position: initial-snapshot"));
+        assert!(output.contains("container_instance: 0x1d\n  container_generation: 3"));
+        assert!(!output.contains('\u{1b}'));
+        for absent in [
+            "received_frame:",
+            "history_event:",
+            "timestamp_ticks: 0",
+            "actor",
+        ] {
+            assert!(!output.contains(absent));
+        }
     }
 
     #[test]

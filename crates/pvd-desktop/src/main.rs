@@ -22,6 +22,7 @@ mod egui_output;
 mod file_picker;
 mod full_profile;
 mod i18n;
+mod lifecycle_probe;
 mod line_render;
 mod listen_settings;
 mod memory;
@@ -53,6 +54,20 @@ fn main() -> AppExit {
     };
     let live_profile = take_flag_option(&mut args, "--live-profile");
     let smooth_lines = !take_flag_option(&mut args, "--no-line-aa");
+    let lifecycle_check = if args
+        .get(1)
+        .is_some_and(|arg| arg == "--render-lifecycle-check")
+    {
+        match lifecycle_probe::Config::parse(&args) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!("{error}");
+                return AppExit::error();
+            }
+        }
+    } else {
+        None
+    };
     let playback_check = if args.get(1).is_some_and(|arg| {
         matches!(
             arg.as_str(),
@@ -69,8 +84,9 @@ fn main() -> AppExit {
     } else {
         None
     };
-    let render_check =
-        playback_check.is_some() || args.get(1).is_some_and(|arg| arg == "--render-check");
+    let render_check = lifecycle_check.is_some()
+        || playback_check.is_some()
+        || args.get(1).is_some_and(|arg| arg == "--render-check");
     let mut studio = studio::Studio::default();
     studio.live_profile_enabled = live_profile;
     if let Some(language) = language {
@@ -113,25 +129,27 @@ fn main() -> AppExit {
             .get(2)
             .expect("--render-check requires a capture path and output PNG");
         let output = args.get(3).expect("--render-check requires an output PNG");
-        app.world_mut().resource_mut::<studio::Studio>().path_input = capture.clone();
+        app.world_mut().resource_mut::<studio::Studio>().path_input = if lifecycle_check.is_some() {
+            String::new()
+        } else {
+            capture.clone()
+        };
         app.insert_resource(scene::RenderCheck {
             output: output.clone(),
             target: Handle::default(),
             frames: 0,
             requested: false,
-            desired_frame: playback_check
-                .is_none()
+            desired_frame: (playback_check.is_none() && lifecycle_check.is_none())
                 .then(|| args.get(4).and_then(|arg| arg.parse().ok()))
                 .flatten(),
-            panel: playback_check
-                .is_none()
+            panel: (playback_check.is_none() && lifecycle_check.is_none())
                 .then(|| args.get(5).cloned())
                 .flatten(),
             prepared: false,
             seek_requested: false,
             completion: None,
             exit_sent: false,
-            size: if playback_check.is_some() {
+            size: if playback_check.is_some() || lifecycle_check.is_some() {
                 UVec2::new(1440, 960)
             } else {
                 UVec2::new(
@@ -150,7 +168,7 @@ fn main() -> AppExit {
             .add_plugins(ScheduleRunnerPlugin::run_loop(
                 std::time::Duration::from_millis(16),
             ));
-        if playback_check.is_none() {
+        if playback_check.is_none() && lifecycle_check.is_none() {
             app.add_systems(Update, scene::render_check);
         }
     } else {
@@ -174,6 +192,9 @@ fn main() -> AppExit {
     .add_systems(Update, clips::handle_window_close);
     if let Some(config) = playback_check {
         app.add_plugins(display_probe::Plugin(config));
+    }
+    if let Some(config) = lifecycle_check {
+        app.add_plugins(lifecycle_probe::Plugin(config));
     }
     app.run()
 }

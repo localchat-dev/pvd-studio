@@ -33,8 +33,8 @@ pub(super) fn show(ui: &mut egui::Ui, rect: egui::Rect, studio: &mut Studio) -> 
         let help_text = format!(
             "{}\n{camera_help}",
             language.text(
-                "Space: play/pause · ←/→: step · F: focus",
-                "空格 播放/暂停 · ←/→ 逐帧 · F 聚焦",
+                "Space: play/pause · ←/→: step · F: focus · Shift+click: select multiple",
+                "空格 播放/暂停 · ←/→ 逐帧 · F 聚焦 · Shift+单击 多选",
             )
         );
         let foreground = egui::Color32::from_rgb(204, 215, 230);
@@ -126,6 +126,60 @@ pub(super) fn show(ui: &mut egui::Ui, rect: egui::Rect, studio: &mut Studio) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiselect_help_fits_both_languages_in_small_viewports() {
+        for language in [Language::Chinese, Language::English] {
+            for mode in [
+                crate::camera_controller::CameraMode::Orbit,
+                crate::camera_controller::CameraMode::Fly,
+            ] {
+                for size in [egui::vec2(640.0, 480.0), egui::vec2(320.0, 180.0)] {
+                    let context = egui::Context::default();
+                    configure(&context);
+                    let mut studio = Studio::default();
+                    studio.prefs.language = language;
+                    studio.prefs.camera_mode = mode;
+                    let screen =
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+                    let viewport = egui::Rect::from_center_size(screen.center(), size);
+                    let output = context.run(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |context| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                context,
+                                |ui| {
+                                    let button = show(ui, viewport, &mut studio);
+                                    assert!(viewport.contains_rect(button.rect));
+                                },
+                            );
+                        },
+                    );
+                    let help = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::epaint::Shape::Text(text)
+                                if text.galley.text().contains("Shift+") =>
+                            {
+                                Some((shape.clip_rect, text))
+                            }
+                            _ => None,
+                        })
+                        .expect("multiselect controls must remain visible");
+                    let bounds = help.1.galley.rect.translate(help.1.pos.to_vec2());
+                    assert!(
+                        viewport.expand(0.5).contains_rect(bounds),
+                        "{language:?} {mode:?} {size:?}: {bounds:?}"
+                    );
+                    assert!(help.0.expand(0.5).contains_rect(bounds));
+                }
+            }
+        }
+    }
 
     #[test]
     fn controls_toggle_preserves_scene_input_and_releases_keyboard_focus() {

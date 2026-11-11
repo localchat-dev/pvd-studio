@@ -26,13 +26,21 @@ const IN_MEMORY_SDK_BYTES: u64 = 32 * 1024 * 1024;
 
 mod action_probe;
 mod analysis_demand;
+mod archive;
 mod display_status;
+mod frame_sources;
 pub use display_status::{DisplayMode, DisplayReason};
 #[cfg(test)]
 mod analysis_demand_tests;
 #[cfg(test)]
+mod analysis_file_tests;
+#[cfg(all(test, windows))]
+mod apex_tcp_tests;
+#[cfg(test)]
 mod clip_tests;
+mod coordinates;
 mod layout;
+mod native_export;
 mod playback_recovery;
 #[cfg(test)]
 mod playback_tests;
@@ -40,6 +48,7 @@ mod playback_tests;
 mod profile_index_tests;
 mod retained_capture;
 mod seeking;
+mod selection;
 mod ui_actions;
 pub use ui_actions::UiAction;
 #[cfg(test)]
@@ -57,6 +66,40 @@ pub enum Panel {
     Curves,
     Diagnostics,
     Display,
+}
+
+impl Panel {
+    pub const ALL: [Self; 10] = [
+        Self::Objects,
+        Self::Viewport,
+        Self::Inspector,
+        Self::Timeline,
+        Self::Clips,
+        Self::Performance,
+        Self::Memory,
+        Self::Curves,
+        Self::Diagnostics,
+        Self::Display,
+    ];
+
+    pub fn label(self, language: Language) -> &'static str {
+        match self {
+            Self::Objects => language.text("Objects", "对象"),
+            Self::Viewport => language.text("Scene", "场景"),
+            Self::Inspector => language.text("Properties", "属性"),
+            Self::Timeline => language.text("Timeline", "时间轴"),
+            Self::Clips => language.text("Clips", "片段"),
+            Self::Performance => language.text("Performance", "性能"),
+            Self::Memory => language.text("Memory", "内存"),
+            Self::Curves => language.text("Curves", "曲线"),
+            Self::Diagnostics => language.text("Diagnostics", "诊断"),
+            Self::Display => language.text("Display", "显示"),
+        }
+    }
+
+    pub fn is_closeable(self) -> bool {
+        self != Self::Viewport
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +124,49 @@ impl ObjectScope {
             Self::All => language.text("All", "全部"),
             Self::Selected => language.text("Selected", "已选"),
             Self::Unselected => language.text("Unselected", "未选"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DisplayColors {
+    pub static_body: [f32; 3],
+    pub dynamic_body: [f32; 3],
+    pub sleeping_body: [f32; 3],
+    pub kinematic_body: [f32; 3],
+    pub cloth: [f32; 3],
+}
+
+impl Default for DisplayColors {
+    fn default() -> Self {
+        Self {
+            static_body: [0.28, 0.34, 0.42],
+            dynamic_body: [0.56, 0.67, 0.79],
+            sleeping_body: [0.36, 0.43, 0.52],
+            kinematic_body: [0.68, 0.47, 0.81],
+            cloth: [0.85, 0.74, 0.5],
+        }
+    }
+}
+
+impl DisplayColors {
+    pub(crate) fn sanitize(&mut self) {
+        let defaults = Self::default();
+        for (color, fallback) in [
+            (&mut self.static_body, defaults.static_body),
+            (&mut self.dynamic_body, defaults.dynamic_body),
+            (&mut self.sleeping_body, defaults.sleeping_body),
+            (&mut self.kinematic_body, defaults.kinematic_body),
+            (&mut self.cloth, defaults.cloth),
+        ] {
+            for (channel, fallback) in color.iter_mut().zip(fallback) {
+                *channel = if channel.is_finite() {
+                    channel.clamp(0.0, 1.0)
+                } else {
+                    fallback
+                };
+            }
         }
     }
 }
@@ -124,6 +210,10 @@ pub struct Preferences {
     pub local_axes_scope: ObjectScope,
     pub velocity_scope: ObjectScope,
     pub opacity_scope: ObjectScope,
+    pub sleeping_scope: ObjectScope,
+    pub show_triggers: bool,
+    pub trigger_scope: ObjectScope,
+    pub display_colors: DisplayColors,
     pub gizmo_scale: f32,
     pub gizmo_line_width: f32,
     pub velocity_scale: f32,
@@ -140,6 +230,8 @@ pub struct Preferences {
     pub camera_mode: crate::camera_controller::CameraMode,
     pub fly_speed: f32,
     pub up_axis: crate::coordinates::UpAxis,
+    pub up_mode: crate::coordinates::UpMode,
+    pub custom_up: [f32; 3],
     pub handedness: crate::coordinates::Handedness,
     pub meters_per_unit: f32,
 }
@@ -219,6 +311,10 @@ impl Default for Preferences {
             local_axes_scope: ObjectScope::All,
             velocity_scope: ObjectScope::All,
             opacity_scope: ObjectScope::All,
+            sleeping_scope: ObjectScope::All,
+            show_triggers: true,
+            trigger_scope: ObjectScope::All,
+            display_colors: DisplayColors::default(),
             gizmo_scale: 1.0,
             gizmo_line_width: crate::line_render::DEFAULT_LINE_WIDTH,
             velocity_scale: 1.0,
@@ -235,6 +331,8 @@ impl Default for Preferences {
             camera_mode: crate::camera_controller::CameraMode::default(),
             fly_speed: 10.0,
             up_axis: crate::coordinates::UpAxis::default(),
+            up_mode: crate::coordinates::UpMode::default(),
+            custom_up: [0.0, 1.0, 0.0],
             handedness: crate::coordinates::Handedness::default(),
             meters_per_unit: 1.0,
         }
@@ -267,6 +365,7 @@ impl Preferences {
         });
         layout::repair(&mut preferences.dock);
         preferences.min_free_disk_mib = preferences.min_free_disk_mib.max(512);
+        preferences.display_colors.sanitize();
         if Path::new(&preferences.history_directory) == std::env::temp_dir().join("pvd-studio-live")
         {
             preferences.history_directory = pvd_core::live::HistoryConfig::default()
@@ -278,6 +377,16 @@ impl Preferences {
     }
     pub(crate) fn validate_dock(dock: &DockState<Panel>) -> Result<(), &'static str> {
         layout::validate(dock)
+    }
+    pub fn show_panel(&mut self, panel: Panel) {
+        layout::show_panel(&mut self.dock, panel);
+    }
+    pub fn hide_panel(&mut self, panel: Panel) {
+        if panel.is_closeable()
+            && let Some(location) = self.dock.find_tab(&panel)
+        {
+            self.dock.remove_tab(location);
+        }
     }
     pub fn save(&self) -> Result<(), String> {
         self.save_to(&Self::path())
@@ -353,14 +462,21 @@ pub struct Studio {
     pub recording: Option<Arc<Recording>>,
     pub state: SceneState,
     pub scene_changes: crate::scene::SceneChanges,
+    up_resolver: crate::coordinates::UpResolver,
     pub activity: crate::activity::ActivityCache,
     pub bytes: Option<Arc<Vec<u8>>>,
     pub source: String,
     pub path_input: String,
     pub export_path: String,
+    pub native_export_path: String,
     pub filter: String,
     pub selected: Option<u64>,
+    selection: selection::Selection,
     pub frame: usize,
+    selected_frame_source: Option<pvd_core::frame_sources::FrameSourceKey>,
+    displayed_frame_source: Option<frame_sources::FrameIdentity>,
+    live_frame_source: Option<frame_sources::FrameIdentity>,
+    live_analysis: pvd_core::analysis::SharedAnalysis,
     pub playing: i32,
     pub playback_fps: f32,
     pub recorded_timing: bool,
@@ -456,14 +572,21 @@ impl Default for Studio {
             recording: None,
             state: SceneState::default(),
             scene_changes: crate::scene::SceneChanges::default(),
+            up_resolver: crate::coordinates::UpResolver::default(),
             activity: crate::activity::ActivityCache::default(),
             bytes: None,
             source: String::new(),
             path_input,
             export_path: "captures/capture.pvdstream".into(),
+            native_export_path: "captures/capture.pxd2".into(),
             filter: String::new(),
             selected: None,
+            selection: selection::Selection::default(),
             frame: 0,
+            selected_frame_source: None,
+            displayed_frame_source: None,
+            live_frame_source: None,
+            live_analysis: Default::default(),
             display_trace: None,
             display_request: 0,
             playing: 0,
@@ -552,6 +675,7 @@ impl Studio {
         let initial = match kind {
             PickerKind::OpenCapture => &self.path_input,
             PickerKind::SaveCapture | PickerKind::SaveClip => &self.export_path,
+            PickerKind::SaveNativeCapture => &self.native_export_path,
             PickerKind::SaveRepx => &self.repx_path,
             PickerKind::SaveCsv => &self.curve_export_path,
             PickerKind::SaveAnalysisCsv => &self.analysis_export_path,
@@ -706,10 +830,9 @@ impl Studio {
         }
     }
     pub fn step_frame(&mut self, direction: i32) {
-        let first = self.first_frame();
-        let last = self.count().saturating_sub(1);
-        let target = (self.frame as i64 + i64::from(direction))
-            .clamp(first as i64, last.max(first) as i64) as usize;
+        let Some(target) = self.next_playback_frame(direction) else {
+            return;
+        };
         self.seek_paused(
             target,
             if direction < 0 {
@@ -720,12 +843,7 @@ impl Studio {
         );
     }
     fn start_playback(&mut self, direction: i32) {
-        let Some((first, last)) = self.timeline_recording().and_then(|recording| {
-            Some((
-                recording.frames.first()?.index,
-                recording.frames.last()?.index,
-            ))
-        }) else {
+        let Some((first, last)) = self.playback_bounds() else {
             if direction > 0 && self.live_connected {
                 self.return_to_live();
             }
@@ -761,19 +879,7 @@ impl Studio {
     }
     fn continue_from_retained_start(&mut self) {
         use playback_recovery::Decision;
-        let range = self.timeline_recording().and_then(|recording| {
-            let first = recording
-                .frames
-                .iter()
-                .find(|frame| recording.is_frame_retained(frame.index))?
-                .index;
-            let last = recording
-                .frames
-                .iter()
-                .rfind(|frame| recording.is_frame_retained(frame.index))?
-                .index;
-            Some((first, last))
-        });
+        let range = self.retained_playback_bounds();
         let decision = match range {
             Some((first, last)) => self
                 .playback_recovery
@@ -783,16 +889,8 @@ impl Studio {
                 .unavailable(self.live_connected, Instant::now()),
         };
         let decision = if let Decision::Seek(target) = decision {
-            self.timeline_recording()
-                .and_then(|recording| {
-                    recording
-                        .frames
-                        .iter()
-                        .find(|frame| {
-                            frame.index >= target && recording.is_frame_retained(frame.index)
-                        })
-                        .map(|frame| Decision::Seek(frame.index))
-                })
+            self.retained_playback_at_or_after(target)
+                .map(Decision::Seek)
                 .unwrap_or_else(|| {
                     self.playback_recovery
                         .unavailable(self.live_connected, Instant::now())
@@ -828,10 +926,18 @@ impl Studio {
         self.playing = 0;
         self.follow_live = self.live_connected;
         self.display_reason = None;
+        self.refresh_selection();
         self.state = self.live_state.clone();
+        self.refresh_selection();
         self.activity.rebuild(&self.state);
         self.frame = self.live_frame;
-        self.recording = Some(recording);
+        self.displayed_frame_source = self.live_frame_source;
+        if !self.live_connected {
+            self.selected_frame_source = self.live_frame_source.map(|(source, _)| source);
+        }
+        let mut displayed = (*recording).clone();
+        displayed.analysis = self.live_analysis.clone();
+        self.recording = Some(Arc::new(displayed));
         self.displayed_analysis = analysis_demand::DisplayedAnalysis::Complete;
         self.refresh_live_errors();
         self.revision += 1;
@@ -886,7 +992,9 @@ impl Studio {
             if self.follow_live {
                 return false;
             }
+            self.refresh_selection();
             self.state = recording.initial_state().clone();
+            self.refresh_selection();
             self.activity.rebuild(&self.state);
             self.frame = 0;
             self.revision += 1;
@@ -945,6 +1053,7 @@ impl Studio {
             if let Some(reason) = reason.or(self.follow_live.then_some(DisplayReason::Frame)) {
                 self.leave_live(reason);
             }
+            self.select_source_of_frame(target);
             self.seeking = Some(target);
             return true;
         }
@@ -953,18 +1062,17 @@ impl Studio {
                 if let Some(reason) = reason.or(self.follow_live.then_some(DisplayReason::Frame)) {
                     self.leave_live(reason);
                 }
+                self.refresh_selection();
                 self.state = state;
+                self.refresh_selection();
                 self.activity.rebuild(&self.state);
-                self.frame = target;
+                self.select_source_of_frame(target);
+                self.remember_display_frame(target);
                 self.revision += 1;
                 true
             }
             Err(error) => {
-                self.playing = 0;
-                self.notice(Message::new(
-                    format!("Frame {target}: {error}"),
-                    format!("第 {target} 帧：{error}"),
-                ));
+                self.stop_seek_failure(target, error.to_string());
                 false
             }
         }
@@ -1015,12 +1123,16 @@ impl Studio {
             job.cancelled.store(true, Ordering::Relaxed);
         }
         self.recording = None;
+        self.selected_frame_source = None;
+        self.displayed_frame_source = None;
+        self.live_frame_source = None;
+        self.live_analysis = Default::default();
         self.displayed_analysis = analysis_demand::DisplayedAnalysis::Complete;
         self.state = SceneState::default();
         self.activity.clear();
         self.bytes = None;
         self.source.clear();
-        self.selected = None;
+        self.clear_selection();
         self.live_session = None;
         self.capture_path = None;
         self.playing = 0;
@@ -1116,6 +1228,7 @@ impl Studio {
                             PickerKind::SaveCapture | PickerKind::SaveClip => {
                                 self.export_path = text
                             }
+                            PickerKind::SaveNativeCapture => self.native_export_path = text,
                             PickerKind::SaveRepx => self.repx_path = text,
                             PickerKind::SaveCsv => self.curve_export_path = text,
                             PickerKind::SaveAnalysisCsv => self.analysis_export_path = text,
@@ -1197,9 +1310,8 @@ impl Studio {
                     source_identity,
                     clips,
                 }) => {
-                    let native_container = bytes.as_ref().is_some_and(|bytes| {
-                        bytes.starts_with(&pvd_core::native::MAGIC.to_le_bytes())
-                    });
+                    let native_container =
+                        recording.source == pvd_core::RecordingSource::Pvd3Database;
                     self.profile_window = None;
                     if !job.live {
                         self.clear_recording();
@@ -1215,14 +1327,22 @@ impl Studio {
                     {
                         self.notice(message);
                     }
+                    if !job.live
+                        && !native_container
+                        && self.capture_path.is_none()
+                        && self.bytes.is_some()
+                    {
+                        self.clip_persistence.issue = Some(Message::new(
+                            "Save the SDK stream to a file to keep clip definitions. Range export is available in the toolbar.",
+                            "先另存 SDK 数据流后可保存片段定义；当前可在工具栏导出帧区间。",
+                        ));
+                    }
                     self.trim_first = self.first_frame();
                     self.trim_last = self.count().saturating_sub(1);
                     self.use_retained_range();
-                    self.seek(if job.live {
-                        self.count().saturating_sub(1)
-                    } else {
-                        self.first_frame()
-                    });
+                    if let Some((first, last)) = self.playback_bounds() {
+                        self.seek(if job.live { last } else { first });
+                    }
                     if !job.live {
                         self.focus_selected = true;
                         let count = self.count().saturating_sub(self.first_frame());
@@ -1281,12 +1401,11 @@ impl Studio {
         {
             let now = Instant::now();
             for _ in 0..16 {
-                let next = self.frame as i64 + i64::from(self.playing);
-                if next < self.first_frame() as i64 || next >= self.count() as i64 {
-                    if self.playing > 0 && next < self.first_frame() as i64 {
+                let next = self.next_playback_frame(self.playing);
+                if next.is_none() {
+                    if self.playing > 0 && self.frame < self.first_frame() {
                         self.continue_from_retained_start();
-                    } else if self.playing > 0 && self.live_connected && next >= self.count() as i64
-                    {
+                    } else if self.playing > 0 && self.live_connected {
                         self.return_to_live();
                     } else {
                         self.pause_display_for(if self.playing < 0 {
@@ -1297,24 +1416,25 @@ impl Studio {
                     }
                     break;
                 }
+                let next = next.unwrap();
                 let interval = playback_interval(
                     self.recording.as_deref(),
                     self.frame,
-                    next as usize,
+                    next,
                     self.recorded_timing,
                     self.playback_fps,
                 );
                 if now.duration_since(self.last_step) < interval {
                     break;
                 }
-                self.seek_with_intent(next as usize, playback_recovery::Intent::Playback);
+                self.seek_with_intent(next, playback_recovery::Intent::Playback);
                 self.last_step += interval;
                 if self.playing == 0 || self.seeking.is_some() {
                     break;
                 }
             }
             if self.playing != 0 {
-                let next = (self.frame as i64 + i64::from(self.playing)) as usize;
+                let next = self.next_playback_frame(self.playing).unwrap_or(self.frame);
                 let interval = playback_interval(
                     self.recording.as_deref(),
                     self.frame,
@@ -1515,22 +1635,55 @@ impl Studio {
         }
     }
     pub fn plot(&mut self, property: String, component: usize, context: egui::Context) {
+        self.plot_property(property, None, component, context);
+    }
+    pub fn plot_element(
+        &mut self,
+        property: String,
+        index: usize,
+        component: usize,
+        context: egui::Context,
+    ) {
+        self.plot_property(property, Some(index), component, context);
+    }
+    fn plot_property(
+        &mut self,
+        property: String,
+        index: Option<usize>,
+        component: usize,
+        context: egui::Context,
+    ) {
         if self.recording.is_none() {
             return;
         }
         let Some(object) = self.selected.and_then(|id| self.state.objects.get(&id)) else {
             return;
         };
-        let Some(component_name) = object
-            .properties
-            .get(&property)
-            .and_then(|value| crate::curve::components(value).get(component))
-            .copied()
-        else {
+        let Some(value) = object.properties.get(&property) else {
+            return;
+        };
+        let (source, value) = if let Some(index) = index {
+            let pvd_core::Value::Array(values) = value else {
+                return;
+            };
+            let Some(value) = values.get(index) else {
+                return;
+            };
+            let Some(value_type) = crate::curve::ElementType::of(value) else {
+                return;
+            };
+            (
+                crate::curve::Source::PropertyElement { index, value_type },
+                value,
+            )
+        } else {
+            (crate::curve::Source::Property, value)
+        };
+        let Some(component_name) = crate::curve::components(value).get(component).copied() else {
             return;
         };
         let spec = crate::curve::Spec {
-            source: crate::curve::Source::Property,
+            source,
             object: object.id,
             generation: object.generation,
             property,
@@ -1639,14 +1792,14 @@ impl Studio {
             component: 0,
             component_name: "ms".into(),
         };
-        let label = if recording
-            .analysis
-            .profile_metadata_ambiguous(key.zone, key.event)
-        {
+        let analysis = recording
+            .native_end_analysis()
+            .unwrap_or(&recording.analysis);
+        let label = if analysis.profile_metadata_ambiguous(key.zone, key.event) {
             spec.label()
                 .context("Metadata identity is ambiguous", "元数据身份有歧义")
-        } else if let Some(zone) = recording.analysis.profile_zone_name(key.zone)
-            && let Some(event) = recording.analysis.profile_event_name(key.zone, key.event)
+        } else if let Some(zone) = analysis.profile_zone_name(key.zone)
+            && let Some(event) = analysis.profile_event_name(key.zone, key.event)
         {
             let name = format!("{zone} / {event}");
             spec.label().context(&name, &name)
@@ -1682,7 +1835,11 @@ impl Studio {
                 break;
             };
             if let Some(curve) = self.curves.curves.iter().find(|curve| curve.id == id) {
-                if curve.spec.needs_analysis() && source.is_none() && !self.analysis_ready() {
+                if curve.spec.needs_analysis()
+                    && source.is_none()
+                    && recording.native_end_analysis().is_none()
+                    && !self.analysis_ready()
+                {
                     self.request_current_analysis();
                     if let analysis_demand::DisplayedAnalysis::Failed { message, .. } =
                         &self.displayed_analysis
@@ -1770,7 +1927,10 @@ impl Studio {
             && self.server.is_none()
             && self.save_job.is_none()
             && self.recording_export.is_none()
-            && self.recording.is_some()
+            && self
+                .recording
+                .as_ref()
+                .is_some_and(|recording| recording.source == pvd_core::RecordingSource::SdkStream)
             && (self
                 .bytes
                 .as_ref()
@@ -1813,6 +1973,17 @@ impl Studio {
                 source
             },
         )
+    }
+
+    pub(crate) fn complete_timeline_source(&self) -> Option<crate::full_profile::timeline::Source> {
+        if self.exit_requested || self.job.is_some() || self.server.is_some() {
+            return None;
+        }
+        if self.recording.as_ref()?.source == pvd_core::RecordingSource::Pvd3Database {
+            crate::full_profile::timeline::Source::native(self.recording.as_ref()?.clone())
+        } else {
+            self.complete_profile_source().map(Into::into)
+        }
     }
 
     fn export_source(&self) -> crate::recording_export::Source {
@@ -1979,16 +2150,21 @@ impl Studio {
                         || !cancelled.load(Ordering::Acquire),
                     )
                     .map_err(|e| e.to_string())?;
-                    Ok::<_, String>(Message::new(
-                        format!(
-                            "RepX saved · {} actors · {} shapes · {} materials · {} joints",
-                            export.actors, export.shapes, export.materials, export.joints
-                        ),
-                        format!(
-                            "RepX 已保存 · {} 个 Actor · {} 个形状 · {} 个材质 · {} 个关节",
-                            export.actors, export.shapes, export.materials, export.joints
-                        ),
-                    ))
+                    let message = if export.kinematic_actors == 0 {
+                        Message::detail("RepX saved", "RepX 已保存", &path)
+                    } else {
+                        Message::new(
+                            format!(
+                                "RepX saved: {path}\n{} kinematic actors: targets, velocities and wake counters are not restored.",
+                                export.kinematic_actors
+                            ),
+                            format!(
+                                "RepX 已保存：{path}\n含 {} 个运动学刚体；导入后不恢复目标、速度和唤醒计时。",
+                                export.kinematic_actors
+                            ),
+                        )
+                    };
+                    Ok::<_, String>(message)
                 })();
                 let _ = sender.send(result.unwrap_or_else(|error| {
                     Message::detail("RepX export failed", "RepX 导出失败", error)
@@ -2060,12 +2236,14 @@ impl Studio {
                     if let Some(trace) = &completed.trace {
                         trace.event("apply_begin", 0);
                     }
+                    self.refresh_selection();
                     self.activity.apply_update(update, &mut self.state);
+                    self.refresh_selection();
                     if let Some(trace) = &completed.trace {
                         trace.event("apply_end", 0);
                     }
                     self.refresh_live_errors();
-                    self.frame = completed.frame;
+                    self.remember_display_frame(completed.frame);
                     self.revision += 1;
                     if let Some(trace) = &completed.trace {
                         self.display_request = trace.id;
@@ -2125,6 +2303,7 @@ impl Studio {
     fn stop_seek_failure(&mut self, frame: usize, error: String) {
         self.playing = 0;
         if !self.follow_live {
+            self.restore_display_frame_source();
             self.display_reason = Some(DisplayReason::SeekFailed);
         }
         self.playback_recovery.clear();
@@ -2137,6 +2316,18 @@ impl Studio {
         if self.live_session != Some(snapshot.session) {
             return;
         }
+        if !snapshot.display_updated {
+            self.live_recording = Some(Arc::new(snapshot.recording));
+            return;
+        }
+        self.live_frame_source = snapshot.source_frame.or_else(|| {
+            snapshot
+                .recording
+                .frame_sources
+                .frame(snapshot.frame)
+                .map(|(source, frame)| (source, *frame))
+        });
+        self.live_analysis = snapshot.recording.analysis.clone();
         if self.follow_live {
             snapshot.update.apply(&mut self.live_state);
         }
@@ -2157,9 +2348,12 @@ impl Studio {
             self.tree
                 .retain_for_update(&snapshot.update, &self.state, self.revision);
             self.scene_changes.record(&snapshot.update, self.revision);
+            self.refresh_selection();
             self.activity.apply_update(snapshot.update, &mut self.state);
+            self.refresh_selection();
             self.recording = Some(recording);
             self.frame = snapshot.frame;
+            self.displayed_frame_source = self.live_frame_source;
             self.displayed_analysis = analysis_demand::DisplayedAnalysis::Complete;
             self.refresh_live_errors();
             self.revision += 1;
@@ -2255,7 +2449,17 @@ impl Studio {
                                 let recording = Arc::new(recording);
                                 self.live_recording = Some(recording.clone());
                                 if self.follow_live {
-                                    self.recording = Some(recording);
+                                    let mut displayed = (*recording).clone();
+                                    displayed.analysis = self.live_analysis.clone();
+                                    self.recording = Some(Arc::new(displayed));
+                                    if let Some((_, last)) = self.playback_bounds() {
+                                        if last != self.frame {
+                                            self.seek_paused(last, DisplayReason::Disconnected);
+                                        }
+                                    } else {
+                                        self.selected_frame_source =
+                                            self.displayed_frame_source.map(|(source, _)| source);
+                                    }
                                 }
                                 self.clip_persistence.bind_complete_capture(
                                     None,
@@ -2269,11 +2473,16 @@ impl Studio {
                                     "片段编辑和片段导出暂不支持实时磁盘历史。完整的原始录制仍可单独保存。",
                                 ));
                             }
-                            Err(error) => self.notice(Message::detail(
-                                "Capture decode failed",
-                                "捕获数据解码失败",
-                                error,
-                            )),
+                            Err(error) => {
+                                if self.follow_live {
+                                    self.restore_display_frame_source();
+                                }
+                                self.notice(Message::detail(
+                                    "Capture decode failed",
+                                    "捕获数据解码失败",
+                                    error,
+                                ));
+                            }
                         }
                     }
                 }
@@ -2493,14 +2702,43 @@ fn read_recording(
             clips: None,
         });
     }
-    let native_container = signature[..4] == pvd_core::native::MAGIC.to_le_bytes();
-    if native_container && length > MAX_CAPTURE_BYTES {
-        return Err(Message::new(
-            "Native PVD3 containers above 512 MiB are not supported by the current native importer.",
-            "当前原版文件导入器暂不支持超过 512 MiB 的 PVD3 容器。",
-        ));
+    if pvd_core::pvd_archive::has_zip_signature(&signature) {
+        return archive::read(&mut file, length, cancelled, progress, history);
     }
-    if !native_container && length > IN_MEMORY_SDK_BYTES {
+    let native_container = signature[..4] == pvd_core::native::MAGIC.to_le_bytes();
+    if native_container {
+        drop(file);
+        let (recording, info) =
+            pvd_core::native::read_path_with_progress(path, history, |completed, total| {
+                let indexed = if total == 0 {
+                    0
+                } else {
+                    (u128::from(completed) * u128::from(length) / u128::from(total))
+                        .min(u128::from(length)) as u64
+                };
+                progress.store(indexed, Ordering::Relaxed);
+                !cancelled.load(Ordering::Relaxed)
+            })
+            .map_err(|error| {
+                Message::detail("Cannot import native capture", "无法导入原版录制", error)
+            })?;
+        validate_complete_disk_history(&recording)?;
+        let source_identity = info.source_blake3.map(|digest| {
+            crate::clip_store::Identity::from_digest(
+                blake3::Hash::from_bytes(digest),
+                info.source_bytes,
+                recording.frame_count(),
+            )
+        });
+        return Ok(LoadedCapture {
+            recording,
+            bytes: None,
+            source_path: Some(path.to_owned()),
+            source_identity,
+            clips: None,
+        });
+    }
+    if length > IN_MEMORY_SDK_BYTES {
         return read_recording_on_disk(path, file, cancelled, progress, history);
     }
     let mut bytes = Vec::with_capacity(length as usize);
@@ -2516,7 +2754,7 @@ fn read_recording(
         if count == 0 {
             break;
         }
-        if !native_container && bytes.len() as u64 + count as u64 > IN_MEMORY_SDK_BYTES {
+        if bytes.len() as u64 + count as u64 > IN_MEMORY_SDK_BYTES {
             drop(decoder);
             drop(bytes);
             return read_recording_on_disk(path, file, cancelled, progress, history);
@@ -2528,7 +2766,7 @@ fn read_recording(
             ));
         }
         bytes.extend_from_slice(&chunk[..count]);
-        if !native_container && let Err(error) = decoder.feed(&chunk[..count]) {
+        if let Err(error) = decoder.feed(&chunk[..count]) {
             if requires_disk_history(&error) {
                 drop(decoder);
                 drop(bytes);
@@ -2542,35 +2780,24 @@ fn read_recording(
         }
         progress.store(bytes.len() as u64, Ordering::Relaxed);
     }
-    let recording = if native_container {
-        pvd_core::native::from_bytes_with_progress(&bytes, |_, _| {
-            !cancelled.load(Ordering::Relaxed)
-        })
-    } else {
-        decoder.finish()
-    }
-    .map_err(|e| {
+    let recording = decoder.finish().map_err(|e| {
         Message::detail(
             "Capture is incomplete or invalid",
             "捕获数据不完整或无效",
             e,
         )
     })?;
-    let source_identity = if native_container {
-        None
-    } else {
-        Some(
-            crate::clip_store::identity(&bytes, recording.frame_count(), cancelled)
-                .map_err(|error| error.message())?,
-        )
-    };
+    let source_identity = Some(
+        crate::clip_store::identity(&bytes, recording.frame_count(), cancelled)
+            .map_err(|error| error.message())?,
+    );
     let clips = source_identity
         .clone()
         .map(|identity| crate::clip_store::load_identified(path, identity, cancelled));
     Ok(LoadedCapture {
         recording,
         bytes: Some(Arc::new(bytes)),
-        source_path: (!native_container).then(|| path.to_owned()),
+        source_path: Some(path.to_owned()),
         source_identity,
         clips,
     })
@@ -2578,7 +2805,22 @@ fn read_recording(
 
 fn read_recording_on_disk(
     path: &Path,
-    mut file: File,
+    file: File,
+    cancelled: &AtomicBool,
+    progress: &AtomicU64,
+    history: pvd_core::live::HistoryConfig,
+) -> LoadResult {
+    let mut loaded = read_sdk_reader(file, cancelled, progress, history)?;
+    loaded.clips = loaded
+        .source_identity
+        .clone()
+        .map(|identity| crate::clip_store::load_identified(path, identity, cancelled));
+    loaded.source_path = Some(path.to_owned());
+    Ok(loaded)
+}
+
+fn read_sdk_reader(
+    mut file: impl Read + Seek,
     cancelled: &AtomicBool,
     progress: &AtomicU64,
     history: pvd_core::live::HistoryConfig,
@@ -2635,17 +2877,22 @@ fn read_recording_on_disk(
         received,
         recording.frame_count(),
     );
-    let clips = crate::clip_store::load_identified(path, identity.clone(), cancelled);
     Ok(LoadedCapture {
         recording,
         bytes: None,
-        source_path: Some(path.into()),
+        source_path: None,
         source_identity: Some(identity),
-        clips: Some(clips),
+        clips: None,
     })
 }
 
 fn requires_disk_history(error: &pvd_core::Error) -> bool {
+    if error
+        .downcast_ref::<pvd_core::analysis::DecodeError>()
+        .is_some()
+    {
+        return true;
+    }
     let detail = error.to_string();
     detail.contains("history memory budget")
         || detail.contains("512 MiB raw stream limit")
@@ -2851,6 +3098,8 @@ mod tests {
             },
         );
         LiveSnapshot {
+            source_frame: None,
+            display_updated: true,
             session,
             frame,
             recording: builder.finish().unwrap(),
@@ -3369,6 +3618,8 @@ mod tests {
         let mut studio = Studio::default();
         studio.connect_live_session(1);
         studio.accept_live_snapshot(LiveSnapshot {
+            source_frame: None,
+            display_updated: true,
             session: 1,
             update: pvd_core::live::SceneUpdate::full(&recording.state_at(last).unwrap()),
             recording: recording.clone(),
@@ -3380,6 +3631,8 @@ mod tests {
         loop {
             for _ in 0..32 {
                 studio.accept_live_snapshot(LiveSnapshot {
+                    source_frame: None,
+                    display_updated: true,
                     session: 1,
                     update: pvd_core::live::SceneUpdate::default(),
                     recording: recording.clone(),
@@ -3417,6 +3670,8 @@ mod tests {
         assert!(after_live > resumed);
         studio.connect_live_session(2);
         studio.accept_live_snapshot(LiveSnapshot {
+            source_frame: None,
+            display_updated: true,
             session: 2,
             update: pvd_core::live::SceneUpdate::full(&recording.state_at(last).unwrap()),
             recording: recording.clone(),
@@ -3601,6 +3856,8 @@ mod tests {
         let mut studio = Studio::default();
         studio.connect_live_session(1);
         studio.accept_live_snapshot(LiveSnapshot {
+            source_frame: None,
+            display_updated: true,
             session: 1,
             update: pvd_core::live::SceneUpdate::full(&recording.state_at(7).unwrap()),
             recording,
@@ -3758,6 +4015,8 @@ mod tests {
         studio.persist_layout = false;
         studio.connect_live_session(1);
         studio.accept_live_snapshot(LiveSnapshot {
+            source_frame: None,
+            display_updated: true,
             session: 1,
             update: pvd_core::live::SceneUpdate::full(&recording.state_at(2).unwrap()),
             recording: recording.clone(),
@@ -3837,6 +4096,8 @@ mod tests {
         let mut studio = Studio::default();
         studio.connect_live_session(1);
         studio.accept_live_snapshot(LiveSnapshot {
+            source_frame: None,
+            display_updated: true,
             session: 1,
             update: pvd_core::live::SceneUpdate::full(&recording.state_at(last).unwrap()),
             recording: recording.clone(),
@@ -3881,7 +4142,7 @@ mod tests {
     #[test]
     #[ignore = "Requires official PhysX 3.4.2 output"]
     fn repeated_disk_seek_matches_real_sdk_capture() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../captures/physx-3.4.pvdstream");
+        let path = sdk_baseline_path();
         let loaded = read_recording_on_disk(
             &path,
             File::open(&path).unwrap(),
@@ -3896,7 +4157,7 @@ mod tests {
     #[test]
     #[ignore = "Requires official PhysX 3.4.2 output"]
     fn disk_file_loader_matches_sdk_replay_and_rejects_incomplete_cache() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../captures/physx-3.4.pvdstream");
+        let path = sdk_baseline_path();
         let cancel = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
         let expected = Recording::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
@@ -3955,7 +4216,7 @@ mod tests {
     #[ignore = "Requires official PhysX 3.4.2 output"]
     fn real_tcp_capture_continues_while_display_is_paused() {
         use std::{io::Write, net::TcpStream};
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../captures/physx-3.4.pvdstream");
+        let path = sdk_baseline_path();
         let bytes = std::fs::read(path).unwrap();
         let mut decoder = pvd_protocol::Decoder::default();
         let groups = decoder.feed(&bytes).unwrap();
@@ -4030,18 +4291,30 @@ mod tests {
         let context = egui::Context::default();
         studio.open(path.clone(), context.clone());
         let deadline = Instant::now() + Duration::from_secs(10);
-        while studio.job.is_some() && Instant::now() < deadline {
+        while (studio.job.is_some() || studio.seeking.is_some()) && Instant::now() < deadline {
             studio.poll(&context);
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(studio.job.is_none(), "desktop load did not finish");
+        assert!(
+            studio.seeking.is_none(),
+            "first frame did not finish loading"
+        );
         assert_eq!(studio.count(), 120, "{:?}", studio.notices);
         assert_eq!(studio.state.render_scene().objects.len(), 6);
         assert_eq!(studio.requested_panel, Some(Panel::Diagnostics));
-        assert_eq!(
-            studio.bytes.as_ref().unwrap().as_slice(),
-            std::fs::read(&path).unwrap()
-        );
+        assert!(studio.bytes.is_none());
+        assert_eq!(studio.capture_path.as_deref(), Some(path.as_path()));
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(studio.source_identity.as_ref().unwrap().matches(
+            *blake3::hash(&bytes).as_bytes(),
+            bytes.len() as u64,
+            120
+        ));
+        assert!(studio.recording.as_ref().unwrap().is_disk_backed());
+        assert!(!studio.can_save_capture());
+        assert!(!studio.can_trim_capture());
+        assert!(studio.can_export_analysis());
         assert!(!studio.recording.as_ref().unwrap().diagnostics.is_empty());
         let errors = studio.recording.as_ref().unwrap().untimed_error_events();
         assert_eq!(errors.len(), 1);
@@ -4051,14 +4324,35 @@ mod tests {
             notice.text(Language::English).contains("limited support")
                 && notice.text(Language::Chinese).contains("部分支持")
         }));
-        studio.plot_performance(context.clone());
+        studio.seek(60);
         let deadline = Instant::now() + Duration::from_secs(10);
+        while studio.seeking.is_some() && Instant::now() < deadline {
+            studio.poll(&context);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(studio.frame, 60);
+        assert!(studio.seeking.is_none());
+        assert!(
+            studio
+                .recording
+                .as_ref()
+                .unwrap()
+                .native_end_analysis()
+                .is_some()
+        );
+        studio.plot_performance(context.clone());
+        let deadline = Instant::now() + Duration::from_secs(30);
         while studio.curve_job.is_some() && Instant::now() < deadline {
             studio.poll(&context);
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(studio.curve_job.is_none());
-        assert_eq!(studio.curves.curves.len(), 1);
+        assert_eq!(studio.curves.curves.len(), 4);
+        for curve in &studio.curves.curves {
+            let data = curve.data.as_ref().expect("native full-history curve");
+            assert_eq!(data.samples.len(), 120);
+            assert!(data.samples.iter().any(|(_, value)| value.is_some()));
+        }
         let interval = &studio.curves.curves[0];
         assert_eq!(
             interval.spec.source,
@@ -4235,6 +4529,124 @@ mod tests {
     }
 
     #[test]
+    fn sleeping_scope_preferences_preserve_visibility_and_old_settings() {
+        let preferences = Preferences {
+            live_refresh_hz: 90,
+            ..Default::default()
+        };
+        let mut stored = serde_json::to_value(&preferences).unwrap();
+        let original_dock = stored["dock"].clone();
+        stored.as_object_mut().unwrap().remove("sleeping_scope");
+        for enabled in [false, true] {
+            stored["show_sleeping"] = enabled.into();
+            let restored = Preferences::from_bytes(&serde_json::to_vec(&stored).unwrap());
+            assert_eq!(restored.show_sleeping, enabled);
+            assert!(restored.sleeping_scope == ObjectScope::All);
+            assert_eq!(restored.live_refresh_hz, 90);
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap()["dock"],
+                original_dock
+            );
+        }
+        for scope in [
+            ObjectScope::All,
+            ObjectScope::Selected,
+            ObjectScope::Unselected,
+        ] {
+            stored["sleeping_scope"] = serde_json::to_value(scope).unwrap();
+            let restored = Preferences::from_bytes(&serde_json::to_vec(&stored).unwrap());
+            assert!(restored.sleeping_scope == scope);
+            assert!(restored.show_sleeping);
+        }
+    }
+
+    #[test]
+    fn display_color_preferences_restore_defaults_and_custom_values() {
+        let mut preferences = Preferences {
+            live_refresh_hz: 90,
+            show_sleeping: false,
+            ..Default::default()
+        };
+        preferences.display_colors = DisplayColors {
+            static_body: [0.1, 0.2, 0.3],
+            dynamic_body: [0.2, 0.3, 0.4],
+            sleeping_body: [0.3, 0.4, 0.5],
+            kinematic_body: [0.4, 0.5, 0.6],
+            cloth: [0.5, 0.6, 0.7],
+        };
+        let mut stored = serde_json::to_value(&preferences).unwrap();
+        let original_dock = stored["dock"].clone();
+        let restored = Preferences::from_bytes(&serde_json::to_vec(&stored).unwrap());
+        assert_eq!(restored.display_colors, preferences.display_colors);
+        stored.as_object_mut().unwrap().remove("display_colors");
+        let restored = Preferences::from_bytes(&serde_json::to_vec(&stored).unwrap());
+        assert_eq!(restored.display_colors, DisplayColors::default());
+        assert!(!restored.show_sleeping);
+        assert_eq!(restored.live_refresh_hz, 90);
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap()["dock"],
+            original_dock
+        );
+        stored["display_colors"] = serde_json::json!({"static_body": [1.5, -0.2, 0.25]});
+        let restored = Preferences::from_bytes(&serde_json::to_vec(&stored).unwrap());
+        assert_eq!(restored.display_colors.static_body, [1.0, 0.0, 0.25]);
+        assert_eq!(
+            restored.display_colors.dynamic_body,
+            DisplayColors::default().dynamic_body
+        );
+        assert!(!restored.show_sleeping);
+        assert_eq!(restored.live_refresh_hz, 90);
+    }
+
+    #[test]
+    fn display_colors_replace_non_finite_channels_independently() {
+        let mut colors = DisplayColors {
+            dynamic_body: [f32::NAN, -0.5, 2.0],
+            cloth: [0.25, f32::INFINITY, 0.75],
+            ..Default::default()
+        };
+        colors.sanitize();
+        assert_eq!(colors.dynamic_body, [0.56, 0.0, 1.0]);
+        assert_eq!(colors.cloth, [0.25, 0.74, 0.75]);
+    }
+
+    #[test]
+    fn trigger_preferences_restore_old_defaults_and_each_scope() {
+        let preferences = Preferences {
+            show_dynamic: false,
+            live_refresh_hz: 90,
+            ..Default::default()
+        };
+        let mut stored = serde_json::to_value(preferences).unwrap();
+        let original_dock = stored["dock"].clone();
+        stored.as_object_mut().unwrap().remove("show_triggers");
+        stored.as_object_mut().unwrap().remove("trigger_scope");
+        let restored = Preferences::from_bytes(&serde_json::to_vec(&stored).unwrap());
+        assert!(restored.show_triggers);
+        assert!(restored.trigger_scope == ObjectScope::All);
+        assert!(!restored.show_dynamic);
+        assert_eq!(restored.live_refresh_hz, 90);
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap()["dock"],
+            original_dock
+        );
+        for enabled in [false, true] {
+            for scope in [
+                ObjectScope::All,
+                ObjectScope::Selected,
+                ObjectScope::Unselected,
+            ] {
+                stored["show_triggers"] = enabled.into();
+                stored["trigger_scope"] = serde_json::to_value(scope).unwrap();
+                let restored = Preferences::from_bytes(&serde_json::to_vec(&stored).unwrap());
+                assert_eq!(restored.show_triggers, enabled);
+                assert!(restored.trigger_scope == scope);
+                assert!(!restored.show_dynamic);
+            }
+        }
+    }
+
+    #[test]
     fn raw_export_rejects_other_formats_before_creating_files() {
         let mut studio = Studio::default();
         studio.bytes.replace(Arc::new(Vec::new()));
@@ -4268,14 +4680,18 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "Requires official PhysX 3.4.2 output"]
-    fn repeated_open_close_does_not_restore_cancelled_or_previous_state() {
-        let path = std::env::var_os("PVD_SDK34_CAPTURE")
+    fn sdk_baseline_path() -> PathBuf {
+        std::env::var_os("PVD_SDK34_CAPTURE")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../captures/physx-3.4.pvdstream")
-            });
+            })
+    }
+
+    #[test]
+    #[ignore = "Requires official PhysX 3.4.2 output"]
+    fn repeated_open_close_does_not_restore_cancelled_or_previous_state() {
+        let path = sdk_baseline_path();
         let mut studio = Studio::default();
         let context = egui::Context::default();
         for _ in 0..3 {

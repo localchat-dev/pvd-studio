@@ -1,16 +1,15 @@
 use super::{Layout, TrackScale, ViewState, refresh};
 use crate::{
-    full_profile::{Source, TimelineProgress},
+    full_profile::timeline::{
+        Identity, Source, ThreadCursor, ThreadPageReport, TimelineProgress, WindowReport,
+    },
     i18n::{Language, Message},
     studio::Studio,
 };
 use bevy_egui::egui;
 use pvd_core::{
     analysis::{Analysis, view::ProfileSource},
-    profile_timeline::{
-        ClockRatio, GlobalPairingStats, ThreadCursor, ThreadPageReport, TickRange, WindowLimits,
-        WindowReport, WindowRequest,
-    },
+    profile_timeline::{ClockRatio, GlobalPairingStats, TickRange, WindowLimits, WindowRequest},
 };
 use std::{
     collections::VecDeque,
@@ -22,6 +21,8 @@ use std::{
 };
 
 const THREAD_PAGE: usize = 512;
+#[cfg(all(test, windows))]
+pub(super) mod analysis_probe;
 const MAX_BACK_PAGES: usize = 256;
 
 #[derive(Clone)]
@@ -66,7 +67,7 @@ pub(super) fn prepare_render(context: &egui::Context, epoch: u64) -> Result<bool
 
 #[derive(Clone)]
 struct Overview {
-    identity: pvd_core::profile_curves::SourceIdentity,
+    identity: Identity,
     clock: ClockRatio,
     range: Option<TickRange>,
     stats: GlobalPairingStats,
@@ -351,7 +352,7 @@ impl State {
                 .update_with(request, Some(0), move |_, cancel| {
                     let report =
                         source.thread_page(cursor.as_ref(), THREAD_PAGE, cancel, |status| {
-                            update_progress(&progress, TimelineProgress::Streaming(status), cancel)
+                            update_progress(&progress, status, cancel)
                         })?;
                     Ok((report, Some(Analysis::default())))
                 });
@@ -500,6 +501,9 @@ pub(super) fn show(ui: &mut egui::Ui, studio: &mut Studio, source: Source, compa
                     TimelineProgress::Index(progress) => {
                         progress.completed as f64 / progress.total.max(1) as f64
                     }
+                    TimelineProgress::Native(progress) => {
+                        progress.frames_scanned as f64 / progress.total_frames.max(1) as f64
+                    }
                 };
                 ui.add(egui::ProgressBar::new(fraction as f32).desired_width(80.0));
             }
@@ -610,7 +614,7 @@ pub(super) fn show(ui: &mut egui::Ui, studio: &mut Studio, source: Source, compa
             .as_ref()
             .is_none_or(|overview| overview.range.is_some())
     {
-        ui.label(language.text("Choose Load window to inspect the complete SDK file. Scrolling never scans the source.", "点击“载入时间窗”查看完整 SDK 文件；滚动操作不会扫描源文件。"));
+        ui.label(language.text("Choose Load window to inspect the complete recording. Scrolling never scans the source.", "点击“载入时间窗”查看完整录制；滚动操作不会扫描数据源。"));
     }
     ui.ctx().data_mut(|data| data.insert_temp(id, state));
 }
@@ -653,9 +657,21 @@ fn advance_render(context: &egui::Context, studio: &Studio, state: &mut State) {
                 "渲染检查窗口中没有完整 CPU 区间。",
             ));
         } else {
+            let source = match &state.overview.as_ref().unwrap().identity {
+                Identity::Sdk(identity) => serde_json::json!({
+                    "kind": "sdk_stream",
+                    "bytes": identity.bytes,
+                    "frames": identity.frames,
+                    "blake3": blake3::Hash::from(identity.blake3).to_hex().to_string(),
+                }),
+                Identity::Native(_) => serde_json::json!({
+                    "kind": "native_history",
+                    "frames": studio.recording.as_ref().unwrap().frame_count(),
+                }),
+            };
             println!(
                 "Thread render window loaded: {}",
-                serde_json::json!({"epoch":request.epoch,"frame":studio.frame,"start_tick":prepared.value.request.ticks.start,"end_tick":prepared.value.request.ticks.end,"complete_spans":prepared.analysis.profile_spans().len(),"source_bytes":state.overview.as_ref().unwrap().identity.bytes,"source_frames":state.overview.as_ref().unwrap().identity.frames,"source_blake3":blake3::Hash::from(state.overview.as_ref().unwrap().identity.blake3).to_hex().to_string()})
+                serde_json::json!({"epoch":request.epoch,"frame":studio.frame,"start_tick":prepared.value.request.ticks.start,"end_tick":prepared.value.request.ticks.end,"complete_spans":prepared.analysis.profile_spans().len(),"source":source})
             );
             request.phase = RenderPhase::Loaded { displayed: false };
         }
@@ -917,7 +933,7 @@ fn query_settings(ui: &mut egui::Ui, studio: &mut Studio, state: &mut State, sho
             state.request_page(Some(next));
         }
     });
-    ui.label(language.text("Thread IDs are paged in numeric order. Each page and Load window scans the complete SDK file; panning and zooming only inspect the loaded window.", "线程标识按数值分页。每次翻页或载入时间窗都扫描完整 SDK 文件；平移、缩放只查看已载入窗口。"));
+    ui.label(language.text("Thread IDs are paged in numeric order. Queries cover the complete recording; panning and zooming only inspect the loaded window.", "线程标识按数值分页，查询覆盖完整录制；平移、缩放只查看已载入窗口。"));
     ui.label(language.text("A query retains at most 200,000 spans and a 32 MiB estimated index; layout and scanner memory are separate. Narrow the range or filter thread/Context if a query exceeds its limits.", "一次查询最多保留 200,000 个区间与 32 MiB 估算索引；轨道和扫描器内存另计。超限时可缩小范围或筛选线程、Context。"));
     ui.separator();
     ui.horizontal(|ui| {
@@ -1004,5 +1020,7 @@ fn loaded_detail(ui: &mut egui::Ui, loaded: &Loaded, overview: &Overview, langua
     diagnostics(ui, loaded.stats, loaded.cuda_buffers, language);
 }
 
+#[cfg(test)]
+mod native_tests;
 #[cfg(test)]
 mod tests;

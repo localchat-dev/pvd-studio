@@ -12,9 +12,18 @@ use crate::{
     studio::{ObjectScope, Panel, Preferences, Studio, UiAction},
 };
 
+#[cfg(test)]
+mod array_format_tests;
 mod capture_save;
+mod frame_sources;
+mod help;
+#[cfg(test)]
+mod object_search_tests;
 mod playback_status;
+#[cfg(test)]
+mod property_context_tests;
 mod settings_menu;
+mod source_coordinates;
 mod toolbar;
 mod typography;
 mod viewport_help;
@@ -54,8 +63,8 @@ fn request_scene_sync(context: &egui::Context, previous_revision: u64, revision:
 fn untimed_error_detail(error: &pvd_core::UntimedErrorEvent, language: Language) -> String {
     localized_format!(
         language,
-        "Time unknown · Code {} · {} · {}:{} · Index {} · Received after {} completed frames · History event {}",
-        "时间未知 · 错误码 {} · {} · {}:{} · 索引 {} · 收到时已完成 {} 帧 · 历史事件 {}",
+        "Time unknown · Code {} · {} · {}:{} · Index {} · Received after {} completed frames · History event {} · Container 0x{:X} · Generation {}",
+        "时间未知 · 错误码 {} · {} · {}:{} · 索引 {} · 收到时已完成 {} 帧 · 历史事件 {} · 容器 0x{:X} · 代际 {}",
         error.code,
         error.message,
         error.file,
@@ -63,7 +72,80 @@ fn untimed_error_detail(error: &pvd_core::UntimedErrorEvent, language: Language)
         error.index,
         error.received_frame,
         error.history_event,
+        error.container_instance,
+        error.container_generation,
     )
+}
+
+fn initial_untimed_error_detail(
+    error: &pvd_core::InitialUntimedError,
+    language: Language,
+) -> String {
+    localized_format!(
+        language,
+        "Present at start · Code {} · {} · {}:{} · Index {} · Container 0x{:X} · Generation {}",
+        "起点已有错误 · 错误码 {} · {} · {}:{} · 索引 {} · 容器 0x{:X} · 代际 {}",
+        error.code,
+        error.message,
+        error.file,
+        error.line,
+        error.index,
+        error.container_instance,
+        error.container_generation,
+    )
+}
+
+fn error_summary(code: u32, message: &str, file: &str, line: u32, language: Language) -> String {
+    localized_format!(
+        language,
+        "Code {} · {} · {}:{}",
+        "错误码 {} · {} · {}:{}",
+        code,
+        message,
+        file,
+        line,
+    )
+}
+
+fn initial_errors(ui: &mut egui::Ui, errors: &[pvd_core::InitialUntimedError], language: Language) {
+    if errors.is_empty() {
+        return;
+    }
+    ui.separator();
+    ui.label(language.text("Errors present at start", "起点已有错误"))
+        .on_hover_text(language.text(
+            "These records are in the initial snapshot. Their time and receive positions are unknown. Records retain each container's array order; container IDs do not identify Actors.",
+            "这些记录来自起点快照，时间和接收位置未知。记录保留各容器内的数组顺序；容器 ID 不代表 Actor。",
+        ));
+    egui::ScrollArea::vertical()
+        .id_salt("initial-errors")
+        .max_height(240.0)
+        .show_rows(ui, 24.0, errors.len(), |ui, range| {
+            for row in range {
+                let error = &errors[row];
+                let detail = initial_untimed_error_detail(error, language);
+                let summary = error_summary(
+                    error.code,
+                    &error.message,
+                    &error.file,
+                    error.line,
+                    language,
+                );
+                ui.horizontal(|ui| {
+                    if ui.small_button(language.text("Copy", "复制")).clicked() {
+                        ui.ctx().copy_text(detail.clone());
+                    }
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(summary)
+                                .color(egui::Color32::from_rgb(239, 148, 137)),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(detail);
+                });
+            }
+        });
 }
 
 fn unframed_error_position(frame_count: usize, language: Language) -> &'static str {
@@ -87,6 +169,16 @@ fn object_scope(ui: &mut egui::Ui, id: &str, value: &mut ObjectScope, language: 
                 ui.selectable_value(value, scope, scope.label(language));
             }
         });
+}
+
+fn display_color(ui: &mut egui::Ui, label: &str, color: &mut [f32; 3]) {
+    ui.horizontal(|ui| {
+        let mut srgb = color.map(|channel| (channel * 255.0).round() as u8);
+        if ui.color_edit_button_srgb(&mut srgb).changed() {
+            *color = srgb.map(|channel| f32::from(channel) / 255.0);
+        }
+        ui.label(label);
+    });
 }
 
 fn dock_translations(language: Language) -> egui_dock::Translations {
@@ -154,6 +246,67 @@ fn dock_translations(language: Language) -> egui_dock::Translations {
     }
 }
 
+#[derive(Clone)]
+struct PropertyMenuTarget {
+    source_epoch: u64,
+    object: u64,
+    generation: u32,
+    property: String,
+    index: Option<usize>,
+    value_type: std::mem::Discriminant<Value>,
+}
+
+impl PropertyMenuTarget {
+    fn new(
+        source_epoch: u64,
+        object: &pvd_core::Object,
+        property: &str,
+        index: Option<usize>,
+        value: &Value,
+    ) -> Self {
+        Self {
+            source_epoch,
+            object: object.id,
+            generation: object.generation,
+            property: property.into(),
+            index,
+            value_type: std::mem::discriminant(value),
+        }
+    }
+
+    fn value<'a>(&self, source_epoch: u64, object: &'a pvd_core::Object) -> Option<&'a Value> {
+        if self.source_epoch != source_epoch
+            || self.object != object.id
+            || self.generation != object.generation
+        {
+            return None;
+        }
+        let value = object.properties.get(&self.property)?;
+        let value = if let Some(index) = self.index {
+            let Value::Array(values) = value else {
+                return None;
+            };
+            values.get(index)?
+        } else {
+            value
+        };
+        (std::mem::discriminant(value) == self.value_type).then_some(value)
+    }
+
+    fn label(&self) -> String {
+        match self.index {
+            Some(index) => format!("{}[{index}]", self.property),
+            None => self.property.clone(),
+        }
+    }
+}
+
+fn property_context_requested(ui: &egui::Ui, rect: egui::Rect) -> bool {
+    ui.input(|input| input.focused && input.pointer.button_clicked(egui::PointerButton::Secondary))
+        && ui.is_enabled()
+        && ui.rect_contains_pointer(rect)
+}
+
 fn property_value_row(
     ui: &mut egui::Ui,
     controls: impl FnOnce(&mut egui::Ui),
@@ -177,6 +330,19 @@ fn property_value_row(
         },
     )
     .response
+}
+
+fn property_f32(value: f32) -> String {
+    if value.abs() >= 1e6 || (value.abs() > 0.0 && value.abs() < 1e-4) {
+        format!("{value:.6e}")
+    } else {
+        format!("{value:.6}")
+    }
+}
+
+fn property_components(values: &[f32]) -> String {
+    let values: Vec<_> = values.iter().map(|value| property_f32(*value)).collect();
+    format!("[{}]", values.join(", "))
 }
 
 fn property_text(
@@ -224,12 +390,17 @@ fn property_text(
         }
     }
     match value {
-        Value::F32(value) if value.abs() >= 1e6 || (value.abs() > 0.0 && value.abs() < 1e-4) => {
-            format!("{value:.6e}")
-        }
+        Value::F32(value) => property_f32(*value),
         Value::F64(value) if value.abs() >= 1e6 || (value.abs() > 0.0 && value.abs() < 1e-4) => {
             format!("{value:.6e}")
         }
+        Value::Vec3(values) => property_components(values),
+        Value::Quat(values) => property_components(values),
+        Value::Transform { position, rotation } => format!(
+            "p {} · q {}",
+            property_components(position),
+            property_components(rotation)
+        ),
         _ => value.to_string(),
     }
 }
@@ -280,8 +451,9 @@ pub fn draw(
     let previous_revision = studio.revision;
     crate::camera_controller::begin_frame(context);
     let clip_modal = crate::clips::show_pending_action(context, &mut studio);
+    let modal = clip_modal || help::show(context, &studio);
     let language = studio.prefs.language;
-    if !clip_modal
+    if !modal
         && let Some(path) = context.input(|input| {
             input
                 .raw
@@ -292,7 +464,7 @@ pub fn draw(
     {
         studio.request_ui_action(context, "dropped-capture", UiAction::Open(path));
     }
-    if !clip_modal && !crate::camera_controller::keyboard_input_blocked(context) {
+    if !modal && !crate::camera_controller::keyboard_input_blocked(context) {
         if shortcut(context, egui::Key::Space) && studio.count() > 0 {
             studio.request_ui_action(context, "keyboard-playback", UiAction::TogglePlayback);
         }
@@ -307,13 +479,13 @@ pub fn draw(
         }
     }
     egui::TopBottomPanel::top("main-toolbar").show(context, |ui| {
-        if clip_modal {
+        if modal {
             ui.disable();
         }
         toolbar::show(ui, &mut studio);
     });
     egui::TopBottomPanel::bottom("status").show(context, |ui| {
-        if clip_modal {
+        if modal {
             ui.disable();
         }
         ui.horizontal(|ui| {
@@ -359,7 +531,7 @@ pub fn draw(
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(context, |ui| {
-            if clip_modal {
+            if modal {
                 ui.disable();
             }
             let mut viewer = Viewer {
@@ -382,17 +554,8 @@ pub fn draw(
         )),
     }
     if let Some(panel) = studio.requested_panel.take() {
-        if studio.prefs.dock.find_tab(&panel).is_none() {
-            studio
-                .prefs
-                .dock
-                .main_surface_mut()
-                .push_to_first_leaf(panel);
-        }
-        if let Some(location) = studio.prefs.dock.find_tab(&panel) {
-            studio.prefs.dock.set_active_tab(location);
-            context.request_repaint();
-        }
+        studio.prefs.show_panel(panel);
+        context.request_repaint();
     }
     request_scene_sync(context, previous_revision, studio.revision);
     Ok(())
@@ -627,10 +790,11 @@ fn activity_counts(ui: &mut egui::Ui, studio: &Studio) -> egui::Response {
 
 fn playback(ui: &mut egui::Ui, studio: &mut Studio) {
     let language = studio.prefs.language;
-    let count = studio.count();
-    let first = studio.first_frame();
-    let history = studio.has_history();
-    ui.add_enabled_ui(count > first, |ui| {
+    let (first, last) = studio.playback_ordinal_bounds().unwrap_or((0, 0));
+    let (first_index, last_index) = studio.playback_bounds().unwrap_or((0, 0));
+    let count = last.saturating_add(1);
+    let history = studio.has_history() && studio.playback_bounds().is_some();
+    ui.add_enabled_ui(studio.count() > 0, |ui| {
         if studio.live_session.is_some() && playback_status::live_button(ui, studio)
             .on_hover_text(language.text("Follow the newest decoded frame; it may lag behind TCP reception. Pausing or seeking only pauses this view; reception and history continue.", "跟随最新解码帧，可能落后于 TCP 接收进度。暂停或跳帧只暂停显示，数据接收和历史存储继续。"))
             .clicked() {
@@ -641,7 +805,7 @@ fn playback(ui: &mut egui::Ui, studio: &mut Studio) {
             .on_hover_text(language.text("First frame", "首帧"))
             .clicked()
         {
-            studio.request_ui_action(ui.ctx(), "playback-first", UiAction::PauseAndSeek(first));
+            studio.request_ui_action(ui.ctx(), "playback-first", UiAction::PauseAndSeek(first_index));
         }
         if ui
             .add_enabled(history, egui::Button::new("<"))
@@ -683,19 +847,21 @@ fn playback(ui: &mut egui::Ui, studio: &mut Studio) {
             .on_hover_text(language.text("Last frame", "末帧"))
             .clicked()
         {
-            studio.request_ui_action(ui.ctx(), "playback-last", UiAction::PauseAndSeek(count.saturating_sub(1)));
+            studio.request_ui_action(ui.ctx(), "playback-last", UiAction::PauseAndSeek(last_index));
         }
-        let mut frame = studio.frame;
+        let mut frame = studio.frame_ordinal(studio.frame);
         ui.label(language.text("Frame", "帧"));
         if ui
             .add_enabled(history, egui::DragValue::new(&mut frame).range(first..=count.saturating_sub(1)).clamp_existing_to_range(false))
             .on_hover_text(localized_format!(language, "Displayed frame; retained history: {first}–{}", "实际显示帧；可回放历史：{first}–{}", count.saturating_sub(1)))
             .changed()
+            && let Some(target) = studio.frame_at_ordinal(frame)
         {
-            studio.request_ui_action(ui.ctx(), "playback-frame", UiAction::PauseAndSeek(frame));
+            studio.request_ui_action(ui.ctx(), "playback-frame", UiAction::PauseAndSeek(target));
         }
         ui.label(format!("/ {}", count.saturating_sub(1)));
-        if let Some(frame) = studio.seeking {
+        if let Some(index) = studio.seeking {
+            let frame = studio.frame_ordinal(index);
             ui.spinner();
             ui.label(localized_format!(language, "Loading frame {frame}", "正在读取第 {frame} 帧"));
             if ui.small_button(language.text("Cancel", "取消")).clicked() { studio.request_ui_action(ui.ctx(), "playback-cancel", UiAction::Pause); }
@@ -745,23 +911,10 @@ impl TabViewer for Viewer<'_> {
         egui::Id::new(("studio-panel", key))
     }
     fn title(&mut self, tab: &mut Panel) -> egui::WidgetText {
-        let language = self.studio.prefs.language;
-        match tab {
-            Panel::Objects => language.text("Objects", "对象"),
-            Panel::Viewport => language.text("Scene", "场景"),
-            Panel::Inspector => language.text("Properties", "属性"),
-            Panel::Timeline => language.text("Timeline", "时间轴"),
-            Panel::Clips => language.text("Clips", "片段"),
-            Panel::Performance => language.text("Performance", "性能"),
-            Panel::Memory => language.text("Memory", "内存"),
-            Panel::Curves => language.text("Curves", "曲线"),
-            Panel::Diagnostics => language.text("Diagnostics", "诊断"),
-            Panel::Display => language.text("Display", "显示"),
-        }
-        .into()
+        tab.label(self.studio.prefs.language).into()
     }
-    fn is_closeable(&self, _: &Panel) -> bool {
-        false
+    fn is_closeable(&self, tab: &Panel) -> bool {
+        tab.is_closeable()
     }
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Panel) {
         match tab {
@@ -788,11 +941,25 @@ impl Viewer<'_> {
     fn objects(&mut self, ui: &mut egui::Ui) {
         let language = self.studio.prefs.language;
         ui.add_space(7.0);
-        ui.add(
+        let search = ui.add(
             egui::TextEdit::singleline(&mut self.studio.filter)
                 .hint_text(language.text("Search name, type or ID", "搜索名称、类型或 ID"))
                 .desired_width(f32::INFINITY),
         );
+        if search.lost_focus()
+            && ui.input(|input| {
+                input.focused
+                    && input.modifiers == egui::Modifiers::NONE
+                    && input.key_pressed(egui::Key::Enter)
+                    && !input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Ime(_)))
+            })
+            && let Some(id) = crate::tree::exact_object_id(&self.studio.state, &self.studio.filter)
+        {
+            self.studio.select_object(Some(id), false);
+        }
         ui.add_space(5.0);
         self.studio.tree.update(
             &self.studio.state,
@@ -811,6 +978,7 @@ impl Viewer<'_> {
                 .color(MUTED),
             );
         }
+        let selected = self.studio.selected_ids();
         let tree = &mut self.studio.tree;
         let mut selection = None;
         let mut toggle = None;
@@ -856,7 +1024,7 @@ impl Viewer<'_> {
                             egui::Sense::click(),
                         );
                         let painter = ui.painter().with_clip_rect(rect);
-                        if row.id.is_some() && self.studio.selected == row.id {
+                        if row.id.is_some_and(|id| selected.contains(&id)) {
                             painter.rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
                         } else if response.hovered() {
                             painter.rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
@@ -866,7 +1034,7 @@ impl Viewer<'_> {
                             egui::Align2::LEFT_TOP,
                             &row.label,
                             egui::TextStyle::Body.resolve(ui.style()),
-                            if self.studio.selected == row.id {
+                            if row.id.is_some_and(|id| selected.contains(&id)) {
                                 ACCENT
                             } else {
                                 ui.visuals().text_color()
@@ -880,7 +1048,12 @@ impl Viewer<'_> {
                             MUTED,
                         );
                         if response.on_hover_text(&row.detail).clicked() {
-                            selection = row.id;
+                            selection = row.id.map(|id| {
+                                (
+                                    id,
+                                    ui.input(|input| input.modifiers == egui::Modifiers::SHIFT),
+                                )
+                            });
                         }
                     });
                 }
@@ -891,14 +1064,40 @@ impl Viewer<'_> {
             }
             tree.dirty = true;
         }
-        if let Some(id) = selection {
-            self.studio.selected = Some(id);
+        if let Some((id, toggle)) = selection {
+            self.studio.select_object(Some(id), toggle);
         }
     }
     fn inspector(&mut self, ui: &mut egui::Ui) {
+        fn plot_component_menu(
+            ui: &mut egui::Ui,
+            value: &Value,
+            language: Language,
+        ) -> Option<usize> {
+            let components = crate::curve::components(value);
+            if components.is_empty() {
+                return None;
+            }
+            let mut selected = None;
+            ui.menu_button(language.text("Plot", "曲线"), |ui| {
+                for (index, component) in components.iter().enumerate() {
+                    if ui
+                        .button(crate::curve::component_label(component, language))
+                        .clicked()
+                    {
+                        selected = Some(index);
+                        ui.close();
+                    }
+                }
+            });
+            selected
+        }
+
+        let menu_id = ui.id().with("property-context");
         let language = self.studio.prefs.language;
         ui.add_space(7.0);
         let Some(id) = self.studio.selected else {
+            egui::Popup::close_id(ui.ctx(), menu_id);
             ui.label(language.text(
                 "Select an object in the scene or object list.",
                 "在场景或对象列表中选择对象。",
@@ -906,6 +1105,7 @@ impl Viewer<'_> {
             return;
         };
         let Some(object) = self.studio.state.objects.get(&id) else {
+            egui::Popup::close_id(ui.ctx(), menu_id);
             ui.label(format!("0x{id:016x}"));
             ui.colored_label(
                 MUTED,
@@ -953,6 +1153,18 @@ impl Viewer<'_> {
             "对象代际 {}",
             object.generation
         ));
+        let selection_count = self.studio.selected_ids().len();
+        if selection_count > 1 {
+            ui.label(
+                egui::RichText::new(localized_format!(
+                    language,
+                    "{selection_count} selected · inspecting this object",
+                    "已选 {selection_count} 个 · 查看当前对象",
+                ))
+                .small()
+                .color(MUTED),
+            );
+        }
         let mut export_actor = false;
         let mut choose_repx_path = false;
         ui.horizontal(|ui| {
@@ -963,9 +1175,10 @@ impl Viewer<'_> {
                 &mut self.studio.follow_selected,
                 language.text("Follow", "跟随"),
             );
-            if object.type_name.ends_with("::PxRigidDynamic")
-                || object.type_name.ends_with("::PxRigidStatic")
-            {
+            if selection_count > 1 || matches!(
+                object.type_name.rsplit("::").next(),
+                Some("PxRigidDynamic" | "PxRigidStatic" | "PxArticulation" | "PxArticulationLink" | "PxParticleSystem" | "PxParticleFluid")
+            ) {
                 settings_menu(ui, "RepX", |ui| {
                     ui.text_edit_singleline(&mut self.studio.repx_path);
                     choose_repx_path = ui
@@ -978,9 +1191,13 @@ impl Viewer<'_> {
                         .add_enabled(
                             self.studio.save_job.is_none(),
                             egui::Button::new(
-                                language.text("Export selected actor", "导出选中 Actor"),
+                                language.text("Export selection", "导出所选对象"),
                             ),
                         )
+                        .on_hover_text(language.text(
+                            "Includes connected Actors, joints, complete Articulation trees, Aggregate membership and resources.",
+                            "包含相连 Actor、关节、完整 Articulation 树、Aggregate 成员及资源。",
+                        ))
                         .clicked();
                     if choose_repx_path || export_actor {
                         ui.close();
@@ -992,6 +1209,11 @@ impl Viewer<'_> {
         let properties: Vec<_> = object.properties.iter().collect();
         let mut jump = None;
         let mut plot = None;
+        let mut element_plot = None;
+        let mut context_plot = None;
+        let mut context_target = None;
+        // 捕获切换递增曲线代际，实时快照更新保留该值。
+        let source_epoch = self.studio.curves.epoch;
         let mut copy_error = None;
         let mut array_copy_error = None;
         egui::ScrollArea::vertical()
@@ -999,11 +1221,22 @@ impl Viewer<'_> {
             .show_rows(ui, 50.0, properties.len(), |ui, range| {
                 for row in range {
                     let (name, value) = properties[row];
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(name).small().color(MUTED)).truncate(),
-                    )
-                    .on_hover_text(name);
-                    property_value_row(
+                    let title = ui
+                        .add(
+                            egui::Label::new(egui::RichText::new(name).small().color(MUTED))
+                                .truncate(),
+                        )
+                        .on_hover_text(name);
+                    if property_context_requested(ui, title.rect) {
+                        context_target = Some(PropertyMenuTarget::new(
+                            source_epoch,
+                            object,
+                            name,
+                            None,
+                            value,
+                        ));
+                    }
+                    let property_row = property_value_row(
                         ui,
                         |ui| {
                             if ui.small_button(language.text("Copy", "复制")).clicked()
@@ -1011,21 +1244,8 @@ impl Viewer<'_> {
                             {
                                 copy_error = Some(error);
                             }
-                            let components = crate::curve::components(value);
-                            if !components.is_empty() {
-                                ui.menu_button(language.text("Plot", "曲线"), |ui| {
-                                    for (index, component) in components.iter().enumerate() {
-                                        if ui
-                                            .button(crate::curve::component_label(
-                                                component, language,
-                                            ))
-                                            .clicked()
-                                        {
-                                            plot = Some((name.clone(), index));
-                                            ui.close();
-                                        }
-                                    }
-                                });
+                            if let Some(component) = plot_component_menu(ui, value, language) {
+                                plot = Some((name.clone(), component));
                             }
                         },
                         |ui| match value {
@@ -1069,7 +1289,7 @@ impl Viewer<'_> {
                                             values.len(),
                                             |ui, range| {
                                                 for index in range {
-                                                    property_value_row(
+                                                    let array_row = property_value_row(
                                                         ui,
                                                         |ui| {
                                                             if ui
@@ -1083,6 +1303,30 @@ impl Viewer<'_> {
                                                                 )
                                                             {
                                                                 array_copy_error = Some(error);
+                                                            }
+                                                            if let Some(component) = ui
+                                                                .push_id(
+                                                                    (
+                                                                        id,
+                                                                        object.generation,
+                                                                        name,
+                                                                        index,
+                                                                    ),
+                                                                    |ui| {
+                                                                        plot_component_menu(
+                                                                            ui,
+                                                                            &values[index],
+                                                                            language,
+                                                                        )
+                                                                    },
+                                                                )
+                                                                .inner
+                                                            {
+                                                                element_plot = Some((
+                                                                    name.clone(),
+                                                                    index,
+                                                                    component,
+                                                                ));
                                                             }
                                                         },
                                                         |ui| {
@@ -1110,10 +1354,34 @@ impl Viewer<'_> {
                                                                     ui.close();
                                                                 }
                                                             } else {
-                                                                ui.label(values[index].to_string());
+                                                                let text = property_text(
+                                                                    self.studio
+                                                                        .recording
+                                                                        .as_deref(),
+                                                                    &object.type_name,
+                                                                    name,
+                                                                    &values[index],
+                                                                );
+                                                                ui.add(
+                                                                    egui::Label::new(text)
+                                                                        .truncate(),
+                                                                );
                                                             }
                                                         },
                                                     );
+                                                    if property_context_requested(
+                                                        ui,
+                                                        array_row.rect,
+                                                    ) {
+                                                        context_target =
+                                                            Some(PropertyMenuTarget::new(
+                                                                source_epoch,
+                                                                object,
+                                                                name,
+                                                                Some(index),
+                                                                &values[index],
+                                                            ));
+                                                    }
                                                 }
                                             },
                                         );
@@ -1145,15 +1413,93 @@ impl Viewer<'_> {
                             }
                         },
                     );
+                    if property_context_requested(ui, property_row.rect) {
+                        context_target = Some(PropertyMenuTarget::new(
+                            source_epoch,
+                            object,
+                            name,
+                            None,
+                            value,
+                        ));
+                    }
+                }
+            });
+        let target_id = menu_id.with("target");
+        let open_menu = context_target.is_some();
+        if let Some(target) = context_target {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(target_id, target));
+        }
+        let target = ui
+            .ctx()
+            .data(|data| data.get_temp::<PropertyMenuTarget>(target_id));
+        egui::Popup::context_menu(&ui.response())
+            .id(menu_id)
+            .open_memory(open_menu.then_some(egui::SetOpenCommand::Bool(true)))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                let Some(target) = target else {
+                    ui.close();
+                    return;
+                };
+                ui.set_max_width(360.0);
+                ui.add(egui::Label::new(target.label()).wrap());
+                let value = target.value(source_epoch, object);
+                if value.is_none() {
+                    ui.label(language.text(
+                        "Property is unavailable at this frame.",
+                        "此帧中该属性不可用。",
+                    ));
+                }
+                if ui
+                    .add_enabled(
+                        value.is_some(),
+                        egui::Button::new(language.text("Copy", "复制")),
+                    )
+                    .clicked()
+                    && let Some(value) = value
+                {
+                    if let Err(error) = copy_property(ui.ctx(), value) {
+                        copy_error = Some(error);
+                    }
+                    ui.close();
+                }
+                if let Some(value) =
+                    value.filter(|value| !crate::curve::components(value).is_empty())
+                {
+                    if let Some(component) = plot_component_menu(ui, value, language) {
+                        context_plot = Some((target, component));
+                        ui.close();
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Button::new(language.text("Plot", "曲线")));
                 }
             });
         if let Some(id) = jump {
-            self.studio.selected = Some(id);
+            self.studio.select_object(Some(id), false);
         }
         if let Some(error) = copy_error.or(array_copy_error) {
             self.studio.notice(error);
         }
-        if let Some((property, component)) = plot {
+        if let Some((target, component)) = context_plot {
+            if let Some(object) = self
+                .studio
+                .selected
+                .and_then(|id| self.studio.state.objects.get(&id))
+                && target.value(self.studio.curves.epoch, object).is_some()
+            {
+                if let Some(index) = target.index {
+                    self.studio
+                        .plot_element(target.property, index, component, ui.ctx().clone());
+                } else {
+                    self.studio
+                        .plot(target.property, component, ui.ctx().clone());
+                }
+            }
+        } else if let Some((property, index, component)) = element_plot {
+            self.studio
+                .plot_element(property, index, component, ui.ctx().clone());
+        } else if let Some((property, component)) = plot {
             self.studio.plot(property, component, ui.ctx().clone());
         }
         if choose_repx_path {
@@ -1162,16 +1508,22 @@ impl Viewer<'_> {
         }
         if export_actor {
             self.studio
-                .export_repx(pvd_core::repx::Selection::Actor(id), ui.ctx().clone());
+                .export_repx(self.studio.repx_selection(), ui.ctx().clone());
         }
     }
     fn viewport(&mut self, ui: &mut egui::Ui) {
         let language = self.studio.prefs.language;
         playback_status::show(ui, self.studio);
         ui.add_space(4.0);
+        let up = self.studio.up_resolution();
+        let up_description = up.description(language);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(language.text("Perspective", "透视")).small().color(MUTED))
-                .on_hover_text(format!("{} {} · {}", self.studio.prefs.up_axis.label(), language.text("up", "向上"), self.studio.prefs.handedness.label(language)));
+                .on_hover_text(format!("{} · {}", up_description, self.studio.prefs.handedness.label(language)));
+            if up.is_fallback() {
+                ui.colored_label(egui::Color32::YELLOW, language.text("Up direction unknown", "上方向未知"))
+                    .on_hover_text(&up_description);
+            }
             if ui.small_button(language.text("Frame all", "查看全部")).clicked() {
                 self.studio.captured_camera = None;
                 self.viewport.captured_pose = None;
@@ -1290,7 +1642,9 @@ impl Viewer<'_> {
             if response.clicked()
                 && let Some(point) = response.interact_pointer_pos()
             {
-                self.studio.selected = self.viewport.select_at(point, rect);
+                let toggle = ui.input(|input| input.modifiers == egui::Modifiers::SHIFT);
+                self.studio
+                    .select_object(self.viewport.select_at(point, rect), toggle);
             }
             if response.double_clicked() {
                 self.studio.focus_selected = true;
@@ -1301,16 +1655,16 @@ impl Viewer<'_> {
         let language = self.studio.prefs.language;
         ui.add_space(6.0);
         let count = self.studio.count();
-        let first = self.studio.first_frame();
-        if count <= first || !self.studio.has_history() {
+        let (first, last) = self.studio.playback_ordinal_bounds().unwrap_or((0, 0));
+        if count == 0 || self.studio.playback_bounds().is_none() {
             ui.label(language.text("No frames", "暂无帧数据"));
         } else {
             let position = ui.label(localized_format!(
                 language,
                 "Frame {} / {}",
                 "帧 {} / {}",
-                self.studio.frame,
-                count - 1
+                self.studio.frame_ordinal(self.studio.frame),
+                last
             ));
             if let Some(info) = self
                 .studio
@@ -1325,23 +1679,27 @@ impl Viewer<'_> {
                     info.timestamp
                 ));
             }
-            let mut frame = self.studio.frame.clamp(first, count - 1);
+            let mut frame = self
+                .studio
+                .frame_ordinal(self.studio.frame)
+                .clamp(first, last);
             ui.spacing_mut().slider_width = (ui.available_width() - 12.0).max(50.0);
             if ui
                 .add(
-                    egui::Slider::new(&mut frame, first..=count - 1)
+                    egui::Slider::new(&mut frame, first..=last)
                         .show_value(false)
                         .trailing_fill(true),
                 )
                 .changed()
+                && let Some(target) = self.studio.frame_at_ordinal(frame)
             {
                 self.studio.request_ui_action(
                     ui.ctx(),
                     ui.id().with("timeline-frame"),
-                    UiAction::Locate(frame, crate::studio::DisplayReason::Timeline),
+                    UiAction::Locate(target, crate::studio::DisplayReason::Timeline),
                 );
             }
-            if self.studio.frame < first {
+            if self.studio.frame < self.studio.first_frame() {
                 ui.label(language.text(
                     "Displayed frame has expired from history",
                     "当前帧已从历史中淘汰",
@@ -1405,24 +1763,26 @@ impl Viewer<'_> {
             return;
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label(language.text("Clip scene frames", "裁剪场景帧"));
-            ui.add(
-                egui::DragValue::new(&mut self.studio.trim_first)
-                    .range(0..=count.saturating_sub(1)),
-            );
-            ui.label(language.text("through", "至"));
-            ui.add(
-                egui::DragValue::new(&mut self.studio.trim_last).range(0..=count.saturating_sub(1)),
-            );
-            if ui
-                .add_enabled(!self.studio.file_picker.is_busy(), egui::Button::new("…"))
-                .on_hover_text(language.text("Choose clip path", "选择片段路径"))
-                .clicked()
-            {
-                self.studio
-                    .pick_file(PickerKind::SaveClip, ui.ctx().clone());
-            }
-            if ui
+            if !self.studio.is_native_recording() {
+                ui.label(language.text("Clip scene frames", "裁剪场景帧"));
+                ui.add(
+                    egui::DragValue::new(&mut self.studio.trim_first)
+                        .range(0..=count.saturating_sub(1)),
+                );
+                ui.label(language.text("through", "至"));
+                ui.add(
+                    egui::DragValue::new(&mut self.studio.trim_last)
+                        .range(0..=count.saturating_sub(1)),
+                );
+                if ui
+                    .add_enabled(!self.studio.file_picker.is_busy(), egui::Button::new("…"))
+                    .on_hover_text(language.text("Choose clip path", "选择片段路径"))
+                    .clicked()
+                {
+                    self.studio
+                        .pick_file(PickerKind::SaveClip, ui.ctx().clone());
+                }
+                if ui
                 .add_enabled(
                     self.studio.can_trim_capture()
                         && self.studio.trim_first <= self.studio.trim_last,
@@ -1437,6 +1797,7 @@ impl Viewer<'_> {
                 .clicked()
             {
                 self.studio.trim_capture(ui.ctx().clone());
+            }
             }
             settings_menu(
                 ui,
@@ -1479,6 +1840,10 @@ impl Viewer<'_> {
     fn diagnostics_content(&mut self, ui: &mut egui::Ui) {
         let language = self.studio.prefs.language;
         ui.add_space(5.0);
+        self.diagnostic_errors(ui);
+        for message in &self.viewport.diagnostics {
+            ui.colored_label(egui::Color32::LIGHT_RED, message.text(language));
+        }
         receive_status(ui, self.studio);
         receive_buffer_status(ui, self.studio);
         if self.studio.live_connected {
@@ -1496,68 +1861,68 @@ impl Viewer<'_> {
                 live_profile_diagnostics(ui, self.studio, self.viewport.objects.len());
             },
         );
-        ui.separator();
         if let Some(recording) = &self.studio.recording {
-            let usage = recording.history_memory_usage();
-            let mib = 1024.0 * 1024.0;
-            ui.label(localized_format!(
-                language,
-                "Core memory budget estimate: {:.1} / {:.0} MiB · checkpoint/cache {:.1} MiB ({} checkpoints)",
-                "核心内存预算估算：{:.1} / {:.0} MiB · 检查点/缓存 {:.1} MiB（{} 个）",
-                (usage.estimated_history_bytes + usage.estimated_checkpoint_bytes) as f64 / mib,
-                usage.limit_bytes as f64 / mib,
-                usage.estimated_checkpoint_bytes as f64 / mib,
-                usage.checkpoint_count,
-            ))
-            .on_hover_text(language.text(
-                "This is a core memory estimate, separate from the rolling disk quota shown in Timeline. It is not process memory usage: analysis, UI snapshots and graphics resources also consume memory.",
-                "这是核心内存估算，与时间轴显示的滚动磁盘容量分开计算。它不等于进程内存占用；分析数据、界面快照和图形资源也会占用内存。",
-            ));
-            ui.label(localized_format!(
-                language,
-                "Retained state changes: {} · unchanged updates omitted: {}",
-                "保留状态变化：{} · 已省略无变化更新：{}",
-                usage.retained_actions,
-                usage.skipped_redundant_actions,
-            ));
-            ui.separator();
-        }
-        for message in &self.viewport.diagnostics {
-            ui.colored_label(egui::Color32::LIGHT_RED, message.text(language));
+            egui::CollapsingHeader::new(language.text("Memory usage", "内存用量"))
+                .id_salt("diagnostic-memory")
+                .show(ui, |ui| {
+                    let usage = recording.history_memory_usage();
+                    let mib = 1024.0 * 1024.0;
+                    ui.label(localized_format!(
+                        language,
+                        "Core memory budget estimate: {:.1} / {:.0} MiB · checkpoint/cache {:.1} MiB ({} checkpoints)",
+                        "核心内存预算估算：{:.1} / {:.0} MiB · 检查点/缓存 {:.1} MiB（{} 个）",
+                        (usage.estimated_history_bytes + usage.estimated_checkpoint_bytes) as f64 / mib,
+                        usage.limit_bytes as f64 / mib,
+                        usage.estimated_checkpoint_bytes as f64 / mib,
+                        usage.checkpoint_count,
+                    ))
+                    .on_hover_text(language.text(
+                        "This is a core memory estimate, separate from the rolling disk quota shown in Timeline. It is not process memory usage: analysis, UI snapshots and graphics resources also consume memory.",
+                        "这是核心内存估算，与时间轴显示的滚动磁盘容量分开计算。它不等于进程内存占用；分析数据、界面快照和图形资源也会占用内存。",
+                    ));
+                    ui.label(localized_format!(
+                        language,
+                        "Retained state changes: {} · unchanged updates omitted: {}",
+                        "保留状态变化：{} · 已省略无变化更新：{}",
+                        usage.retained_actions,
+                        usage.skipped_redundant_actions,
+                    ));
+                });
         }
         if let Some(recording) = &self.studio.recording
             && !recording.diagnostics.is_empty()
         {
-            ui.label(
-                egui::RichText::new(language.text("CAPTURE DIAGNOSTICS", "录制诊断与导入限制"))
-                    .small()
-                    .color(egui::Color32::from_rgb(230, 186, 107)),
-            );
-            egui::ScrollArea::vertical()
-                .max_height(100.0)
-                .id_salt("capture-diagnostics")
-                .show_rows(ui, 22.0, recording.diagnostics.len(), |ui, range| {
-                    for row in range {
-                        let detail = &recording.diagnostics[row];
-                        ui.add(egui::Label::new(detail).truncate())
-                            .on_hover_text(detail);
-                    }
+            egui::CollapsingHeader::new(language.text("Capture diagnostics", "录制诊断与导入限制"))
+                .id_salt("diagnostic-capture")
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(100.0)
+                        .id_salt("capture-diagnostics")
+                        .show_rows(ui, 22.0, recording.diagnostics.len(), |ui, range| {
+                            for row in range {
+                                let detail = &recording.diagnostics[row];
+                                ui.add(egui::Label::new(detail).truncate())
+                                    .on_hover_text(detail);
+                            }
+                        });
                 });
-            ui.separator();
         }
-        ui.label(
-            egui::RichText::new(language.text("APPLICATION DIAGNOSTICS", "应用诊断"))
-                .small()
-                .color(MUTED),
-        );
-        egui::ScrollArea::vertical()
-            .max_height(90.0)
-            .id_salt("notices")
-            .show_rows(ui, 22.0, self.studio.notices.len(), |ui, range| {
-                for row in range {
-                    ui.label(self.studio.notices[row].text(language));
-                }
+        egui::CollapsingHeader::new(language.text("Application diagnostics", "应用诊断"))
+            .id_salt("diagnostic-application")
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(90.0)
+                    .id_salt("notices")
+                    .show_rows(ui, 22.0, self.studio.notices.len(), |ui, range| {
+                        for row in range {
+                            ui.label(self.studio.notices[row].text(language));
+                        }
+                    });
             });
+    }
+
+    fn diagnostic_errors(&mut self, ui: &mut egui::Ui) {
+        let language = self.studio.prefs.language;
         let errors = self.studio.error_rows.clone();
         if !errors.is_empty() {
             ui.separator();
@@ -1578,6 +1943,13 @@ impl Viewer<'_> {
                             error.file,
                             error.line,
                             error.timestamp,
+                        );
+                        let summary = error_summary(
+                            error.code,
+                            &error.message,
+                            &error.file,
+                            error.line,
+                            language,
                         );
                         ui.horizontal(|ui| {
                             if let Some(frame) = frame {
@@ -1602,7 +1974,7 @@ impl Viewer<'_> {
                             }
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(&detail)
+                                    egui::RichText::new(summary)
                                         .color(egui::Color32::from_rgb(239, 148, 137)),
                                 )
                                 .truncate(),
@@ -1611,6 +1983,9 @@ impl Viewer<'_> {
                         });
                     }
                 });
+        }
+        if let Some(recording) = &self.studio.recording {
+            initial_errors(ui, recording.initial_untimed_errors(), language);
         }
         if let Some(recording) = self.studio.recording.clone()
             && !recording.untimed_error_events().is_empty()
@@ -1629,6 +2004,13 @@ impl Viewer<'_> {
                     for row in range {
                         let error = &errors[row];
                         let detail = untimed_error_detail(error, language);
+                        let summary = error_summary(
+                            error.code,
+                            &error.message,
+                            &error.file,
+                            error.line,
+                            language,
+                        );
                         ui.horizontal(|ui| {
                             if error.received_frame < recording.frame_count() {
                                 if ui
@@ -1659,7 +2041,7 @@ impl Viewer<'_> {
                             }
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(&detail)
+                                    egui::RichText::new(summary)
                                         .color(egui::Color32::from_rgb(239, 148, 137)),
                                 )
                                 .truncate(),
@@ -1728,28 +2110,23 @@ impl Viewer<'_> {
                 ui.label(language.text("Control speed", "操作速度"));
                 ui.add_enabled(manual, egui::DragValue::new(&mut self.studio.prefs.camera_speed).range(0.05..=20.0).speed(0.05).suffix("×"));
             });
-            if ui.button(language.text("Frame all", "查看全部")).clicked() { self.studio.captured_camera = None; self.viewport.captured_pose = None; self.viewport.focus(None); self.studio.follow_selected = false; }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(language.text("Reset camera", "重置相机"))
+                    .on_hover_text(language.text("Point at the scene center without changing camera distance.", "朝向场景中心，保持相机距离。"))
+                    .clicked()
+                {
+                    self.studio.captured_camera = None;
+                    self.studio.focus_selected = false;
+                    self.studio.follow_selected = false;
+                    self.viewport.captured_pose = None;
+                    crate::camera_controller::cancel_gesture(ui.ctx());
+                    self.viewport.reset_camera();
+                }
+                if ui.button(language.text("Frame all", "查看全部")).clicked() { self.studio.captured_camera = None; self.viewport.captured_pose = None; self.viewport.focus(None); self.studio.follow_selected = false; }
+            });
         });
         ui.collapsing(language.text("Source coordinates", "源坐标系"), |ui| {
-            egui::ComboBox::from_id_salt("source-up-axis")
-                .selected_text(format!("{} {}", self.studio.prefs.up_axis.label(), language.text("up", "向上")))
-                .show_ui(ui, |ui| {
-                    for axis in crate::coordinates::UpAxis::ALL {
-                        ui.selectable_value(&mut self.studio.prefs.up_axis, axis, axis.label());
-                    }
-                });
-            egui::ComboBox::from_id_salt("source-handedness")
-                .selected_text(self.studio.prefs.handedness.label(language))
-                .show_ui(ui, |ui| {
-                    for hand in [crate::coordinates::Handedness::Right, crate::coordinates::Handedness::Left] {
-                        ui.selectable_value(&mut self.studio.prefs.handedness, hand, hand.label(language));
-                    }
-                });
-            ui.horizontal(|ui| {
-                ui.label(language.text("Meters / unit", "米 / 单位"));
-                ui.add(egui::DragValue::new(&mut self.studio.prefs.meters_per_unit).range(1e-6..=1e6).speed(0.001));
-            });
-            ui.label(egui::RichText::new(language.text("Explicit display calibration. Properties, CSV and RepX keep recorded coordinates and units. No source unit or handedness is inferred.", "显式设置显示换算。属性、CSV 和 RepX 保留录制坐标及单位，不自动推断源单位或手性。")).small());
+            source_coordinates::show(ui, self.studio);
         });
         ui.label(
             egui::RichText::new(language.text("OVERLAYS", "叠加显示"))
@@ -1872,12 +2249,26 @@ impl Viewer<'_> {
             &mut self.studio.prefs.show_sleeping,
             language.text("Sleeping bodies", "休眠刚体"),
         );
+        if self.studio.prefs.show_sleeping { object_scope(ui, "sleeping-scope", &mut self.studio.prefs.sleeping_scope, language); }
+        ui.checkbox(&mut self.studio.prefs.show_triggers, language.text("Trigger shapes", "触发器"));
+        if self.studio.prefs.show_triggers { object_scope(ui, "trigger-scope", &mut self.studio.prefs.trigger_scope, language); }
         ui.label(language.text("Opacity", "不透明度"));
         object_scope(ui, "opacity-scope", &mut self.studio.prefs.opacity_scope, language);
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut self.studio.prefs.opacity).range(0.1..=1.0).speed(0.01));
             ui.spacing_mut().slider_width = ui.available_width().max(1.0);
             ui.add(egui::Slider::new(&mut self.studio.prefs.opacity, 0.1..=1.0).show_value(false));
+        });
+        ui.collapsing(language.text("Colors", "颜色"), |ui| {
+            let colors = &mut self.studio.prefs.display_colors;
+            display_color(ui, language.text("Static bodies", "静态刚体"), &mut colors.static_body);
+            display_color(ui, language.text("Awake bodies", "唤醒刚体"), &mut colors.dynamic_body);
+            display_color(ui, language.text("Sleeping bodies", "休眠刚体"), &mut colors.sleeping_body);
+            display_color(ui, language.text("Kinematic bodies", "运动学刚体"), &mut colors.kinematic_body);
+            display_color(ui, language.text("Cloth", "布料"), &mut colors.cloth);
+            if ui.button(language.text("Reset colors", "重置颜色")).clicked() {
+                *colors = crate::studio::DisplayColors::default();
+            }
         });
         ui.collapsing(language.text("Overlay sizes", "叠加显示尺寸"), |ui| {
             ui.horizontal(|ui| {
@@ -1912,6 +2303,232 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    fn initial_error() -> pvd_core::InitialUntimedError {
+        pvd_core::InitialUntimedError {
+            code: 4,
+            message: "captured before the first retained frame".repeat(12),
+            file: "source/example.cpp".into(),
+            line: 248,
+            index: 9,
+            container_instance: 29,
+            container_generation: 3,
+        }
+    }
+
+    #[test]
+    fn initial_error_rows_keep_duplicates_and_copy_full_details_without_frame_actions() {
+        for language in [Language::Chinese, Language::English] {
+            let context = egui::Context::default();
+            configure(&context);
+            let errors = [initial_error(), initial_error()];
+            let draw = |events| {
+                context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(360.0, 300.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |context| {
+                        egui::CentralPanel::default().show(context, |ui| {
+                            let right = ui.max_rect().right();
+                            initial_errors(ui, &errors, language);
+                            assert!(ui.min_rect().right() <= right + 0.1);
+                        });
+                    },
+                )
+            };
+            let _ = draw(vec![]);
+            let output = draw(vec![]);
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect();
+            let copy = language.text("Copy", "复制");
+            assert_eq!(
+                text.iter()
+                    .filter(|text| text.galley.text() == copy)
+                    .count(),
+                2
+            );
+            assert!(text.iter().any(|text| {
+                text.galley.text() == language.text("Errors present at start", "起点已有错误")
+            }));
+            assert!(text.iter().any(|text| {
+                text.galley
+                    .text()
+                    .starts_with(language.text("Code 4 · ", "错误码 4 · "))
+            }));
+            for absent in [
+                "View frame",
+                "查看帧",
+                "After final frame",
+                "末帧之后",
+                "Index 9",
+                "索引 9",
+                "Container",
+                "容器",
+                "Generation",
+                "代际",
+            ] {
+                assert!(!text.iter().any(|text| text.galley.text().contains(absent)));
+            }
+            let copy_text = text.iter().find(|text| text.galley.text() == copy).unwrap();
+            let position = copy_text
+                .galley
+                .rect
+                .translate(copy_text.pos.to_vec2())
+                .center();
+            let _ = draw(vec![egui::Event::PointerMoved(position)]);
+            let _ = draw(vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            let output = draw(vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            let copied = output
+                .platform_output
+                .commands
+                .iter()
+                .find_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) => Some(text),
+                    _ => None,
+                })
+                .expect("copy command");
+            assert!(copied.contains(&errors[0].message));
+            assert!(copied.contains("source/example.cpp:248"));
+            assert!(copied.contains(language.text("Index 9", "索引 9")));
+            assert!(copied.contains(language.text("Container 0x1D", "容器 0x1D")));
+            assert!(copied.contains(language.text("Generation 3", "代际 3")));
+            for absent in ["Received", "收到", "History event", "历史事件"] {
+                assert!(!copied.contains(absent));
+            }
+        }
+    }
+
+    #[test]
+    fn initial_error_list_draws_only_visible_rows() {
+        let context = egui::Context::default();
+        configure(&context);
+        let errors = vec![initial_error(); 1000];
+        for _ in 0..2 {
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(480.0, 320.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        initial_errors(ui, &errors, Language::English);
+                    });
+                },
+            );
+            let drawn_rows = output
+                .shapes
+                .iter()
+                .filter(|shape| {
+                    matches!(&shape.shape,
+                        egui::epaint::Shape::Text(text) if text.galley.text() == "Copy"
+                    )
+                })
+                .count();
+            assert!((1..=12).contains(&drawn_rows), "{drawn_rows}");
+        }
+    }
+
+    #[test]
+    fn diagnostics_prioritize_errors_in_short_panels() {
+        for language in [Language::Chinese, Language::English] {
+            let context = egui::Context::default();
+            configure(&context);
+            let mut studio = Studio::default();
+            studio.prefs.language = language;
+            let mut recording = playback_recording();
+            recording.diagnostics = vec!["long capture import restriction".repeat(30); 20];
+            studio.recording = Some(Arc::new(recording));
+            studio.error_rows = Arc::new(vec![(
+                Some(3),
+                pvd_core::ErrorEvent {
+                    code: 4,
+                    message: "invalid mass".into(),
+                    file: "source.cpp".into(),
+                    line: 248,
+                    timestamp: 100,
+                },
+            )]);
+            let mut viewport = Viewport::default();
+            let mut images = Assets::<Image>::default();
+            let mut output = None;
+            for _ in 0..2 {
+                output = Some(context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(840.0, 200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |context| {
+                        egui::CentralPanel::default().show(context, |ui| {
+                            Viewer {
+                                studio: &mut studio,
+                                viewport: &mut viewport,
+                                images: &mut images,
+                            }
+                            .diagnostics(ui);
+                        });
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let visible: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text)
+                        if shape
+                            .clip_rect
+                            .contains(text.galley.rect.translate(text.pos.to_vec2()).center()) =>
+                    {
+                        Some(text.galley.text())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(visible.iter().any(|text| text.contains("invalid mass")));
+            assert!(visible.iter().any(|text| {
+                *text
+                    == language.text(
+                        "SDK errors · click a frame to locate",
+                        "SDK 错误 · 点击帧号定位",
+                    )
+            }));
+            assert!(
+                !visible
+                    .iter()
+                    .any(|text| text.contains("long capture import restriction"))
+            );
+            assert!(!visible.iter().any(|text| {
+                text.contains(language.text("Core memory budget estimate", "核心内存预算估算"))
+            }));
+        }
+    }
 
     fn playback_recording() -> Recording {
         use pvd_protocol::{Endian, Event, EventGroup, Header};
@@ -2010,7 +2627,7 @@ mod tests {
                 let mut studio = Studio::default();
                 studio.prefs.language = language;
                 studio.recording = Some(Arc::new(playback_recording()));
-                studio.frame = 10;
+                studio.seek(10);
                 studio.live_session = Some(1);
                 studio.live_connected = true;
                 for (follow, playing, seeking, mode) in [

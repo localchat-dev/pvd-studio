@@ -9,6 +9,7 @@ use std::{fs, path::PathBuf};
 #[derive(Deserialize)]
 struct Truth {
     sdk: String,
+    bounds_source: String,
     warmup_frames: usize,
     frames: Vec<Frame>,
 }
@@ -23,8 +24,15 @@ struct Frame {
 struct World {
     scene: u64,
     poses: Vec<PoseEntry>,
+    bounds: Vec<BoundsEntry>,
+    targets: Vec<PoseEntry>,
     local_poses: Vec<PoseEntry>,
     particles: Vec<Particles>,
+}
+#[derive(Deserialize)]
+struct BoundsEntry {
+    id: u64,
+    bounds: [f32; 6],
 }
 #[derive(Deserialize)]
 struct PoseEntry {
@@ -39,6 +47,7 @@ struct Pose {
 #[derive(Deserialize)]
 struct Particles {
     id: u64,
+    projection_plane: [f32; 4],
     values: Vec<Particle>,
 }
 #[derive(Deserialize)]
@@ -60,8 +69,10 @@ fn check(state: &SceneState, frame: &Frame) {
     for world in &frame.worlds {
         assert_eq!(state.objects[&world.scene].type_name, "physx3::PxScene");
         assert_eq!(world.poses.len(), 6);
+        assert_eq!(world.targets.len(), 1);
         for (property, poses) in [
             ("GlobalPose", &world.poses),
+            ("KinematicTarget", &world.targets),
             ("LocalPose", &world.local_poses),
         ] {
             for entry in poses {
@@ -82,8 +93,40 @@ fn check(state: &SceneState, frame: &Frame) {
                 floats(&rotation, &entry.pose.rotation);
             }
         }
+        assert_eq!(world.bounds.len(), 8);
+        for entry in &world.bounds {
+            let Value::Array(values) = &state.objects[&entry.id].properties["WorldBounds"] else {
+                panic!("bounds");
+            };
+            assert_eq!(values.len(), 6);
+            for (actual, expected) in values.iter().zip(entry.bounds) {
+                let Value::F32(actual) = actual else {
+                    panic!("bounds scalar");
+                };
+                // SDK getter 重算中心与半尺寸，捕获值则保留连续 f32 平移的舍入结果。
+                assert!(
+                    actual.is_finite() && (actual - expected).abs() <= 0.002,
+                    "frame {} object {} WorldBounds: {actual} != {expected}",
+                    frame.frame,
+                    entry.id,
+                );
+            }
+        }
         for particles in &world.particles {
             let object = &state.objects[&particles.id];
+            let Value::Array(plane) = &object.properties["ProjectionPlane"] else {
+                panic!("projection plane");
+            };
+            let plane = plane
+                .iter()
+                .map(|value| {
+                    let Value::F32(value) = value else {
+                        panic!("plane scalar");
+                    };
+                    *value
+                })
+                .collect::<Vec<_>>();
+            floats(&plane, &particles.projection_plane);
             let Value::Array(indices) = &object.properties["ValidParticleBitmap"] else {
                 panic!("bitmap")
             };
@@ -144,6 +187,7 @@ fn sdk_origin_shifts_match_both_scenes_and_exact_forward_reverse_disk_replay() {
         floats(value, &frame.shift);
     }
     assert_eq!(truth.sdk, "3.4.2");
+    assert_eq!(truth.bounds_source, "explicit-sdk-getters");
     assert_eq!(truth.warmup_frames, 2);
     assert_eq!(truth.frames.len(), 144);
     let recording = Recording::from_path(&path).unwrap();
@@ -247,6 +291,6 @@ fn sdk_origin_shifts_match_both_scenes_and_exact_forward_reverse_disk_replay() {
     drop(reopened);
     fs::remove_file(saved).unwrap();
     println!(
-        "5 SDK origin shifts, 144 exact getter snapshots, two Scenes, 12 poses and 4 particle systems per snapshot, 288 forward/reverse steps plus random disk replay, source cleanup and retained capture reopen verified"
+        "5 SDK origin shifts, 144 getter snapshots, two Scenes, 14 poses and 4 particle projection planes per snapshot, 16 explicitly submitted bounds checked within 0.002, exact forward/reverse/random disk replay, source cleanup and retained capture reopen verified"
     );
 }

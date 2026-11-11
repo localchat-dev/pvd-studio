@@ -1,0 +1,202 @@
+{
+  "repository": "https://github.com/NVIDIAGameWorks/PhysX-3.4",
+  "commit": "5e42a5f112351a223c19c17bb331e6c55037b8eb",
+  "configuration": "vc15win64-PhysX_3.4 checked",
+  "files": [
+    {
+      "path": "bin/vc15win64-PhysX_3.4/APEX_ClothingCHECKED_x64.dll",
+      "sha256": "afc57a6a5676deea13c65932f102f73169b12426557b105fdb8ac07421c294f4",
+      "normalize_line_endings": false
+    },
+    {
+      "path": "bin/vc15win64-PhysX_3.4/APEX_LegacyCHECKED_x64.dll",
+      "sha256": "a88f346c90f08f7c49f6948bbc725b1b64a05c318b42d7d6d0fd6d1161b7314e",
+      "normalize_line_endings": false
+    },
+    {
+      "path": "bin/vc15win64-PhysX_3.4/ApexFrameworkCHECKED_x64.dll",
+      "sha256": "02e67cffa587a086a2c95495e2ec7dc6b760555400276243556447bdeaaa4427",
+      "normalize_line_endings": false
+    },
+    {
+      "path": "include/Actor.h",
+      "sha256": "5db2bd85cab1af598b1d9ca06bfc6fe00e1d426bdd567e9394780a70c60fada8",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/ApexDefs.h",
+      "sha256": "4d30e0d6cb909c351c083a09d05b5ee6c8e60bdf2a84b540db0a1e0de9216bdb",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/ApexDesc.h",
+      "sha256": "efeb9ee7965f0f0066e07e3b5eefd25d46669db9280dce55b8513702297f0725",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/ApexInterface.h",
+      "sha256": "8210e5efe55e5f564fc92970e39bc225bf3b04c0e87b5945c88d86bcd0d7ac23",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/ApexSDK.h",
+      "sha256": "b06151dd6bb0aa1c2ba3dbc052663703905ada51e813388398cc72ba9f82fec6",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/ApexUsingNamespace.h",
+      "sha256": "bd7eb1b0939c9475237517cc70c6514b615fb94aa070152b63db369259af4ab8",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/Asset.h",
+      "sha256": "1be1adf554b73a11aaa8c25ba2d0f02ba62c0eb23c98bee300dcae7a08ead386",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/AssetPreviewScene.h",
+      "sha256": "afe1fb1bcb9d1d45888370091949d8bfb98e78e06b0201425c870fa509fdc443",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/Context.h",
+      "sha256": "387fecfd193d1714f9eec6130ef9968d45f53157446de0f9c749de1c8c4a820b",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/MirrorScene.h",
+      "sha256": "ef95c50b0450832eeec887da8e469811a400eeda23b672054805ade24a2e23b0",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/Module.h",
+      "sha256": "a02f8b4e4a05c7b4e079cacd3af88bc99893cdea8ea44c60613e8b7d74a214bc",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/PhysX3/PhysXSDKVersion.h",
+      "sha256": "1d31c16ff748392e8f39fe080991e85558c916dd3bf8bed719b58a5e4615b7fe",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/RWLockable.h",
+      "sha256": "e4f728310167573363623e61640d3a4b2f3f8d6f32a57cf0c95549d6590ce60e",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/RenderDataProvider.h",
+      "sha256": "0a64f8b523b3def996c4cea5bf195bdb7954b7032723f08b2caa6015b70c256e",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/RenderDebugInterface.h",
+      "sha256": "5df6701a2666a21ab546d675f8a9a8a78dc97f489c75abe53700918e3cfe4a77",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/Renderable.h",
+      "sha256": "3238d9537d3bfb79e9b9beecb162a61ebdcaf001da82ccfde5c5e2c661cad9ab",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/ResourceCallback.h",
+      "sha256": "7194bba7a4ed51ece1066ba8488fdb9f8e7ee4c1106124edd3e0df287141d00f",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/Scene.h",
+      "sha256": "60a71adb614b758647924a3893c093944fde148e65a873e1c21259bb7cf3594f",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/Shape.h",
+      "sha256": "e187d52afbdf0de2f62da88eba909573f4039bdc61db88a9878985cc27480cc5",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/UserRenderResourceManager.h",
+      "sha256": "d936a7ad2f0fcb5c94583d6dcc22518087df23ec15ee310d93bd00814c45cb6b",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/clothing/ClothingActor.h",
+      "sha256": "d1c41c276936e9595dace2fbdf546a3125637bd9549af5197bbe0de8a30261dc",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/clothing/ClothingAsset.h",
+      "sha256": "5f25470c2a00146ff0ea8be050428b683c0a2703ecfc5e379ed47a7fb050796b",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/clothing/ModuleClothing.h",
+      "sha256": "93f2a310771d501f2577c686ca5f0d318e5dd3fabb852a718793715f69bc4ca7",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/nvparameterized/NvParamUtils.h",
+      "sha256": "23b6545f7bec155348697e0de069f7bbf8f00d51aef3a2f41c359f7c59e1dfe8",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/nvparameterized/NvParamUtils.inl",
+      "sha256": "a181d362d333b203f873dc293c1847080ec8de048606315e66298cbfdff056cd",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/nvparameterized/NvParameterized.h",
+      "sha256": "8f582fd6b0affca2027722222b80ee2c073978c663606b5edd87402e8390fde3",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/nvparameterized/NvParameterized.inl",
+      "sha256": "bd723df8b5f437916764d0a2ae62660e087ae7f1e65e6fcb4e4483f018816c54",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/nvparameterized/NvParameterizedMacroses.h",
+      "sha256": "931d2ce457b923eb32db6130b4b105e72eedd0a2c7797463b4b761cdf2c11fd5",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/nvparameterized/NvParameterizedTraits.h",
+      "sha256": "7891d3b23cefa25539becc4cfc20595598edfa60238f3fd5d3f955709c808035",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/nvparameterized/NvParameterized_types.h",
+      "sha256": "46095593e7fe09be265792408dc98e1042a66047f00de845d39f1c7ea10b3e98",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/nvparameterized/NvSerializer.h",
+      "sha256": "e9550f63aa770f3047ad99ad2ba6a7434ff206296a9cff520a3fae1faefcd950",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "include/nvparameterized/NvSerializer.inl",
+      "sha256": "26b36417e9e3abf22663f0fdebdfe41267c593ce2d3d2514cea069537c267fac",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "lib/vc15win64-PhysX_3.4/ApexFrameworkCHECKED_x64.lib",
+      "sha256": "d044b2d4980613b7c40a5604f74fa1d24b9794dc2102eef16a11aac56ef6e9b9",
+      "normalize_line_endings": false
+    },
+    {
+      "path": "samples_v2/SampleClothingBase/plane32.apx",
+      "sha256": "bb144bb40a7f8cfcae8e5f0fceef1dffb8ade4051bfbfa68b07129a13c9a2ef5",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "shared/general/RenderDebug/public/RenderDebug.h",
+      "sha256": "ac352b6a7e4067c646890082e1bd42c36d93dcf66a93befb5e8f23ab5180f6c0",
+      "normalize_line_endings": true
+    },
+    {
+      "path": "shared/general/RenderDebug/public/RenderDebugTyped.h",
+      "sha256": "aaec4a7399aac92864b5b9202b664ffb3a82f42a3b2e6a411d6302b8bd5c9a97",
+      "normalize_line_endings": true
+    }
+  ]
+}

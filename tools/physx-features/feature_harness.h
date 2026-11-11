@@ -7,6 +7,11 @@
 
 using namespace physx;
 
+inline std::string feature_sdk_version() {
+    return std::to_string(PX_PHYSICS_VERSION_MAJOR) + "." +
+        std::to_string(PX_PHYSICS_VERSION_MINOR) + "." + std::to_string(PX_PHYSICS_VERSION_BUGFIX);
+}
+
 template <typename T> T* feature_require(T* pointer, const char* name) {
     if (!pointer) throw std::runtime_error(std::string("Cannot create ") + name);
     return pointer;

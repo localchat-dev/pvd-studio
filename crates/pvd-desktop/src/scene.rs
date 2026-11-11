@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     hash::{Hash, Hasher},
 };
 
@@ -22,6 +22,8 @@ use pvd_core::{
 use crate::coordinates::Coordinates;
 use crate::{i18n::Message, studio::Studio};
 
+mod captured_display;
+mod debug_bounds;
 mod display_validation;
 mod incremental;
 #[cfg(test)]
@@ -47,8 +49,7 @@ pub struct CapturedObject;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct MaterialKey {
-    tint: u8,
-    opacity: u32,
+    rgba: [u32; 4],
 }
 
 struct RenderedObject {
@@ -57,12 +58,7 @@ struct RenderedObject {
     material: Handle<StandardMaterial>,
     transform: Transform,
     visible: bool,
-}
-
-struct DebugSurface {
-    entity: Entity,
-    mesh: Handle<Mesh>,
-    material: Handle<StandardMaterial>,
+    display: captured_display::Style,
 }
 
 struct SharedGeometry {
@@ -108,19 +104,22 @@ pub struct Viewport {
     pub point_radius: f32,
     show_particles: bool,
     show_cloth: bool,
+    point_display: HashMap<u64, captured_display::Style>,
     query_lines: Vec<QueryLine>,
     limit_lines: Vec<pvd_core::joint_geometry::Line>,
+    debug_bounds: debug_bounds::DebugBounds,
     meshes: HashMap<u64, Handle<Mesh>>,
     mesh_cache: pvd_core::MeshCache,
     shared_geometry: HashMap<(usize, usize), SharedGeometry>,
     rendered: HashMap<(u64, u64), RenderedObject>,
     materials: HashMap<MaterialKey, Handle<StandardMaterial>>,
-    debug_surface: Option<DebugSurface>,
     wires: HashMap<u64, Vec<[Vec3; 2]>>,
     wire_keys: HashMap<u64, u64>,
     revision: u64,
     selected: Option<u64>,
-    settings: [u32; 12],
+    selection_revision: u64,
+    settings: [u32; 16],
+    palette: crate::studio::DisplayColors,
     incremental: incremental::SceneIndex,
     source_index: source_index::SourceIndex,
 }
@@ -147,19 +146,22 @@ impl Default for Viewport {
             point_radius: 0.025,
             show_particles: true,
             show_cloth: true,
+            point_display: HashMap::new(),
             query_lines: Vec::new(),
             limit_lines: Vec::new(),
+            debug_bounds: debug_bounds::DebugBounds::default(),
             meshes: HashMap::new(),
             mesh_cache: pvd_core::MeshCache::default(),
             shared_geometry: HashMap::new(),
             rendered: HashMap::new(),
             materials: HashMap::new(),
-            debug_surface: None,
             wires: HashMap::new(),
             wire_keys: HashMap::new(),
             revision: u64::MAX,
             selected: None,
-            settings: [u32::MAX; 12],
+            selection_revision: 0,
+            settings: [u32::MAX; 16],
+            palette: crate::studio::DisplayColors::default(),
             incremental: incremental::SceneIndex::default(),
             source_index: source_index::SourceIndex::default(),
         }
@@ -206,6 +208,28 @@ impl Viewport {
             .map_or(self.distance, |pose| pose.position.distance(pose.target))
     }
     pub fn focus(&mut self, selected: Option<u64>) {
+        self.focus_selection(&selected.into_iter().collect());
+    }
+    fn focus_selection(&mut self, selected: &BTreeSet<u64>) {
+        if let Some((min, max)) = self.selection_bounds(selected) {
+            self.target = (min + max) * 0.5;
+            let extent = (max - min).length();
+            if extent > 0.0 {
+                self.distance = (extent * 1.4)
+                    .clamp(0.01 * self.coordinates.scale, 1e12 * self.coordinates.scale);
+            }
+        }
+    }
+    pub fn reset_camera(&mut self) {
+        if let Some((min, max)) = self.focus_bounds(None) {
+            self.target = (min + max) * 0.5;
+        }
+    }
+    fn focus_bounds(&self, selected: Option<u64>) -> Option<(Vec3, Vec3)> {
+        self.selection_bounds(&selected.into_iter().collect())
+    }
+    fn selection_bounds(&self, selected: &BTreeSet<u64>) -> Option<(Vec3, Vec3)> {
+        let all = selected.is_empty();
         let mut min = Vec3::splat(f32::INFINITY);
         let mut max = Vec3::splat(f32::NEG_INFINITY);
         let mut include = |position: Vec3, radius: f32| {
@@ -219,8 +243,8 @@ impl Viewport {
         for object in self
             .objects
             .iter()
-            .filter(|o| selected.is_none_or(|id| o.id == id || o.shape_id == id))
-            .filter(|o| selected.is_some() || !matches!(o.geometry, Geometry::Plane))
+            .filter(|o| all || selected.contains(&o.id) || selected.contains(&o.shape_id))
+            .filter(|o| !all || !matches!(o.geometry, Geometry::Plane))
         {
             include(
                 Vec3::from(object.position),
@@ -233,13 +257,13 @@ impl Viewport {
             } else {
                 self.show_particles
             };
-            if visible && selected.is_none_or(|id| id == cloud.id) {
+            if visible && (all || selected.contains(&cloud.id)) {
                 for point in &cloud.points {
                     include(*point, self.point_radius);
                 }
             }
         }
-        if selected.is_none() {
+        if all {
             for sweep in &self.queries.sweeps {
                 let start = Vec3::from(sweep.geometry.position);
                 let radius = geometry_radius(&sweep.geometry.geometry);
@@ -253,11 +277,18 @@ impl Viewport {
                 );
             }
         }
-        if min.is_finite() && max.is_finite() {
-            self.target = (min + max) * 0.5;
-            self.distance = ((max - min).length() * 1.4)
-                .clamp(0.01 * self.coordinates.scale, 1e12 * self.coordinates.scale);
+        if all {
+            for corner in self.debug_bounds.corners(None) {
+                include(corner, 0.0);
+            }
+        } else {
+            for id in selected {
+                for corner in self.debug_bounds.corners(Some(*id)) {
+                    include(corner, 0.0);
+                }
+            }
         }
+        (min.is_finite() && max.is_finite()).then_some((min, max))
     }
     pub fn select_at(&self, point: egui::Pos2, rect: egui::Rect) -> Option<u64> {
         let x = ((point.x - rect.left()) / rect.width()) * 2.0 - 1.0;
@@ -274,6 +305,11 @@ impl Viewport {
         let shape = self
             .objects
             .iter()
+            .filter(|object| {
+                self.rendered
+                    .get(&(object.id, object.shape_id))
+                    .is_none_or(|rendered| rendered.display.pickable)
+            })
             .filter_map(|object| {
                 let rotation = Quat::from_array(object.rotation).normalize();
                 let inverse = rotation.inverse();
@@ -295,6 +331,11 @@ impl Viewport {
             .point_clouds
             .clouds
             .iter()
+            .filter(|cloud| {
+                self.point_display
+                    .get(&cloud.id)
+                    .is_none_or(|display| display.pickable)
+            })
             .filter(|cloud| {
                 if cloud.kind == crate::point_clouds::Kind::Cloth {
                     self.show_cloth
@@ -405,10 +446,85 @@ fn render_check_clip_range(first_frame: usize, frame_count: usize) -> Option<(us
     (first_frame <= last).then_some(((frame_count / 4).max(first_frame), last))
 }
 
+struct ArrayCurveSelection {
+    object: u64,
+    property: String,
+    elements: Vec<(usize, usize)>,
+}
+
+fn render_check_array_selection(state: &pvd_core::SceneState) -> Option<ArrayCurveSelection> {
+    state.objects.values().find_map(|object| {
+        object.properties.iter().find_map(|(property, value)| {
+            let pvd_core::Value::Array(values) = value else {
+                return None;
+            };
+            let elements: Vec<_> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    let count = crate::curve::components(value).len().min(3);
+                    (count != 0).then_some((index, count))
+                })
+                .take(2)
+                .collect();
+            (!elements.is_empty()).then(|| ArrayCurveSelection {
+                object: object.id,
+                property: property.clone(),
+                elements,
+            })
+        })
+    })
+}
+
+fn prepare_multi_selection(studio: &mut Studio) -> Result<(), &'static str> {
+    let scene = studio.state.render_scene();
+    let mut selected = Vec::new();
+    for name in ["PvdStudioBox", "PvdStudioSphere"] {
+        let matches: Vec<_> = studio
+            .state
+            .objects
+            .values()
+            .filter(|object| {
+                matches!(object.properties.get("Name"), Some(pvd_core::Value::String(value)) if value == name)
+            })
+            .collect();
+        let [object] = matches.as_slice() else {
+            return Err(
+                "multi-selection requires the rich SDK Box and Sphere at the requested frame",
+            );
+        };
+        let Some(rendered) = scene
+            .objects
+            .iter()
+            .find(|rendered| rendered.id == object.id)
+        else {
+            return Err("selected SDK Actor has no visible geometry");
+        };
+        selected.push((object.id, Vec3::from(rendered.position)));
+    }
+    if !selected.iter().all(|(_, position)| position.is_finite())
+        || selected[0].1.distance_squared(selected[1].1) < 1.0
+    {
+        return Err("selected SDK Actors must be separated");
+    }
+    studio.select_object(Some(selected[0].0), false);
+    studio.select_object(Some(selected[1].0), true);
+    studio.prefs.show_bounds = true;
+    studio.prefs.bounds_scope = crate::studio::ObjectScope::Selected;
+    studio.prefs.opacity = 0.5;
+    studio.prefs.opacity_scope = crate::studio::ObjectScope::Selected;
+    studio.prefs.show_viewport_help = true;
+    studio.filter = "PxRigidDynamic".into();
+    studio.focus_selected = true;
+    studio.follow_selected = false;
+    Ok(())
+}
+
 pub fn render_check(
     mut commands: Commands,
     mut check: ResMut<RenderCheck>,
     mut studio: ResMut<Studio>,
+    viewport: Res<Viewport>,
     mut contexts: bevy_egui::EguiContexts,
     mut exit: MessageWriter<bevy::app::AppExit>,
 ) {
@@ -458,22 +574,51 @@ pub fn render_check(
         check.prepared = true;
         // Scene entities and render pipelines need frames after the background load completes.
         check.frames = 0;
-        studio.selected = studio
+        let selected = studio
             .state
             .render_scene()
             .objects
             .iter()
             .find(|object| object.dynamic)
             .map(|object| object.id);
+        studio.select_object(selected, false);
+        if check.panel.as_deref() == Some("multi-selection")
+            && let Err(error) = prepare_multi_selection(&mut studio)
+        {
+            eprintln!("Multi-selection render preparation failed: {error}");
+            check.completion = Some(bevy::app::AppExit::error());
+            return;
+        }
         if matches!(
             check.panel.as_deref(),
             Some("coordinates-z-left" | "source-camera-z-left")
         ) {
             studio.prefs.up_axis = crate::coordinates::UpAxis::Z;
+            studio.prefs.up_mode = crate::coordinates::UpMode::Preset;
             studio.prefs.handedness = crate::coordinates::Handedness::Left;
             studio.prefs.meters_per_unit = 0.1;
             studio.prefs.show_bounds = true;
             studio.prefs.show_local_axes = true;
+        }
+        if matches!(
+            check.panel.as_deref(),
+            Some("coordinates-custom-left" | "source-camera-custom-left")
+        ) {
+            studio.prefs.up_mode = crate::coordinates::UpMode::Custom;
+            studio.prefs.custom_up = [1.0, 2.0, -3.0];
+            studio.prefs.handedness = crate::coordinates::Handedness::Left;
+            studio.prefs.meters_per_unit = 0.1;
+            studio.prefs.show_bounds = true;
+            studio.prefs.show_local_axes = true;
+        }
+        if check.panel.as_deref() == Some("coordinates-auto") {
+            studio.prefs.up_mode = crate::coordinates::UpMode::Auto;
+            let up = studio.up_resolution();
+            if up.is_fallback() {
+                eprintln!("{}", up.description(language));
+                check.completion = Some(bevy::app::AppExit::error());
+                return;
+            }
         }
         if matches!(
             check.panel.as_deref(),
@@ -489,13 +634,9 @@ pub fn render_check(
         }
         if matches!(
             check.panel.as_deref(),
-            Some("source-camera" | "source-camera-z-left")
+            Some("source-camera" | "source-camera-z-left" | "source-camera-custom-left")
         ) {
-            let coordinates = Coordinates::new(
-                studio.prefs.up_axis,
-                studio.prefs.handedness,
-                studio.prefs.meters_per_unit,
-            );
+            let coordinates = studio.display_coordinates();
             studio.captured_camera = studio
                 .state
                 .cameras
@@ -526,23 +667,37 @@ pub fn render_check(
         }
         if matches!(
             check.panel.as_deref(),
-            Some("overview" | "coordinates-z-left")
+            Some(
+                "overview" | "coordinates-z-left" | "coordinates-custom-left" | "coordinates-auto"
+            )
         ) {
-            studio.selected = None;
+            studio.select_object(None, false);
             studio.focus_selected = true;
         }
         let panel = match check.panel.as_deref() {
+            Some("timeline") => Some(crate::studio::Panel::Timeline),
             Some("performance" | "profile-events" | "profile-first-start" | "thread-window") => {
                 Some(crate::studio::Panel::Performance)
             }
-            Some("memory" | "memory-events" | "memory-end") => Some(crate::studio::Panel::Memory),
-            Some("curves" | "frame-curves" | "event-curves") => Some(crate::studio::Panel::Curves),
+            Some(
+                "memory"
+                | "memory-events"
+                | "memory-end"
+                | "memory-groups"
+                | "memory-totals"
+                | "memory-totals-initial"
+                | "memory-totals-end",
+            ) => Some(crate::studio::Panel::Memory),
+            Some("curves" | "array-curves" | "frame-curves" | "event-curves") => {
+                Some(crate::studio::Panel::Curves)
+            }
             Some("diagnostics") => Some(crate::studio::Panel::Diagnostics),
             Some(
                 "display"
                 | "camera-fly"
                 | "source-camera"
                 | "source-camera-z-left"
+                | "source-camera-custom-left"
                 | "help-hidden"
                 | "help-hidden-fly",
             ) => Some(crate::studio::Panel::Display),
@@ -559,14 +714,27 @@ pub fn render_check(
                 studio.clip_set.split(frame);
             }
             if check.panel.as_deref() == Some("memory-events") {
-                studio.memory_panel.events = true;
+                studio.memory_panel.show_events();
+            }
+            if check.panel.as_deref() == Some("memory-groups") {
+                studio.memory_panel.show_groups();
             }
             if check.panel.as_deref() == Some("memory-end") {
                 studio.memory_panel.at_end = true;
             }
-            if let Some(location) = studio.prefs.dock.find_tab(&panel) {
-                studio.prefs.dock.set_active_tab(location);
+            match check.panel.as_deref() {
+                Some("memory-totals") => studio
+                    .memory_panel
+                    .show_totals(crate::memory::TotalsPosition::Current),
+                Some("memory-totals-initial") => studio
+                    .memory_panel
+                    .show_totals(crate::memory::TotalsPosition::Initial),
+                Some("memory-totals-end") => studio
+                    .memory_panel
+                    .show_totals(crate::memory::TotalsPosition::End),
+                _ => (),
             }
+            studio.requested_panel = Some(panel);
             if check.panel.as_deref() == Some("event-curves") {
                 if let Some(recording) = studio.recording.clone() {
                     let catalogue = pvd_core::profile_curves::catalog(
@@ -604,6 +772,30 @@ pub fn render_check(
             } else if check.panel.as_deref() == Some("frame-curves") {
                 if let Ok(context) = contexts.ctx_mut() {
                     studio.plot_performance(context.clone());
+                }
+            } else if check.panel.as_deref() == Some("array-curves") {
+                let Some(selection) = render_check_array_selection(&studio.state) else {
+                    eprintln!(
+                        "Array-curve render check has no numeric array at the selected frame"
+                    );
+                    check.completion = Some(bevy::app::AppExit::error());
+                    return;
+                };
+                let Ok(context) = contexts.ctx_mut() else {
+                    eprintln!("Array-curve render check has no UI context");
+                    check.completion = Some(bevy::app::AppExit::error());
+                    return;
+                };
+                studio.select_object(Some(selection.object), false);
+                for (index, count) in selection.elements {
+                    for component in 0..count {
+                        studio.plot_element(
+                            selection.property.clone(),
+                            index,
+                            component,
+                            context.clone(),
+                        );
+                    }
                 }
             } else if panel == crate::studio::Panel::Curves {
                 let property = studio
@@ -674,14 +866,115 @@ pub fn render_check(
         if studio.seeking.is_some() {
             return;
         }
+        if check.panel.as_deref() == Some("multi-selection") {
+            let selected = studio.selected_ids();
+            let visible: BTreeSet<_> = viewport
+                .objects
+                .iter()
+                .filter(|object| selected.contains(&object.id))
+                .map(|object| object.id)
+                .collect();
+            let bounds = viewport.selection_bounds(&selected);
+            let centered = bounds.is_some_and(|(min, max)| {
+                viewport.view_target().distance((min + max) * 0.5) < 0.0001
+            });
+            if selected.len() != 2
+                || visible != selected
+                || !centered
+                || viewport.revision != studio.revision
+                || viewport.selection_revision != studio.selection_revision()
+                || studio.focus_selected
+            {
+                eprintln!(
+                    "Multi-selection render check requires two visible selected Actors and their combined focus"
+                );
+                check.completion = Some(bevy::app::AppExit::error());
+                return;
+            }
+            println!(
+                "Multi-selection render state: {}",
+                serde_json::json!({
+                    "frame": studio.frame,
+                    "selected": selected,
+                    "primary": studio.selected,
+                    "focus": viewport.view_target().to_array(),
+                    "bounds_scope": "selected",
+                    "opacity_scope": "selected",
+                    "opacity": studio.prefs.opacity,
+                })
+            );
+        }
+        if check.panel.as_deref() == Some("array-curves") {
+            if !studio.curves.pending.is_empty() {
+                return;
+            }
+            let curves = &studio.curves.curves;
+            if curves.is_empty()
+                || curves.len() > 6
+                || curves.iter().any(|curve| {
+                    curve.error.is_some()
+                        || curve.pending
+                        || curve.data.is_none()
+                        || !matches!(
+                            curve.spec.source,
+                            crate::curve::Source::PropertyElement { .. }
+                        )
+                })
+                || !curves.iter().any(|curve| {
+                    curve
+                        .data
+                        .as_ref()
+                        .is_some_and(|data| data.samples.iter().any(|(_, value)| value.is_some()))
+                })
+            {
+                eprintln!("Array-curve render check has no completed numeric samples");
+                check.completion = Some(bevy::app::AppExit::error());
+                return;
+            }
+            let samples: Vec<_> = curves
+                .iter()
+                .filter_map(|curve| {
+                    let data = curve.data.as_ref()?;
+                    Some(serde_json::json!({
+                        "label": curve.label.text(language),
+                        "samples": data.samples.len(),
+                        "gaps": data.samples.iter().filter(|(_, value)| value.is_none()).count(),
+                    }))
+                })
+                .collect();
+            println!(
+                "Array curve render samples loaded: {}",
+                serde_json::json!(samples)
+            );
+        }
         if matches!(
             check.panel.as_deref(),
-            Some("memory" | "memory-events" | "memory-end")
+            Some("memory-totals" | "memory-totals-initial" | "memory-totals-end")
+        ) && let Err(error) = crate::memory::prepare_totals_render(&mut studio)
+        {
+            eprintln!("Memory source totals render preparation failed: {error}");
+            check.completion = Some(bevy::app::AppExit::error());
+            return;
+        }
+        if matches!(
+            check.panel.as_deref(),
+            Some("memory" | "memory-events" | "memory-end" | "memory-groups")
         ) {
             if !studio.analysis_ready() {
                 eprintln!("Memory render check has no analysis for the displayed frame");
                 check.completion = Some(bevy::app::AppExit::error());
                 return;
+            }
+            if check.panel.as_deref() == Some("memory-groups") {
+                match crate::memory::prepare_groups_render(&mut studio) {
+                    Ok(true) => (),
+                    Ok(false) => return,
+                    Err(error) => {
+                        eprintln!("Memory grouping render preparation failed: {error}");
+                        check.completion = Some(bevy::app::AppExit::error());
+                        return;
+                    }
+                }
             }
             if let Some(recording) = &studio.recording {
                 println!(
@@ -759,11 +1052,12 @@ pub fn sync_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let coordinates = Coordinates::new(
-        studio.prefs.up_axis,
-        studio.prefs.handedness,
-        studio.prefs.meters_per_unit,
-    );
+    let mut palette = studio.prefs.display_colors;
+    palette.sanitize();
+    if studio.prefs.display_colors != palette {
+        studio.prefs.display_colors = palette;
+    }
+    let coordinates = studio.display_coordinates();
     let coordinates_changed = coordinates != viewport.coordinates;
     let settings = [
         studio.prefs.show_static as u32,
@@ -778,10 +1072,16 @@ pub fn sync_scene(
         studio.prefs.show_cloth_points as u32,
         studio.prefs.show_cloth_constraints as u32,
         studio.prefs.point_radius.to_bits(),
+        studio.prefs.sleeping_scope as u32,
+        studio.prefs.show_triggers as u32,
+        studio.prefs.trigger_scope as u32,
+        studio.prefs.joint_frame_scale.to_bits(),
     ];
     if viewport.revision == studio.revision
         && viewport.selected == studio.selected
+        && viewport.selection_revision == studio.selection_revision()
         && viewport.settings == settings
+        && viewport.palette == palette
         && !coordinates_changed
     {
         return;
@@ -811,7 +1111,9 @@ pub fn sync_scene(
     }
     let incremental = !coordinates_changed
         && viewport.settings == settings
-        && viewport.selected == studio.selected;
+        && viewport.palette == palette
+        && viewport.selected == studio.selected
+        && viewport.selection_revision == studio.selection_revision();
     let actors = if incremental {
         changed.and_then(|changed| viewport.incremental.affected(&studio.state, changed))
     } else {
@@ -848,6 +1150,17 @@ pub fn sync_scene(
     } else {
         crate::point_clouds::PointClouds::collect(&studio.state)
     };
+    viewport.point_display = viewport
+        .point_clouds
+        .clouds
+        .iter()
+        .map(|cloud| {
+            (
+                cloud.id,
+                captured_display::Style::instance(studio.state.objects.get(&cloud.id)),
+            )
+        })
+        .collect();
     viewport.point_radius = if studio.prefs.point_radius.is_finite() {
         studio.prefs.point_radius.clamp(0.0001, 1000.0)
     } else {
@@ -870,19 +1183,23 @@ pub fn sync_scene(
     let mut invalid_debug = 0usize;
     let mut limited_lines = false;
     viewport.limit_lines.clear();
+    viewport.debug_bounds.clear();
     let debug_count: usize = studio
         .state
         .debug_draw
         .values()
         .map(|batch| batch.len())
         .sum();
+    if !studio.prefs.show_debug_draw || debug_count == 0 {
+        viewport.debug_bounds = debug_bounds::DebugBounds::default();
+    }
     if debug_count > MAX_DEBUG_PRIMITIVES {
         viewport.diagnostics.push(Message::new(
             format!("Debug display is limited to the first {MAX_DEBUG_PRIMITIVES} of {debug_count} primitives in this frame; captured data is retained."),
             format!("本帧包含 {debug_count} 个调试图元，仅显示前 {MAX_DEBUG_PRIMITIVES} 个；捕获数据仍完整保留。"),
         ));
     }
-    for primitive in debug_primitives(&studio.state) {
+    for (owner, primitive) in debug_primitives_with_owner(&studio.state) {
         if is_joint_limit(primitive) {
             match pvd_core::joint_geometry::tessellate(primitive) {
                 Ok(lines)
@@ -892,6 +1209,11 @@ pub fn sync_scene(
                 {
                     let remaining = MAX_OVERLAY_LINES - viewport.limit_lines.len();
                     limited_lines |= lines.len() > remaining;
+                    if studio.prefs.show_debug_draw {
+                        viewport
+                            .debug_bounds
+                            .lines(owner, &lines[..lines.len().min(remaining)]);
+                    }
                     viewport
                         .limit_lines
                         .extend(lines.into_iter().take(remaining));
@@ -900,6 +1222,10 @@ pub fn sync_scene(
             }
         } else if !drawable_debug(primitive) {
             invalid_debug += 1;
+        } else if studio.prefs.show_debug_draw {
+            viewport
+                .debug_bounds
+                .primitive(owner, primitive, studio.prefs.joint_frame_scale);
         }
     }
     if limited_lines {
@@ -935,47 +1261,6 @@ pub fn sync_scene(
             format!("Query-shape display reached the {MAX_OVERLAY_LINES}-line budget; captured data is retained."),
             format!("查询形状显示达到 {MAX_OVERLAY_LINES} 条线的预算；捕获数据仍完整保留。"),
         ));
-    }
-    if studio.prefs.show_debug_draw
-        && !studio.prefs.wireframe
-        && let Some(mut mesh) = debug_triangles(&studio.state)
-    {
-        orient_winding(&mut mesh, coordinates.mirrored);
-        if let Some(surface) = &viewport.debug_surface {
-            if let Some(existing) = meshes.get_mut(&surface.mesh) {
-                *existing = mesh;
-            }
-            if coordinates_changed {
-                commands
-                    .entity(surface.entity)
-                    .insert(coordinates.transform(Transform::default()));
-            }
-        } else {
-            let mesh = meshes.add(mesh);
-            let material = materials.add(StandardMaterial {
-                unlit: true,
-                cull_mode: None,
-                alpha_mode: AlphaMode::Blend,
-                ..default()
-            });
-            let entity = commands
-                .spawn((
-                    Mesh3d(mesh.clone()),
-                    MeshMaterial3d(material.clone()),
-                    coordinates.transform(Transform::default()),
-                    CapturedObject,
-                ))
-                .id();
-            viewport.debug_surface = Some(DebugSurface {
-                entity,
-                mesh,
-                material,
-            });
-        }
-    } else if let Some(surface) = viewport.debug_surface.take() {
-        commands.entity(surface.entity).despawn();
-        meshes.remove(surface.mesh.id());
-        materials.remove(surface.material.id());
     }
     if let Some(actors) = actors {
         incremental::sync_actors(
@@ -1024,7 +1309,7 @@ pub fn sync_scene(
             invalid_shapes += usize::from(!valid);
             valid
         })
-        .filter(|object| incremental::actor_visible(&studio, object))
+        .filter(|object| incremental::object_visible(&studio, object))
         .collect();
     viewport.invalid_shapes = invalid_shapes;
     viewport
@@ -1085,7 +1370,9 @@ pub fn sync_scene(
     );
     viewport.revision = studio.revision;
     viewport.selected = studio.selected;
+    viewport.selection_revision = studio.selection_revision();
     viewport.settings = settings;
+    viewport.palette = palette;
 }
 
 fn sync_object(
@@ -1117,44 +1404,37 @@ fn sync_object(
         viewport.meshes.insert(key, handle.clone());
         handle
     };
-    let selected = studio
-        .selected
-        .is_some_and(|id| id == object.id || id == object.shape_id);
-    let tint = if selected {
-        0
-    } else if object.dynamic && is_kinematic(&studio.state, object.id) {
-        1
+    let selected = studio.is_selected(object.id) || studio.is_selected(object.shape_id);
+    let colors = &studio.prefs.display_colors;
+    let [r, g, b] = if selected {
+        [0.24, 0.82, 0.92]
     } else if object.sleeping {
-        2
+        colors.sleeping_body
+    } else if object.dynamic && is_kinematic(&studio.state, object.id) {
+        colors.kinematic_body
     } else if object.dynamic {
-        3
+        colors.dynamic_body
     } else {
-        4
+        colors.static_body
     };
-    let opacity = if studio.prefs.opacity_scope.includes(selected) {
-        studio.prefs.opacity.clamp(0.1, 1.0)
-    } else {
-        1.0
-    };
+    let display = captured_display::Style::shape(&studio.state, object);
+    let rgba = display.rgba(
+        [r, g, b, 1.0],
+        selected,
+        captured_display::opacity(studio, selected),
+    );
     let material_key = MaterialKey {
-        tint,
-        opacity: opacity.to_bits(),
+        rgba: rgba.map(f32::to_bits),
     };
     let material = viewport
         .materials
         .entry(material_key)
         .or_insert_with(|| {
-            let [r, g, b] = [
-                [0.24, 0.82, 0.92],
-                [0.68, 0.47, 0.81],
-                [0.36, 0.43, 0.52],
-                [0.56, 0.67, 0.79],
-                [0.28, 0.34, 0.42],
-            ][usize::from(tint)];
+            let [r, g, b, alpha] = rgba;
             materials.add(StandardMaterial {
-                base_color: Color::srgba(r, g, b, opacity),
+                base_color: Color::srgba(r, g, b, alpha),
                 perceptual_roughness: 0.8,
-                alpha_mode: if opacity < 1.0 {
+                alpha_mode: if alpha < 1.0 {
                     AlphaMode::Blend
                 } else {
                     AlphaMode::Opaque
@@ -1181,6 +1461,7 @@ fn sync_object(
         transform,
         visible,
     );
+    viewport.rendered.get_mut(&object_key)?.display = display;
     Some(incremental::AssetUse {
         mesh: key,
         material: material_key,
@@ -1237,6 +1518,7 @@ fn sync_rendered_object(
                 material,
                 transform,
                 visible,
+                display: captured_display::Style::default(),
             },
         );
     }
@@ -1375,7 +1657,7 @@ pub fn update_camera(
     }
     crate::captured_camera::sync(&studio, &mut viewport);
     if studio.focus_selected {
-        viewport.focus(studio.selected);
+        viewport.focus_selection(&studio.selected_ids());
         studio.focus_selected = false;
     }
     if studio.follow_selected
@@ -1454,17 +1736,30 @@ pub fn draw_grid(
         }) {
             continue;
         }
-        let color = if studio.selected == Some(cloud.id) {
+        let selected = studio.is_selected(cloud.id);
+        let color = if selected {
             Color::srgb(0.25, 0.85, 0.9)
         } else if cloud.inactive {
             Color::srgb(0.5, 0.55, 0.62)
         } else if cloud.kind == crate::point_clouds::Kind::Fluid {
             Color::srgb(0.35, 0.65, 1.0)
         } else if cloth {
-            Color::srgb(0.85, 0.74, 0.5)
+            let [r, g, b] = studio.prefs.display_colors.cloth;
+            Color::srgb(r, g, b)
         } else {
             Color::srgb(0.64, 0.86, 0.56)
         };
+        let rgba = viewport
+            .point_display
+            .get(&cloud.id)
+            .copied()
+            .unwrap_or_default()
+            .rgba(
+                color.to_srgba().to_f32_array(),
+                selected,
+                captured_display::opacity(&studio, selected),
+            );
+        let color = Color::srgba(rgba[0], rgba[1], rgba[2], rgba[3]);
         for point in &cloud.points {
             for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
                 gizmos.line(
@@ -1477,15 +1772,23 @@ pub fn draw_grid(
     }
     if studio.prefs.show_cloth_constraints {
         for (id, [a, b]) in &viewport.point_clouds.constraints {
-            gizmos.line(
-                *a,
-                *b,
-                if studio.selected == Some(*id) {
-                    Color::srgb(0.25, 0.85, 0.9)
-                } else {
-                    Color::srgb(0.61, 0.56, 0.44)
-                },
-            );
+            let selected = studio.is_selected(*id);
+            let fallback = if selected {
+                [0.25, 0.85, 0.9, 1.0]
+            } else {
+                [0.61, 0.56, 0.44, 1.0]
+            };
+            let rgba = viewport
+                .point_display
+                .get(id)
+                .copied()
+                .unwrap_or_default()
+                .rgba(
+                    fallback,
+                    selected,
+                    captured_display::opacity(&studio, selected),
+                );
+            gizmos.line(*a, *b, Color::srgba(rgba[0], rgba[1], rgba[2], rgba[3]));
         }
     }
     for ray in &viewport.queries.raycasts {
@@ -1564,28 +1867,37 @@ pub fn draw_grid(
                 Transform::from_translation(Vec3::from(object.position)).with_rotation(rotation);
             let mut min = Vec3::splat(f32::INFINITY);
             let mut max = Vec3::splat(f32::NEG_INFINITY);
+            let selected = studio.is_selected(object.id) || studio.is_selected(object.shape_id);
+            let fallback = if selected {
+                [0.25, 0.85, 0.9, 1.0]
+            } else {
+                [0.6, 0.68, 0.76, 1.0]
+            };
+            let rgba = viewport
+                .rendered
+                .get(&(object.id, object.shape_id))
+                .map_or_else(captured_display::Style::default, |rendered| {
+                    rendered.display
+                })
+                .rgba(
+                    fallback,
+                    selected,
+                    captured_display::opacity(&studio, selected),
+                );
+            let wire_color = Color::srgba(rgba[0], rgba[1], rgba[2], rgba[3]);
             for edge in edges {
                 let [a, b] = edge.map(|point| transform.transform_point(point));
                 if studio.prefs.wireframe {
-                    gizmos.line(
-                        a,
-                        b,
-                        if studio.selected == Some(object.id) {
-                            Color::srgb(0.25, 0.85, 0.9)
-                        } else {
-                            Color::srgb(0.6, 0.68, 0.76)
-                        },
-                    );
+                    gizmos.line(a, b, wire_color);
                 }
                 min = min.min(a).min(b);
                 max = max.max(a).max(b);
             }
             if studio.prefs.show_bounds
-                && studio.prefs.bounds_scope.includes(
-                    studio
-                        .selected
-                        .is_some_and(|id| id == object.id || id == object.shape_id),
-                )
+                && studio
+                    .prefs
+                    .bounds_scope
+                    .includes(studio.is_selected(object.id) || studio.is_selected(object.shape_id))
                 && !matches!(object.geometry, Geometry::Plane)
                 && min.is_finite()
                 && max.is_finite()
@@ -1620,13 +1932,12 @@ pub fn draw_grid(
         }
     }
     if studio.prefs.show_com || studio.prefs.show_velocity || studio.prefs.show_local_axes {
-        let selected_actor = studio.selected.map(|selected| {
-            viewport
-                .objects
-                .iter()
-                .find(|object| object.shape_id == selected)
-                .map_or(selected, |object| object.id)
-        });
+        let selected_actors: HashSet<_> = viewport
+            .objects
+            .iter()
+            .filter(|object| studio.is_selected(object.id) || studio.is_selected(object.shape_id))
+            .map(|object| object.id)
+            .collect();
         let ids: HashSet<_> = viewport.objects.iter().map(|o| o.id).collect();
         for id in ids {
             let Some(object) = studio.state.objects.get(&id) else {
@@ -1646,7 +1957,7 @@ pub fn draw_grid(
                 continue;
             }
             let rotation = rotation.normalize();
-            let selected = selected_actor == Some(id);
+            let selected = selected_actors.contains(&id);
             if studio.prefs.show_local_axes && studio.prefs.local_axes_scope.includes(selected) {
                 gizmos.axes(
                     Transform::from_translation(position).with_rotation(rotation),
@@ -1717,7 +2028,7 @@ pub fn draw_grid(
             gizmos.line(
                 Vec3::from(line.positions[0]),
                 Vec3::from(line.positions[1]),
-                argb(line.color),
+                debug_rgb(line.color),
             );
         }
         use pvd_core::debug_draw::Primitive;
@@ -1735,7 +2046,7 @@ pub fn draw_grid(
                         * marker_scale
                         / viewport.coordinates.scale;
                     for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
-                        gizmos.line(p - axis * r, p + axis * r, argb(*color));
+                        gizmos.line(p - axis * r, p + axis * r, debug_rgb(*color));
                     }
                 }
                 Primitive::Line {
@@ -1744,19 +2055,18 @@ pub fn draw_grid(
                     gizmos.line_gradient(
                         Vec3::from(positions[0]),
                         Vec3::from(positions[1]),
-                        argb(colors[0]),
-                        argb(colors[1]),
+                        debug_rgb(colors[0]),
+                        debug_rgb(colors[1]),
                     );
                 }
                 Primitive::Triangle {
                     positions, colors, ..
-                } if studio.prefs.wireframe => {
+                } => {
                     for (a, b) in [(0, 1), (1, 2), (2, 0)] {
-                        gizmos.line_gradient(
+                        gizmos.line(
                             Vec3::from(positions[a]),
                             Vec3::from(positions[b]),
-                            argb(colors[a]),
-                            argb(colors[b]),
+                            debug_rgb(colors[a]),
                         );
                     }
                 }
@@ -1891,38 +2201,6 @@ fn is_joint_limit(primitive: &pvd_core::debug_draw::Primitive) -> bool {
     )
 }
 
-fn debug_triangles(state: &pvd_core::SceneState) -> Option<Mesh> {
-    let mut positions = Vec::<[f32; 3]>::new();
-    let mut normals = Vec::<[f32; 3]>::new();
-    let mut colors = Vec::<[f32; 4]>::new();
-    for primitive in debug_primitives(state) {
-        if let pvd_core::debug_draw::Primitive::Triangle {
-            positions: triangle,
-            colors: tint,
-            ..
-        } = primitive
-            && triangle.iter().all(|p| valid_position(*p))
-        {
-            let [a, b, c] = triangle.map(Vec3::from);
-            let Some(normal) = (b - a).cross(c - a).try_normalize() else {
-                continue;
-            };
-            positions.extend(triangle);
-            normals.extend([normal.to_array(); 3]);
-            colors.extend(tint.map(|color| argb(color).to_linear().to_f32_array()));
-        }
-    }
-    (!positions.is_empty()).then(|| {
-        Mesh::new(
-            PrimitiveTopology::TriangleList,
-            RenderAssetUsages::default(),
-        )
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
-    })
-}
-
 fn query_lines(queries: &pvd_core::queries::QueryScene) -> (Vec<QueryLine>, bool) {
     let mut lines = Vec::new();
     let mut cache = HashMap::<u64, Vec<[Vec3; 2]>>::new();
@@ -2016,20 +2294,22 @@ fn query_lines(queries: &pvd_core::queries::QueryScene) -> (Vec<QueryLine>, bool
 pub(crate) fn debug_primitives(
     state: &pvd_core::SceneState,
 ) -> impl Iterator<Item = &pvd_core::debug_draw::Primitive> {
+    debug_primitives_with_owner(state).map(|(_, primitive)| primitive)
+}
+
+fn debug_primitives_with_owner(
+    state: &pvd_core::SceneState,
+) -> impl Iterator<Item = (u64, &pvd_core::debug_draw::Primitive)> {
     state
         .debug_draw
-        .values()
-        .flat_map(|batch| batch.iter())
+        .iter()
+        .flat_map(|(owner, batch)| batch.iter().map(move |primitive| (*owner, primitive)))
         .take(MAX_DEBUG_PRIMITIVES)
 }
 
-pub fn argb(color: u32) -> Color {
-    Color::srgba_u8(
-        (color >> 16) as u8,
-        (color >> 8) as u8,
-        color as u8,
-        (color >> 24) as u8,
-    )
+fn debug_rgb(color: u32) -> Color {
+    // Captured debug lines use an unblended RGB pass; alpha is retained in the capture.
+    Color::srgb_u8((color >> 16) as u8, (color >> 8) as u8, color as u8)
 }
 
 fn is_kinematic(state: &pvd_core::SceneState, id: u64) -> bool {
@@ -2367,61 +2647,37 @@ mod tests {
     }
 
     #[test]
-    fn debug_surfaces_reuse_assets_and_release_them_when_hidden() {
+    fn debug_geometry_does_not_allocate_surface_assets() {
         let mut app = App::new();
         app.insert_resource(Studio::default())
             .insert_resource(Viewport::default())
             .insert_resource(Assets::<Mesh>::default())
             .insert_resource(Assets::<StandardMaterial>::default())
             .add_systems(Update, sync_scene);
-        {
-            let mut studio = app.world_mut().resource_mut::<Studio>();
-            studio.prefs.show_debug_draw = true;
-            studio.prefs.wireframe = false;
-            studio.state.debug_draw.insert(
+        app.world_mut()
+            .resource_mut::<Studio>()
+            .state
+            .debug_draw
+            .insert(
                 1,
                 std::sync::Arc::new(vec![pvd_core::debug_draw::Primitive::Triangle {
                     instance: 1,
                     positions: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-                    colors: [0xffffffff; 3],
+                    colors: [27; 3],
                 }]),
             );
-        }
-        app.update();
-        let entity = app
-            .world()
-            .resource::<Viewport>()
-            .debug_surface
-            .as_ref()
-            .unwrap()
-            .entity;
-        for _ in 0..32 {
-            app.world_mut().resource_mut::<Studio>().revision += 1;
+        for index in 0..32 {
+            let mut studio = app.world_mut().resource_mut::<Studio>();
+            studio.revision += 1;
+            studio.prefs.show_debug_draw = index % 2 == 0;
             app.update();
-            assert_eq!(
+            assert!(app.world().resource::<Assets<Mesh>>().is_empty());
+            assert!(
                 app.world()
-                    .resource::<Viewport>()
-                    .debug_surface
-                    .as_ref()
-                    .unwrap()
-                    .entity,
-                entity
+                    .resource::<Assets<StandardMaterial>>()
+                    .is_empty()
             );
-            assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 1);
-            assert_eq!(app.world().resource::<Assets<StandardMaterial>>().len(), 1);
         }
-        app.world_mut()
-            .resource_mut::<Studio>()
-            .prefs
-            .show_debug_draw = false;
-        app.update();
-        assert!(app.world().get_entity(entity).is_err());
-        assert!(app.world().resource::<Assets<Mesh>>().is_empty());
-        assert!(
-            app.world()
-                .resource::<Assets<StandardMaterial>>()
-                .is_empty()
-        );
     }
 
     #[test]
@@ -2437,10 +2693,14 @@ mod tests {
             geometry: Geometry::Sphere { radius: 1.0 },
         };
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
-        for up in UpAxis::ALL {
+        for up in UpAxis::ALL
+            .into_iter()
+            .map(UpAxis::vector)
+            .chain([Vec3::new(1.0, 2.0, -3.0), Vec3::new(-3.0, 1.0, 2.0)])
+        {
             for hand in [Handedness::Right, Handedness::Left] {
                 for scale in [1e-6, 0.001, 1.0, 1000.0, 1e6] {
-                    let coordinates = Coordinates::new(up, hand, scale);
+                    let coordinates = Coordinates::from_up_vector(up, hand, scale).unwrap();
                     let viewport = Viewport {
                         coordinates,
                         objects: vec![object.clone()],
@@ -2483,6 +2743,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn reset_camera_centers_the_scene_without_changing_distance_or_orientation() {
+        use crate::coordinates::Handedness;
+
+        for hand in [Handedness::Right, Handedness::Left] {
+            for scale in [1e-6, 1.0, 1e6] {
+                let coordinates =
+                    Coordinates::from_up_vector(Vec3::new(1.0, 2.0, -3.0), hand, scale).unwrap();
+                let mut viewport = Viewport {
+                    coordinates,
+                    target: coordinates.point(Vec3::new(-20.0, 30.0, 40.0)),
+                    yaw: -0.3,
+                    pitch: 0.7,
+                    distance: 17.25 * scale,
+                    near: 0.01 * scale,
+                    far: 900.0 * scale,
+                    ..default()
+                };
+                for (index, position) in [[-8.0, 2.0, 4.0], [12.0, 6.0, -2.0]]
+                    .into_iter()
+                    .enumerate()
+                {
+                    viewport.objects.push(RenderObject {
+                        id: index as u64 + 1,
+                        shape_id: index as u64 + 10,
+                        dynamic: false,
+                        sleeping: false,
+                        position,
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                        geometry: Geometry::Sphere { radius: 2.0 },
+                    });
+                }
+                let offset = viewport.position() - viewport.target;
+                viewport.reset_camera();
+
+                assert!(
+                    viewport
+                        .target
+                        .abs_diff_eq(coordinates.point(Vec3::new(2.0, 4.0, 1.0)), 1e-5 * scale,)
+                );
+                assert_eq!(viewport.distance, 17.25 * scale);
+                assert_eq!((viewport.yaw, viewport.pitch), (-0.3, 0.7));
+                assert_eq!((viewport.near, viewport.far), (0.01 * scale, 900.0 * scale));
+                assert!((viewport.position() - viewport.target).abs_diff_eq(offset, 1e-5 * scale));
+            }
+        }
+    }
+
+    #[test]
+    fn reset_camera_requires_finite_visible_bounds_and_includes_cloth_points() {
+        use crate::point_clouds::{Cloud, Kind};
+
+        let mut viewport = Viewport {
+            target: Vec3::new(8.0, -4.0, 2.0),
+            distance: 9.0,
+            show_particles: false,
+            ..default()
+        };
+        let target = viewport.target;
+        viewport.reset_camera();
+        assert_eq!(viewport.target, target);
+        viewport.objects.push(RenderObject {
+            id: 1,
+            shape_id: 2,
+            dynamic: false,
+            sleeping: false,
+            position: [1000.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            geometry: Geometry::Plane,
+        });
+        viewport.point_clouds.clouds.push(Cloud {
+            id: 3,
+            kind: Kind::Particles,
+            points: vec![Vec3::splat(100.0)],
+            inactive: false,
+        });
+        viewport.reset_camera();
+        assert_eq!(viewport.target, target);
+        viewport.point_clouds.clouds.push(Cloud {
+            id: 4,
+            kind: Kind::Cloth,
+            points: vec![
+                Vec3::new(-4.0, 2.0, 5.0),
+                Vec3::new(6.0, 8.0, -3.0),
+                Vec3::splat(f32::NAN),
+            ],
+            inactive: false,
+        });
+        viewport.reset_camera();
+        assert!(viewport.target.abs_diff_eq(Vec3::new(1.0, 5.0, 1.0), 1e-6));
+        assert_eq!(viewport.distance, 9.0);
+        viewport.focus(None);
+        assert!(viewport.target.abs_diff_eq(Vec3::new(1.0, 5.0, 1.0), 1e-6));
+        assert!(viewport.distance > 9.0);
     }
 
     #[test]
@@ -2554,47 +2910,6 @@ mod tests {
         let (lines, limited) = query_lines(&queries);
         assert!(limited);
         assert_eq!(lines.len(), MAX_OVERLAY_LINES);
-    }
-
-    #[test]
-    fn filled_debug_mesh_preserves_vertex_colors_and_rejects_degenerate_triangles() {
-        use pvd_core::debug_draw::Primitive;
-        let mut state = pvd_core::SceneState::default();
-        let positions = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
-        state.debug_draw.insert(
-            1,
-            std::sync::Arc::new(vec![
-                Primitive::Triangle {
-                    instance: 1,
-                    positions,
-                    colors: [0xffff0000, 0xff00ff00, 0xff0000ff],
-                },
-                Primitive::Triangle {
-                    instance: 1,
-                    positions: [[0.0; 3]; 3],
-                    colors: [0; 3],
-                },
-                Primitive::Triangle {
-                    instance: 1,
-                    positions: [[f32::NAN; 3]; 3],
-                    colors: [0; 3],
-                },
-            ]),
-        );
-        let mesh = debug_triangles(&state).unwrap();
-        assert_eq!(mesh.count_vertices(), 3);
-        let Some(VertexAttributeValues::Float32x4(colors)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR)
-        else {
-            panic!("missing colors")
-        };
-        assert_eq!(
-            colors,
-            &[
-                [1.0, 0.0, 0.0, 1.0],
-                [0.0, 1.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0, 1.0]
-            ]
-        );
     }
 
     #[test]
@@ -2964,7 +3279,7 @@ mod tcp_render_diagnostic {
 
 #[cfg(test)]
 mod retained_render_tests {
-    use super::render_check_clip_range;
+    use super::{render_check_array_selection, render_check_clip_range};
 
     #[test]
     fn clip_render_ranges_stay_inside_the_public_frame_interval() {
@@ -2973,5 +3288,43 @@ mod retained_render_tests {
         assert_eq!(render_check_clip_range(0, 120), Some((30, 119)));
         assert_eq!(render_check_clip_range(0, 0), None);
         assert_eq!(render_check_clip_range(61, 61), None);
+    }
+
+    #[test]
+    fn array_curve_render_selection_takes_two_numeric_indices_and_three_components() {
+        use pvd_core::{Object, SceneState, Value};
+        let mut state = SceneState::default();
+        assert!(render_check_array_selection(&state).is_none());
+        state.objects.insert(
+            7,
+            Object {
+                id: 7,
+                generation: 0,
+                type_name: "CurveFixture".into(),
+                properties: [
+                    ("Scalar".into(), Value::F32(1.0)),
+                    (
+                        "Values".into(),
+                        Value::Array(
+                            vec![
+                                Value::Ref(1),
+                                Value::Vec3([1.0, 2.0, 3.0]),
+                                Value::Quat([4.0, 5.0, 6.0, 7.0]),
+                                Value::Transform {
+                                    position: [8.0, 9.0, 10.0],
+                                    rotation: [0.0, 0.0, 0.0, 1.0],
+                                },
+                            ]
+                            .into(),
+                        ),
+                    ),
+                ]
+                .into(),
+            },
+        );
+        let selection = render_check_array_selection(&state).unwrap();
+        assert_eq!(selection.object, 7);
+        assert_eq!(selection.property, "Values");
+        assert_eq!(selection.elements, vec![(1, 3), (2, 3)]);
     }
 }

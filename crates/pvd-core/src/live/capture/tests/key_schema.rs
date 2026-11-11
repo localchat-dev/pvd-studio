@@ -1,6 +1,6 @@
 use super::*;
 
-fn keyed_fixture(paged: bool) -> Fixture {
+pub(super) fn keyed_fixture(paged: bool) -> Fixture {
     Fixture::with_keys(
         paged,
         32 << 20,
@@ -36,7 +36,7 @@ fn frame_object(segment: &SegmentView, frame: usize) -> (HistoryReader, u64) {
 }
 
 fn assert_range(recording: &crate::Recording, fixture: &Fixture, range: CaptureRange) {
-    assert_eq!(recording.capture_format(), Some(Format::V2));
+    assert_eq!(recording.capture_format(), Some(Format::V3));
     assert_eq!(recording.first_frame(), range.first);
     assert_eq!(recording.frame_count(), range.last + 1);
     let mut cursor = ReplayCursor::default();
@@ -98,7 +98,7 @@ fn keyed_capture_reopens_and_recrops_with_independent_complete_scene_and_analysi
         }
         assert_eq!(schema_ids.len(), 2);
         let (bytes, report) = fixture.export(CaptureRange { first: 3, last: 6 });
-        assert_eq!(report.format, Format::V2);
+        assert_eq!(report.format, Format::V3);
         assert!(bytes.starts_with(MAGIC));
         let path = fixture.root.join("keyed.pvdcapture");
         std::fs::write(&path, &bytes).unwrap();
@@ -123,7 +123,7 @@ fn keyed_capture_reopens_and_recrops_with_independent_complete_scene_and_analysi
                 |_| true,
             )
             .unwrap();
-            assert_eq!(report.format, Format::V2);
+            assert_eq!(report.format, Format::V3);
             drop(recording);
             recording = crate::Recording::from_path(&output).unwrap();
             assert_range(&recording, &fixture, range);
@@ -228,7 +228,7 @@ fn keyed_capture_rejects_damage_version_mismatch_and_budget_and_cancellation() {
     let corrupt = fixture.root.join("corrupt.pvdcapture");
     std::fs::write(&corrupt, damaged).unwrap();
     assert!(crate::Recording::from_path(&corrupt).is_err());
-    assert!(Format::from_magic(b"PVDCAP03").is_err());
+    assert!(Format::from_magic(b"PVDCAP04").is_err());
     assert_eq!(Format::from_magic(b"notcapture").unwrap(), None);
     assert!(std::fs::read_dir(&fixture.root).unwrap().all(|entry| {
         !entry
@@ -248,7 +248,7 @@ const EMPTY_ANALYSIS: &[u8] = &[
 const EMPTY_CHECKPOINT: &[u8] = &[3, 0, 0, 0, 0, 0, 0];
 const FRAME_20: &[u8] = &[4, 20, 232, 7, 42, 0, 0, 0, 0, 0, 0, 0];
 
-fn small_v1_fixture() -> Vec<u8> {
+pub(super) fn small_v1_fixture() -> Vec<u8> {
     let mut output = Cursor::new(LEGACY_MAGIC.to_vec());
     output.set_position(8);
     let mut hash = blake3::Hasher::new();
@@ -322,7 +322,7 @@ fn small_v1_fixture() -> Vec<u8> {
 }
 
 #[test]
-fn fixed_v1_records_open_under_legacy_magic_and_export_as_explicit_v2() {
+fn fixed_v1_records_open_under_legacy_magic_and_export_as_explicit_v3() {
     let fixture = Fixture::new(false);
     let bytes = small_v1_fixture();
     let Record::Analysis(analysis) = decode_record(EMPTY_ANALYSIS, &mut || false).unwrap() else {
@@ -358,10 +358,10 @@ fn fixed_v1_records_open_under_legacy_magic_and_export_as_explicit_v2() {
         )
         .unwrap()
         .format,
-        Format::V2
+        Format::V3
     );
     let reopened = crate::Recording::from_path(&output).unwrap();
-    assert_eq!(reopened.capture_format(), Some(Format::V2));
+    assert_eq!(reopened.capture_format(), Some(Format::V3));
     assert_eq!(reopened.state_at(20).unwrap(), SceneState::default());
     assert_eq!(std::fs::read(path).unwrap(), bytes);
     drop(reopened);
@@ -416,7 +416,7 @@ fn actual_311_v1_fixtures_remain_readable_and_can_be_recropped() {
         .unwrap();
         drop(source);
         let cropped = crate::Recording::from_path(output).unwrap();
-        assert_eq!(cropped.capture_format(), Some(Format::V2));
+        assert_eq!(cropped.capture_format(), Some(Format::V3));
         for frame in (25..=55).rev().chain(25..=55) {
             assert_eq!(cropped.state_at(frame).unwrap(), states[frame - 25]);
             assert_eq!(

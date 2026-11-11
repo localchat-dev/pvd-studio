@@ -198,6 +198,8 @@ impl Case {
         studio.connect_live_session(73);
         let last = disk.frame_count() - 1;
         studio.accept_live_snapshot(LiveSnapshot {
+            source_frame: None,
+            display_updated: true,
             session: 73,
             frame: last,
             update: pvd_core::live::SceneUpdate::full(&expected.state_at(last).unwrap()),

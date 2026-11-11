@@ -15,4 +15,6 @@ SDK 在动态位姿更新前发送 EndSection。独立 JSON 记录每个边界�
 
 两个 simulate 区间有时间重叠，不证明 CPU 核心同时执行，也不构成性能结果。生成和显式 ignored 测试的命令见生产器说明；使用其他输入时可设置 `PVD_MULTISCENE_CAPTURE`。
 
-原版多 Scene 容器、跨 Scene debug draw、Scene 销毁/复用、Actor 转移、跨机器时钟和独立物理时间轴重采样仍需验证。回放按合并流顺序推进，绘制在全局帧边界重置，保守的多 Scene 诊断保持。
+回放按[所选帧来源](frame-sources.md)推进，对象状态保持合并事件顺序；绘制窗口从前一个同源 End 延续到当前 End，不在其他来源的边界清除。跨来源绘制另由双 Scene OriginShift 空间专项和 APEX 同步/异步捕获核对。
+
+真实原版多 Scene 容器、Scene 销毁/复用、Actor 转移、跨机器时钟和独立物理时间轴重采样仍需分别验证。构造多 Scene 容器的读取与裁剪范围见[原版导出](native-export.md)。

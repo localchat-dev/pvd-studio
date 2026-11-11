@@ -27,6 +27,9 @@ pub struct WindowState {
 
     /// True if the window is minimized
     minimized: bool,
+
+    #[cfg_attr(feature = "serde", serde(skip))]
+    focus_requested: bool,
 }
 
 impl Default for WindowState {
@@ -39,6 +42,7 @@ impl Default for WindowState {
             expanded_height: None,
             new: true,
             minimized: false,
+            focus_requested: false,
         }
     }
 }
@@ -111,6 +115,14 @@ impl WindowState {
     #[inline(always)]
     pub(crate) fn is_minimized(&self) -> bool {
         self.minimized
+    }
+
+    pub(crate) fn request_focus(&mut self) {
+        self.focus_requested = true;
+    }
+
+    pub(crate) fn take_focus_request(&mut self) -> bool {
+        std::mem::take(&mut self.focus_requested)
     }
 
     //the 'static in this case means that the `open` field is always `None`

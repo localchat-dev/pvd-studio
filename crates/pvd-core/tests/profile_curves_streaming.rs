@@ -11,6 +11,9 @@ use pvd_core::{
 };
 use std::{fs::File, io::Cursor, path::PathBuf, sync::atomic::AtomicBool};
 
+#[path = "support/profile_isolation.rs"]
+mod profile_isolation;
+
 fn text(value: &str) -> Vec<u8> {
     let mut bytes = (value.len() as u32 + 1).to_le_bytes().to_vec();
     bytes.extend(value.as_bytes());

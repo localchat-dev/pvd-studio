@@ -1,0 +1,10 @@
+[package]
+name = "pvd-apex-event-probe"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+pvd-protocol = { path = "../../../crates/pvd-protocol" }
+serde_json = "1.0"

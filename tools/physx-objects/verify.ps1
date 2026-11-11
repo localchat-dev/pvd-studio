@@ -30,8 +30,10 @@ try {
     & cargo test --locked -p pvd-core --test object_hierarchy -- --ignored --nocapture
     if ($LASTEXITCODE -ne 0) { throw 'SDK getter truth comparison failed.' }
     if (-not $SkipDesktopTests) {
-        & cargo test --locked -p pvd-desktop tree::tests:: -- --include-ignored --nocapture
+        & cargo test --locked -p pvd-desktop tree::tests:: -- --test-threads=1
         if ($LASTEXITCODE -ne 0) { throw 'Desktop tree logic tests failed.' }
+        & cargo test --locked -p pvd-desktop tree::tests::aggregate_link_tree_tracks_membership_language_and_generation -- --ignored --exact --nocapture --test-threads=1
+        if ($LASTEXITCODE -ne 0) { throw 'SDK object tree comparison failed.' }
     }
     Get-FileHash -Algorithm SHA256 $capture, $truth | Format-List Path, Hash
 } finally {

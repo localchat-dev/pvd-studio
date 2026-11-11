@@ -3,7 +3,10 @@ mod analysis_support;
 use analysis_support::legacy_fixture;
 use pvd_core::analysis::view::ProfileSource;
 use pvd_core::{Geometry, LiveRecording, Recording, Value};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 fn capture_path() -> PathBuf {
     std::env::var_os("PVD_SDK34_CAPTURE")
@@ -13,20 +16,20 @@ fn capture_path() -> PathBuf {
         })
 }
 
-#[test]
-#[ignore = "requires tools/physx-sample generated PhysX 3.4.2 lifecycle capture and truth CSV"]
-fn official_sdk_capture_matches_independent_sdk_poses_and_random_replay() {
-    let path = capture_path();
-    let recording = Recording::from_path(&path).expect("generate the official SDK fixture first");
+fn verify_sdk_poses(recording: &Recording, path: &Path, actors_per_frame: usize) {
     assert_eq!(recording.frame_count(), 120);
     recording.verify_replay().unwrap();
     let truth = fs::read_to_string(path.with_extension("csv")).unwrap();
     let mut poses = 0;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut per_frame = [0usize; 120];
     for line in truth.lines().skip(1) {
         let c = line.split(',').collect::<Vec<_>>();
         assert_eq!(c.len(), 10);
         let frame = c[0].parse::<usize>().unwrap();
         let id = c[1].parse::<u64>().unwrap();
+        assert!(frame < per_frame.len() && seen.insert((frame, id)));
+        per_frame[frame] += 1;
         let state = recording.state_at(frame).unwrap();
         let actor = &state.objects[&id];
         assert_eq!(
@@ -49,7 +52,16 @@ fn official_sdk_capture_matches_independent_sdk_poses_and_random_replay() {
         }
         poses += 1;
     }
-    assert_eq!(poses, 240);
+    assert_eq!(poses, 120 * actors_per_frame);
+    assert_eq!(per_frame, [actors_per_frame; 120]);
+}
+
+#[test]
+#[ignore = "requires tools/physx-sample generated PhysX 3.4.2 lifecycle capture and truth CSV"]
+fn official_sdk_capture_matches_independent_sdk_poses_and_random_replay() {
+    let path = capture_path();
+    let recording = Recording::from_path(&path).expect("generate the official SDK fixture first");
+    verify_sdk_poses(&recording, &path, 2);
     let before = recording.state_at(89).unwrap();
     let after = recording.state_at(90).unwrap();
     let original = before
@@ -100,7 +112,7 @@ fn official_sdk_capture_matches_independent_sdk_poses_and_random_replay() {
 }
 
 #[test]
-#[ignore = "requires tools/physx-sample --rich capture and SDK mesh truth JSON"]
+#[ignore = "requires tools/physx-sample --rich capture, SDK pose CSV and mesh truth JSON"]
 fn rich_geometry_matches_sdk_cooked_resources_and_scaled_axes() {
     let path = std::env::var_os("PVD_SDK34_RICH_CAPTURE")
         .map(PathBuf::from)
@@ -109,7 +121,7 @@ fn rich_geometry_matches_sdk_cooked_resources_and_scaled_axes() {
                 .join("../../captures/physx-3.4-rich.pvdstream")
         });
     let recording = Recording::from_path(&path).unwrap();
-    recording.verify_replay().unwrap();
+    verify_sdk_poses(&recording, &path, 4);
     let state = recording.state_at(0).unwrap();
     let scene = state.render_scene();
     assert!(scene.diagnostics.is_empty(), "{:?}", scene.diagnostics);

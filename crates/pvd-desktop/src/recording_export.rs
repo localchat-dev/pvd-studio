@@ -16,6 +16,7 @@ use pvd_core::clip::{TrimPhase, TrimProgress};
 #[derive(Clone, Copy)]
 pub enum Kind {
     Clip { first: usize, last: usize },
+    Native(pvd_core::native::export::Selection),
     Analysis(AnalysisCsvKind),
     Retained { first: usize, last: usize },
 }
@@ -24,6 +25,9 @@ pub enum Kind {
 pub enum Phase {
     Inspect,
     Export,
+    NativeRead,
+    NativeExport,
+    NativeRecheck,
     LoadedRows,
     CaptureInspect,
     CaptureCopy,
@@ -167,16 +171,18 @@ impl Job {
                         &worker_cancel,
                         update,
                     ),
-                    Source::File(path, identity) => File::open(path).and_then(|mut file| {
-                        run_export(
-                            &mut file,
-                            &destination,
-                            kind,
-                            Some(&identity),
-                            &worker_cancel,
-                            update,
-                        )
-                    }),
+                    Source::File(path, identity) => {
+                        open_export_source(&path).and_then(|mut file| {
+                            run_export(
+                                &mut file,
+                                &destination,
+                                kind,
+                                Some(&identity),
+                                &worker_cancel,
+                                update,
+                            )
+                        })
+                    }
                     Source::Retained {
                         recording,
                         epoch,
@@ -235,6 +241,17 @@ impl Job {
     }
 }
 
+fn open_export_source(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(1);
+    }
+    options.open(path)
+}
+
 fn run_export<R: Read + Seek>(
     source: &mut R,
     destination: &Path,
@@ -244,6 +261,61 @@ fn run_export<R: Read + Seek>(
     mut progress: impl FnMut(Progress) -> bool,
 ) -> io::Result<Message> {
     match kind {
+        Kind::Native(selection) => {
+            if !destination
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pxd2"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "PVD3 container export requires a .pxd2 output",
+                ));
+            }
+            crate::atomic_output::create_parent_directory(destination)?;
+            let mut report = None;
+            crate::atomic_output::write_with(destination, |output| {
+                let value =
+                    pvd_core::native::export::write_reader(source, selection, output, |value| {
+                        progress(Progress {
+                            phase: match value.phase {
+                                pvd_core::native::export::Phase::Read => Phase::NativeRead,
+                                pvd_core::native::export::Phase::Export => Phase::NativeExport,
+                                pvd_core::native::export::Phase::Recheck => Phase::NativeRecheck,
+                            },
+                            completed: value.completed,
+                            total: value.total,
+                        })
+                    })
+                    .map_err(export_error)?;
+                validate_identity(
+                    expected,
+                    *value.source_blake3.as_bytes(),
+                    value.source_bytes as u64,
+                    value.source_frames,
+                )?;
+                output.sync_all()?;
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                report = Some(value);
+                Ok(())
+            })?;
+            let report = report.unwrap();
+            Ok(Message::new(
+                format!(
+                    "Saved PVD3 recording: {} frames, {} bytes to {}",
+                    report.frames,
+                    report.output_bytes,
+                    destination.display()
+                ),
+                format!(
+                    "已保存 PVD3 录制：{} 帧，{} 字节，路径 {}",
+                    report.frames,
+                    report.output_bytes,
+                    destination.display()
+                ),
+            ))
+        }
         Kind::Retained { .. } => Err(io::Error::other(
             "Retained capture export requires a disk history source",
         )),
@@ -586,9 +658,16 @@ fn analysis_controls(
     menu: bool,
 ) {
     let language = studio.prefs.language;
-    let can_export = studio.can_export_analysis();
+    let incomplete_memory = kind == AnalysisCsvKind::Memory
+        && studio.recording.as_ref().is_some_and(|recording| {
+            recording.memory_history_scope() == pvd_core::MemoryHistoryScope::AfterInitialSnapshot
+        });
+    let can_export = studio.can_export_analysis() && !incomplete_memory;
     let label = match kind {
         AnalysisCsvKind::Profile => language.text("Export all completed spans", "导出全部完成区间"),
+        AnalysisCsvKind::Memory if incomplete_memory => {
+            language.text("Full memory CSV unavailable", "完整内存统计不可用")
+        }
         AnalysisCsvKind::Memory => language.text("Export all memory samples", "导出全部内存汇总"),
     };
     ui.horizontal_wrapped(|ui| {
@@ -620,7 +699,12 @@ fn analysis_controls(
         }
     });
     if !can_export && studio.recording_export.is_none() {
-        let (en, zh) = if studio.is_project_capture() {
+        let (en, zh) = if incomplete_memory {
+            (
+                "Earlier memory events are unavailable; full allocation statistics cannot be exported.",
+                "缺少起点前内存事件，不能导出完整分配统计。",
+            )
+        } else if studio.is_project_capture() {
             (
                 "This project capture contains a retained interval; full-source analysis export is unavailable.",
                 "本项目捕获仅包含保留区间，不能导出完整源分析。",
@@ -647,6 +731,7 @@ fn analysis_controls(
     }
     ui.label(egui::RichText::new(match kind {
         AnalysisCsvKind::Profile => language.text("Includes completed CPU spans across the full file; counter values and CUDA records are separate event types.", "包含完整文件的已完成 CPU 区间；计数值和 CUDA 记录属于其他事件类型。"),
+        AnalysisCsvKind::Memory if incomplete_memory => language.text("Only memory events captured in this file are available.", "仅可分析文件内捕获的内存事件。"),
         AnalysisCsvKind::Memory => language.text("One cumulative sample per received memory buffer, covering the full file.", "覆盖完整文件，每个内存缓冲对应一条累计汇总。"),
     }).small());
     if studio
@@ -688,6 +773,10 @@ pub(crate) fn prepare_retained_render(
 }
 
 pub fn retained_controls(ui: &mut egui::Ui, studio: &mut crate::studio::Studio) {
+    if studio.is_native_recording() {
+        studio.native_export_controls(ui);
+        return;
+    }
     let language = studio.prefs.language;
     egui::CollapsingHeader::new(language.text("Save retained history", "保存保留历史"))
         .default_open(studio.live_connected)
@@ -733,6 +822,7 @@ pub fn show_progress(ui: &mut egui::Ui, studio: &crate::studio::Studio) {
     };
     let language = studio.prefs.language;
     ui.label(match job.kind {
+        Kind::Native(_) => language.text("PVD3 recording export", "PVD3 录制导出"),
         Kind::Retained { .. } => language.text("Retained project capture", "保留范围的项目捕获"),
         Kind::Clip { .. } => language.text("Recording clip export", "录制片段导出"),
         Kind::Analysis(AnalysisCsvKind::Profile) => {
@@ -744,6 +834,18 @@ pub fn show_progress(ui: &mut egui::Ui, studio: &crate::studio::Studio) {
     });
     if let Some(progress) = job.progress() {
         let (phase, offset) = match progress.phase {
+            Phase::NativeRead => (
+                language.text("Reading native recording", "读取原版录制"),
+                0.0,
+            ),
+            Phase::NativeExport => (
+                language.text("Writing native recording", "保存原版录制"),
+                0.5,
+            ),
+            Phase::NativeRecheck => (
+                language.text("Rechecking source recording", "复核源录制"),
+                0.5,
+            ),
             Phase::CaptureInspect => (
                 language.text("Inspecting retained frames", "检查保留帧"),
                 0.0,
@@ -787,11 +889,18 @@ pub fn show_progress(ui: &mut egui::Ui, studio: &crate::studio::Studio) {
                 ),
             )
         };
-        ui.add(
-            egui::ProgressBar::new((offset + fraction.clamp(0.0, 1.0) * scale) as f32)
-                .desired_width(ui.available_width().min(360.0))
-                .text(label),
-        );
+        if progress.total == 0 {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(phase);
+            });
+        } else {
+            ui.add(
+                egui::ProgressBar::new((offset + fraction.clamp(0.0, 1.0) * scale) as f32)
+                    .desired_width(ui.available_width().min(360.0))
+                    .text(label),
+            );
+        }
     }
     if ui
         .add_enabled(
@@ -812,6 +921,118 @@ pub fn show_progress(ui: &mut egui::Ui, studio: &crate::studio::Studio) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    #[ignore = "requires preserved real PVD3 baseline container"]
+    fn native_exports_preserve_source_identity_cancellation_and_existing_outputs() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../captures/native/baseline-paired-native.pxd2");
+        let bytes = fs::read(&source).unwrap();
+        let recording = pvd_core::Recording::from_bytes(&bytes).unwrap();
+        let identity = Identity::from_digest(
+            blake3::hash(&bytes),
+            bytes.len() as u64,
+            recording.frame_count(),
+        );
+        let wrong = Identity::from_digest(
+            blake3::hash(b"different source"),
+            bytes.len() as u64,
+            recording.frame_count(),
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "pvd-native-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let output = directory.join("prefix.pxd2");
+        let cancelled = AtomicBool::new(false);
+        let kind = Kind::Native(pvd_core::native::export::Selection::Frames { first: 0, last: 29 });
+        assert!(
+            run_export(
+                &mut Cursor::new(&bytes),
+                &output,
+                kind,
+                Some(&wrong),
+                &cancelled,
+                |_| true,
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        let error = run_export(
+            &mut Cursor::new(&bytes),
+            &output,
+            kind,
+            Some(&identity),
+            &cancelled,
+            |progress| progress.phase != Phase::NativeRecheck,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!output.exists());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        run_export(
+            &mut Cursor::new(&bytes),
+            &output,
+            kind,
+            Some(&identity),
+            &cancelled,
+            |_| true,
+        )
+        .unwrap();
+        let saved = fs::read(&output).unwrap();
+        let clipped = pvd_core::Recording::from_bytes(&saved).unwrap();
+        assert_eq!(clipped.frame_count(), 30);
+        for frame in [0, 29, 1, 28] {
+            assert_eq!(
+                clipped.state_at(frame).unwrap(),
+                recording.state_at(frame).unwrap()
+            );
+        }
+        assert!(
+            run_export(
+                &mut Cursor::new(&bytes),
+                &output,
+                kind,
+                Some(&identity),
+                &cancelled,
+                |_| true,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&output).unwrap(), saved);
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        let middle = directory.join("middle.pxd2");
+        run_export(
+            &mut Cursor::new(&bytes),
+            &middle,
+            Kind::Native(pvd_core::native::export::Selection::Frames {
+                first: 30,
+                last: 31,
+            }),
+            Some(&identity),
+            &cancelled,
+            |_| true,
+        )
+        .unwrap();
+        let clipped = pvd_core::Recording::from_bytes(&fs::read(&middle).unwrap()).unwrap();
+        assert_eq!(clipped.frame_count(), 2);
+        for frame in [1, 0, 1] {
+            assert_eq!(
+                clipped.state_at(frame).unwrap(),
+                recording.state_at(frame + 30).unwrap()
+            );
+        }
+        fs::remove_file(middle).unwrap();
+        fs::remove_file(output).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn closing_waits_for_detached_export_cleanup() {
@@ -1100,5 +1321,73 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), output);
         fs::remove_file(&destination).unwrap();
         fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires PVD_NATIVE_MEMORY_FIXTURE_DIRECTORY constructed fixtures"]
+    fn constructed_native_memory_totals_partial_history_does_not_offer_full_statistics() {
+        let directory = PathBuf::from(
+            std::env::var_os("PVD_NATIVE_MEMORY_FIXTURE_DIRECTORY")
+                .expect("constructed memory fixture directory"),
+        );
+        let recording = Arc::new(
+            pvd_core::Recording::from_bytes(
+                &fs::read(directory.join("memory-initial-zero.pxd2")).unwrap(),
+            )
+            .unwrap(),
+        );
+        for language in [
+            crate::i18n::Language::English,
+            crate::i18n::Language::Chinese,
+        ] {
+            let mut studio = crate::studio::Studio::default();
+            studio.persist_layout = false;
+            studio.prefs.language = language;
+            studio.recording = Some(recording.clone());
+            assert!(studio.can_export_analysis());
+            let context = egui::Context::default();
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 450.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        analysis_controls(ui, &mut studio, AnalysisCsvKind::Memory, false)
+                    });
+                },
+            );
+            let text: Vec<_> = output
+                .shapes
+                .into_iter()
+                .filter_map(|shape| match shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                text.iter().any(|label| label
+                    == language.text("Full memory CSV unavailable", "完整内存统计不可用")),
+                "{text:?}"
+            );
+            assert!(
+                text.iter().any(|label| label.contains(language.text(
+                    "Earlier memory events are unavailable",
+                    "缺少起点前内存事件"
+                ))),
+                "{text:?}"
+            );
+            assert!(
+                !text
+                    .iter()
+                    .any(|label| label
+                        == language.text("Export all memory samples", "导出全部内存汇总")),
+                "{text:?}"
+            );
+            assert!(studio.recording_export.is_none());
+        }
     }
 }

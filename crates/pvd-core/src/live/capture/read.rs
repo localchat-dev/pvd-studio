@@ -109,6 +109,7 @@ pub fn open_with_progress(
     .snapshot()?;
     recording.source = crate::RecordingSource::ProjectCapture;
     recording.frames = frames;
+    recording.frame_sources = directory.frame_sources;
     recording.classes = metadata.classes;
     recording.diagnostics = metadata.diagnostics;
     recording.diagnostics.push(format!("Project capture retains source frames {}..={}; hidden restoration history and analysis retention boundaries are preserved. Type metadata belongs to the export snapshot.", report.range.first, report.range.last));
@@ -256,6 +257,7 @@ pub(super) fn directory<R: Read + Seek>(
     let mut position = 8u64;
     let mut budget = Budget::new(limits.index_bytes);
     let mut metadata = None;
+    let mut source_directory = None;
     let mut segments: Vec<Segment> = Vec::new();
     let mut blocks = Vec::new();
     let mut blobs = Vec::new();
@@ -280,9 +282,23 @@ pub(super) fn directory<R: Read + Seek>(
         }
         if !matches!(
             kind,
-            wire::BLOCK | wire::BLOB | wire::RECORD | wire::SEGMENT | wire::METADATA | wire::FOOTER
+            wire::BLOCK
+                | wire::BLOB
+                | wire::RECORD
+                | wire::SEGMENT
+                | wire::METADATA
+                | wire::FRAME_SOURCES
+                | wire::FOOTER
         ) {
             return Err(error("unknown project capture entry"));
+        }
+        if source_directory.is_some() && kind != wire::FOOTER {
+            return Err(error(
+                "capture frame source directory must immediately precede the footer",
+            ));
+        }
+        if kind == wire::FRAME_SOURCES && format != Format::V3 {
+            return Err(error("frame source directory requires capture version 3"));
         }
         if kind == wire::BLOCK && length > (64 << 10) + 44 {
             return Err(error("capture block exceeds 64 KiB"));
@@ -456,6 +472,9 @@ pub(super) fn directory<R: Read + Seek>(
                 })?;
                 metadata = Some(value);
             }
+            wire::FRAME_SOURCES => {
+                source_directory = Some(std::mem::take(&mut payload));
+            }
             wire::FOOTER => {
                 if end != total {
                     return Err(error("trailing bytes after project capture footer"));
@@ -492,6 +511,69 @@ pub(super) fn directory<R: Read + Seek>(
                 if visible != frames {
                     return Err(error("capture visible frame count differs"));
                 }
+                let frame_index_bytes = frames
+                    .max(4)
+                    .checked_mul(2 * size_of::<FrameInfo>() + 32)
+                    .and_then(|bytes| bytes.checked_add(128))
+                    .ok_or_else(|| error("capture source frame index size overflow"))?;
+                budget.charge(frame_index_bytes)?;
+                let mut visible_frames = crate::FrameIndex::default();
+                for frame in segments.iter().flat_map(|segment| &segment.frames) {
+                    if (first..=last).contains(&frame.info.index) {
+                        progress(callback, CapturePhase::Validate, position, total)?;
+                        visible_frames.push(frame.info.clone());
+                    }
+                }
+                let source_limits = crate::frame_sources::FrameDirectoryLimits {
+                    index_bytes: limits.index_bytes.saturating_sub(budget.used),
+                    frames: limits.frames,
+                    ..Default::default()
+                };
+                let frame_sources = match (format, source_directory) {
+                    (Format::V3, Some(source_bytes)) => {
+                        let directory = crate::frame_sources::wire::decode_with_cancel(
+                            &source_bytes,
+                            &visible_frames,
+                            source_limits,
+                            || {
+                                !callback(CaptureProgress {
+                                    phase: CapturePhase::Validate,
+                                    completed: position,
+                                    total,
+                                })
+                            },
+                        )?;
+                        budget.charge(directory.index_bytes())?;
+                        let temporary = source_bytes.capacity();
+                        drop(source_bytes);
+                        budget.release(temporary);
+                        directory
+                    }
+                    (Format::V3, None) => {
+                        return Err(error("capture frame source directory is missing"));
+                    }
+                    (_, None) => {
+                        let directory =
+                            crate::frame_sources::FrameDirectory::from_legacy_with_cancel(
+                                &visible_frames,
+                                source_limits,
+                                || {
+                                    !callback(CaptureProgress {
+                                        phase: CapturePhase::Validate,
+                                        completed: position,
+                                        total,
+                                    })
+                                },
+                            )?;
+                        budget.charge(directory.index_bytes())?;
+                        directory
+                    }
+                    (_, Some(_)) => {
+                        return Err(error("legacy capture contains a frame source directory"));
+                    }
+                };
+                drop(visible_frames);
+                budget.release(frame_index_bytes);
                 hash.update(&header);
                 hash.update(&payload);
                 let digest = *hash.finalize().as_bytes();
@@ -515,6 +597,7 @@ pub(super) fn directory<R: Read + Seek>(
                 return Ok(Directory {
                     format,
                     retained_bytes: budget.used,
+                    frame_sources,
                     metadata,
                     segments,
                     blocks,

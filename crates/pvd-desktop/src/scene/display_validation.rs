@@ -29,7 +29,7 @@ impl Viewport {
             .filter(|object| {
                 valid_pose(object)
                     && valid_geometry(&object.geometry)
-                    && incremental::actor_visible(studio, object)
+                    && incremental::object_visible(studio, object)
             })
             .collect();
         expected.sort_by_key(|object| (object.id, object.shape_id));

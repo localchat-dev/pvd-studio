@@ -42,3 +42,9 @@ endfunction()
 
 add_feature_producer(pvd-origin-shift main.cpp)
 target_include_directories(pvd-origin-shift PRIVATE "${PHYSX34_ROOT}/PxShared/src/pvd/include")
+
+add_feature_producer(pvd-origin-shift-spatial spatial.cpp)
+target_include_directories(pvd-origin-shift-spatial PRIVATE
+  "${PHYSX34_ROOT}/PxShared/src/pvd/include"
+  "${PHYSX34_ROOT}/PxShared/src/foundation/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../physx-sample/compat")

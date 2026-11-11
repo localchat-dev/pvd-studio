@@ -11,9 +11,11 @@ use bevy::{
 #[derive(Resource, Default)]
 pub(crate) struct Output {
     vertices: Vec<[u32; 3]>,
+    pub(super) colors: Vec<LinearRgba>,
 }
 impl Output {
     pub fn capture(&mut self, gizmos: &Gizmos) {
+        self.colors.clone_from(&gizmos.list_colors);
         self.vertices = gizmos
             .list_positions
             .iter()
@@ -58,6 +60,95 @@ fn draw(
         world.remove_resource::<Output>().unwrap().vertices,
         world.resource::<Studio>().selected,
     )
+}
+
+fn draw_debug(state: pvd_core::SceneState, wireframe: bool, visible: bool) -> Output {
+    let captured = state.clone();
+    let mut studio = Studio::default();
+    studio.state = state;
+    studio.prefs.show_grid = false;
+    studio.prefs.show_axes = false;
+    studio.prefs.show_debug_draw = visible;
+    studio.prefs.wireframe = wireframe;
+    let mut config = GizmoConfigStore::default();
+    config.insert(default(), DefaultGizmoConfigGroup);
+    let mut world = World::new();
+    world.insert_resource(studio);
+    world.insert_resource(Viewport::default());
+    world.insert_resource(config);
+    world.insert_resource(GizmoStorage::<DefaultGizmoConfigGroup, ()>::default());
+    world.insert_resource(Output::default());
+    world.run_system_once(draw_grid).unwrap();
+    assert_eq!(world.resource::<Studio>().state, captured);
+    world.remove_resource::<Output>().unwrap()
+}
+
+#[test]
+fn captured_triangles_draw_three_opaque_edges_with_each_start_vertex_rgb() {
+    use pvd_core::debug_draw::Primitive;
+    let mut state = pvd_core::SceneState::default();
+    let positions = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    state.debug_draw.insert(
+        7,
+        std::sync::Arc::new(vec![
+            Primitive::Triangle {
+                instance: 9,
+                positions,
+                colors: [27, 0x80112233, 0x00ff0000],
+            },
+            Primitive::Triangle {
+                instance: 10,
+                positions: [[f32::NAN; 3]; 3],
+                colors: [0xffffffff; 3],
+            },
+        ]),
+    );
+    let mut vertices: Vec<_> = positions
+        .into_iter()
+        .flat_map(|position| [position.map(f32::to_bits); 2])
+        .collect();
+    vertices.sort_unstable();
+    let colors: Vec<_> = [
+        Color::srgb_u8(0, 0, 27),
+        Color::srgb_u8(17, 34, 51),
+        Color::srgb_u8(255, 0, 0),
+    ]
+    .into_iter()
+    .flat_map(|color| [color.to_linear(); 2])
+    .collect();
+    for wireframe in [false, true] {
+        let output = draw_debug(state.clone(), wireframe, true);
+        assert_eq!(output.vertices, vertices);
+        assert_eq!(output.colors, colors);
+        let hidden = draw_debug(state.clone(), wireframe, false);
+        assert!(hidden.vertices.is_empty());
+        assert!(hidden.colors.is_empty());
+    }
+}
+
+#[test]
+fn captured_points_and_lines_keep_rgb_independent_of_alpha() {
+    use pvd_core::debug_draw::Primitive;
+    let mut state = pvd_core::SceneState::default();
+    state.debug_draw.insert(
+        7,
+        std::sync::Arc::new(vec![
+            Primitive::Point {
+                instance: 9,
+                position: [1.0, 2.0, 3.0],
+                color: 0x00ff0000,
+            },
+            Primitive::Line {
+                instance: 9,
+                positions: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                colors: [0x0000ff00, 0x800000ff],
+            },
+        ]),
+    );
+    let output = draw_debug(state, false, true);
+    assert_eq!(output.vertices.len(), 8);
+    assert_eq!(output.colors[..6], [LinearRgba::RED; 6]);
+    assert_eq!(output.colors[6..], [LinearRgba::GREEN, LinearRgba::BLUE]);
 }
 
 fn fixture() -> (pvd_core::SceneState, Vec<RenderObject>) {

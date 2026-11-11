@@ -232,7 +232,7 @@ fn shared_geometry_restrictions_include_every_selected_owner() {
         .unwrap()
         .to_string();
     assert!(
-        error.contains("dynamic actors cannot have plane"),
+        error.contains("non-kinematic dynamic actors cannot simulate plane"),
         "{error}"
     );
 }

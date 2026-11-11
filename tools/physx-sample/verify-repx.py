@@ -44,7 +44,7 @@ def compare_roundtrip(expected_path, actual_path, selector=None):
     expected, actual = leaves(expected_root), leaves(actual_root)
     compared = 0
     for path, value in expected.items():
-        if not value and path.rsplit("/", 1)[-1].endswith("Flags") and path not in actual:
+        if value in ("", "0") and path.rsplit("/", 1)[-1].endswith("Flags") and path not in actual:
             continue
         assert path in actual, f"SDK discarded property {path}: {value}"
         if value == actual[path]:
@@ -102,12 +102,15 @@ def main():
         assert len(original_root.findall("PxSphericalJoint")) == len(imported_root.findall("PxSphericalJoint")) == 1
         compared = compare_roundtrip(repx, roundtrip, "PxSphericalJoint")
         total_properties += compared
-        selected = output / "unsupported-connected-actor.xml"
+        selected = output / "connected-actor.xml"
+        selected_roundtrip = output / "connected-actor-sdk.xml"
         actor_id = original_root.findtext("PxSphericalJoint/Actors/actor1")
-        result = execute([args.cli, "repx", args.rich_capture, 0, selected, actor_id], succeed=False)
-        assert "RepX" in result.stderr, result.stderr
-        assert not selected.exists(), "Unsupported connected Actor export left an output file"
-        print(f"rich frame: SDK imported all 6 Actors and spherical joint; {compared} joint properties matched; connected Actor selection explicitly refused")
+        execute([args.cli, "repx", args.rich_capture, 0, selected, actor_id])
+        imported = execute([args.producer, "--import-repx", selected, "--roundtrip-repx", selected_roundtrip])
+        assert not imported.stderr.strip(), imported.stderr
+        assert len(ET.parse(selected_roundtrip).getroot().findall("PxSphericalJoint")) == 1
+        total_properties += compare_roundtrip(selected, selected_roundtrip)
+        print(f"rich frame: SDK imported all 6 Actors and spherical joint; {compared} joint properties matched; selected Actor retains its joint dependencies")
     missing = output / "missing-actor.xml"
     execute([args.cli, "repx", args.capture, 0, missing, 1], succeed=False)
     assert not missing.exists()

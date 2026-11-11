@@ -108,10 +108,14 @@ mod tests {
     #[test]
     fn tilted_source_cameras_preserve_projection_and_picking_in_every_coordinate_system() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 720.0));
-        for axis in UpAxis::ALL {
+        for up in UpAxis::ALL
+            .into_iter()
+            .map(UpAxis::vector)
+            .chain([Vec3::new(1.0, 2.0, -3.0), Vec3::new(-3.0, 1.0, 2.0)])
+        {
             for hand in [Handedness::Right, Handedness::Left] {
                 for scale in [1e-6, 0.001, 1.0, 1000.0, 1e6] {
-                    let coordinates = Coordinates::new(axis, hand, scale);
+                    let coordinates = Coordinates::from_up_vector(up, hand, scale).unwrap();
                     let pose = Pose::from_source(&camera(), coordinates).unwrap();
                     let mut viewport = Viewport::default();
                     viewport.coordinates = coordinates;

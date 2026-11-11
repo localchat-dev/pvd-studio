@@ -10,6 +10,8 @@ Windows x64 / MSVC，固定的官方 PhysX 3.4.2 源码提交 `5e42a5f112351a223
 - Convex 几何顶点逐项比较 SDK 已烹制网格 `getVertices()`，三角化复用已有捕获网格路径。展示不调用物理引擎，不重做查询。
 - 逐帧逆向恢复与顺序/检查点状态一致性验证通过。32 位与大端仅通过结构测试；没有宣称这些平台上的 SDK 实测。
 
+PhysX 4.1.2 的独立 SDK 构建与同次真值也通过上述 12 帧、420 次查询和 312 个命中的文件检查。其文件/TCP 验证入口与具体版本见[4.1 生产器](../tools/physx41-sample/README.md)，不从共用源码推定其他版本兼容。
+
 ## 源码证据
 
 - `PhysX_3.4/Source/PhysX/src/NpPvdSceneQueryCollector.h`：`PvdSweep`、`PvdOverlap`、`PvdSqHit` 原生布局。
@@ -42,9 +44,11 @@ Windows x64 / MSVC，固定的官方 PhysX 3.4.2 源码提交 `5e42a5f112351a223
 .\tools\physx-features\build.ps1 -Target pvd-query-shapes -BuildRoot .deps/physx-query-shapes-build
 .\.deps\physx-query-shapes-build\Release\pvd-query-shapes.exe captures/physx-3.4-query-shapes.pvdstream captures/physx-3.4-query-shapes.json
 cargo test --locked -p pvd-core --lib queries::
-cargo test --locked -p pvd-core --test query_shapes -- --ignored --nocapture
+cargo test --locked -p pvd-core --test query_shapes -- --ignored --nocapture --skip physx41_
 ```
 
 可设置 `PVD_QUERY_SHAPES_CAPTURE` 指向其他捕获；测试读取同名 `.json` 作为独立 SDK 真值。该实测默认被忽略，必须生成数据并显式运行，默认 `cargo test` 不等价于它已通过。
+
+4.1 专项使用 `PVD_QUERY_SHAPES41_CAPTURE`，只运行 `physx41_` 过滤项，并核对真值中的 SDK 版本。
 
 实现与生产器：`crates/pvd-core/src/queries.rs`、`crates/pvd-core/tests/query_shapes.rs`、`tools/physx-features/query_shapes.cpp`。

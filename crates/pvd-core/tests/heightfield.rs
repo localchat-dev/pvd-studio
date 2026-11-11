@@ -18,11 +18,21 @@ fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
 #[test]
 #[ignore = "requires pvd-heightfield official SDK producer and independent triangle truth"]
 fn height_fields_match_sdk_triangles_across_scale_holes_and_replay() {
-    let capture = std::env::var_os("PVD_HEIGHTFIELD_CAPTURE")
+    verify_heightfields("PVD_HEIGHTFIELD_CAPTURE", "physx-3.4", "3.4.2");
+}
+
+#[test]
+#[ignore = "requires PhysX 4.1.2 heightfield capture and same-run SDK triangle truth"]
+fn physx41_height_fields_match_sdk_triangles_across_scale_holes_and_replay() {
+    verify_heightfields("PVD_HEIGHTFIELD41_CAPTURE", "physx-4.1", "4.1.2");
+}
+
+fn verify_heightfields(variable: &str, name: &str, version: &str) {
+    let capture = std::env::var_os(variable)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../captures/physx-3.4-heightfield.pvdstream")
+                .join(format!("../../captures/{name}-heightfield.pvdstream"))
         });
     let bytes = fs::read(&capture).unwrap();
     let recording = Recording::from_bytes(&bytes).unwrap();
@@ -30,6 +40,7 @@ fn height_fields_match_sdk_triangles_across_scale_holes_and_replay() {
         &fs::read_to_string(capture.with_extension("heightfield.json")).unwrap(),
     )
     .unwrap();
+    assert_eq!(truth["sdk"].as_str(), Some(version));
     assert_eq!(recording.frame_count(), 75);
     assert_eq!(truth["frames"].as_array().unwrap().len(), 75);
     recording.verify_replay().unwrap();

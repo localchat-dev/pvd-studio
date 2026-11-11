@@ -14,21 +14,25 @@ mod wire;
 pub use atomic::write_retained_new;
 pub use export::write_retained;
 pub use read::open_with_progress;
-pub const MAGIC: &[u8; 8] = b"PVDCAP02";
+pub const MAGIC: &[u8; 8] = b"PVDCAP03";
+pub const V2_MAGIC: &[u8; 8] = b"PVDCAP02";
 pub const LEGACY_MAGIC: &[u8; 8] = b"PVDCAP01";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     V1,
     V2,
+    V3,
 }
 
 impl Format {
     pub fn from_magic(bytes: &[u8]) -> Result<Option<Self>, Error> {
         if bytes.starts_with(LEGACY_MAGIC) {
             Ok(Some(Self::V1))
-        } else if bytes.starts_with(MAGIC) {
+        } else if bytes.starts_with(V2_MAGIC) {
             Ok(Some(Self::V2))
+        } else if bytes.starts_with(MAGIC) {
+            Ok(Some(Self::V3))
         } else if bytes.starts_with(b"PVDCAP") {
             Err(error("unsupported project capture version"))
         } else {
@@ -40,6 +44,7 @@ impl Format {
         match self {
             Self::V1 => "PVDCAP01",
             Self::V2 => "PVDCAP02",
+            Self::V3 => "PVDCAP03",
         }
     }
 }
@@ -210,6 +215,7 @@ struct Segment {
 struct Directory {
     format: Format,
     retained_bytes: usize,
+    frame_sources: crate::frame_sources::FrameDirectory,
     metadata: Metadata,
     segments: Vec<Segment>,
     blocks: Vec<BlockDescription>,

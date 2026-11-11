@@ -218,6 +218,38 @@ fn copy<W: Write>(
     if copied_frames != count as u64 {
         return Err(error("capture range changed or contains a history gap"));
     }
+    let mut cancelled = || {
+        !callback(CaptureProgress {
+            phase: CapturePhase::Copy,
+            completed: copied_frames,
+            total: count as u64,
+        })
+    };
+    copied.budget.charge(
+        source
+            .frame_sources
+            .clipped_index_bytes(range.first, range.last)?,
+    )?;
+    let directory =
+        source
+            .frame_sources
+            .clipped_with_cancel(range.first, range.last, &mut cancelled)?;
+    if directory.retained_frames() != count {
+        return Err(error(
+            "capture frame source directory does not cover its visible range",
+        ));
+    }
+    let source_bytes = crate::frame_sources::wire::encode_with_cancel(
+        &directory,
+        limits.index_bytes.saturating_sub(copied.budget.used),
+        &mut cancelled,
+    )?;
+    copied.budget.charge(source_bytes.capacity())?;
+    writer.entry(wire::FRAME_SOURCES, &[&source_bytes], &mut cancelled)?;
+    let temporary = directory.index_bytes() + source_bytes.capacity();
+    drop(source_bytes);
+    drop(directory);
+    copied.budget.release(temporary);
     let digest = *writer.hash.finalize().as_bytes();
     let mut footer = wire::u64_bytes([writer.bytes, count as u64]);
     footer.extend(digest);
@@ -229,7 +261,7 @@ fn copy<W: Write>(
         })
     })?;
     Ok(CaptureReport {
-        format: Format::V2,
+        format: Format::V3,
         range,
         frames: count,
         bytes: writer.bytes,

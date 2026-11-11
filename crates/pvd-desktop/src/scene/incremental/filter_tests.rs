@@ -132,6 +132,297 @@ fn every_filter_mask_tracks_hidden_lifetimes_and_motion_across_revisions() {
     }
 }
 
+#[test]
+fn sleeping_scope_tracks_actor_selection_and_wake_updates() {
+    use crate::studio::ObjectScope;
+    let (mut builder, initial) = fixture();
+    let mut app = app();
+    update(&mut app, initial, &[]);
+    let sleeping = frame(
+        &mut builder,
+        1,
+        vec![set(1, 26, 33, vec![1]), set(2, 26, 33, vec![1])],
+    );
+    update(&mut app, sleeping.clone(), &[1, 2]);
+    for (enabled, scope, selected, expected) in [
+        (true, ObjectScope::All, None, &[1, 2, 3, 4][..]),
+        (false, ObjectScope::All, Some(1), &[3, 4][..]),
+        (true, ObjectScope::Selected, Some(1), &[1, 3, 4][..]),
+        (true, ObjectScope::Selected, Some(2), &[2, 3, 4][..]),
+        (true, ObjectScope::Unselected, Some(2), &[1, 3, 4][..]),
+        (true, ObjectScope::Selected, None, &[3, 4][..]),
+        (true, ObjectScope::Unselected, None, &[1, 2, 3, 4][..]),
+        (true, ObjectScope::Selected, Some(10), &[3, 4][..]),
+    ] {
+        {
+            let mut studio = app.world_mut().resource_mut::<Studio>();
+            studio.prefs.show_sleeping = enabled;
+            studio.prefs.sleeping_scope = scope;
+            studio.selected = selected;
+        }
+        app.update();
+        assert_eq!(
+            objects(&app)
+                .iter()
+                .map(|object| object.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            app.world().resource::<Viewport>().rendered.len(),
+            expected.len()
+        );
+    }
+    let awake = frame(&mut builder, 2, vec![set(1, 26, 33, vec![0])]);
+    update(&mut app, awake, &[1]);
+    assert_eq!(
+        objects(&app)
+            .iter()
+            .map(|object| object.id)
+            .collect::<Vec<_>>(),
+        [1, 3, 4]
+    );
+    update(&mut app, sleeping, &[1]);
+    assert_eq!(
+        objects(&app)
+            .iter()
+            .map(|object| object.id)
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+}
+
+fn trigger_fixture() -> (pvd_core::RecordingBuilder, SceneState) {
+    let (mut builder, _) = fixture();
+    let state = frame(
+        &mut builder,
+        1,
+        vec![
+            Event::StringHandle {
+                handle: 28,
+                value: "Flags".into(),
+            },
+            Event::StringHandle {
+                handle: 35,
+                value: "PvdU8".into(),
+            },
+            create(12, 3),
+            reference(12, 21, 20),
+            array(
+                1,
+                20,
+                30,
+                2,
+                [10_u64, 12]
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes)
+                    .collect(),
+            ),
+            pose(12, 24, 5.0),
+            pose(2, 23, 10.0),
+            pose(4, 23, 20.0),
+            pose(3, 23, 30.0),
+            set(10, 28, 35, vec![4]),
+            set(11, 28, 35, vec![2]),
+            set(12, 28, 35, vec![1]),
+        ],
+    );
+    assert_eq!(state.render_scene().objects.len(), 5);
+    (builder, state)
+}
+
+fn assert_trigger_view(app: &mut App, expected: &[(u64, u64)]) {
+    assert_eq!(
+        objects(app)
+            .iter()
+            .map(|object| (object.id, object.shape_id))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let mut viewport = app.world_mut().resource_mut::<Viewport>();
+    let mut rendered = viewport.rendered.keys().copied().collect::<Vec<_>>();
+    rendered.sort_unstable();
+    assert_eq!(rendered, expected);
+    viewport.yaw = 0.0;
+    viewport.pitch = 0.0;
+    viewport.distance = 10.0;
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+    for (x, actor, shape) in [
+        (0.0, 1, 10),
+        (5.0, 1, 12),
+        (10.0, 2, 10),
+        (20.0, 4, 10),
+        (30.0, 3, 11),
+    ] {
+        viewport.target = Vec3::new(x, 0.0, 0.0);
+        assert_eq!(
+            viewport.select_at(rect.center(), rect),
+            expected.contains(&(actor, shape)).then_some(actor),
+            "Actor {actor}, Shape {shape}"
+        );
+    }
+}
+
+#[test]
+fn trigger_scope_tracks_shared_shapes_and_keeps_ordinary_geometry_pickable() {
+    use crate::studio::ObjectScope;
+    let (_, state) = trigger_fixture();
+    let mut app = app();
+    update(&mut app, state, &[]);
+    let all = &[(1, 10), (1, 12), (2, 10), (3, 11), (4, 10)][..];
+    let ordinary = &[(1, 12), (3, 11)][..];
+    for wireframe in [false, true] {
+        for (enabled, scope, selected, expected) in [
+            (true, ObjectScope::All, None, all),
+            (false, ObjectScope::All, None, ordinary),
+            (
+                true,
+                ObjectScope::Selected,
+                Some(1),
+                &[(1, 10), (1, 12), (3, 11)][..],
+            ),
+            (
+                true,
+                ObjectScope::Unselected,
+                Some(1),
+                &[(1, 12), (2, 10), (3, 11), (4, 10)][..],
+            ),
+            (true, ObjectScope::Selected, Some(10), all),
+            (true, ObjectScope::Unselected, Some(10), ordinary),
+            (true, ObjectScope::Selected, Some(12), ordinary),
+            (true, ObjectScope::Selected, None, ordinary),
+            (true, ObjectScope::Unselected, None, all),
+        ] {
+            {
+                let mut studio = app.world_mut().resource_mut::<Studio>();
+                studio.prefs.show_triggers = enabled;
+                studio.prefs.trigger_scope = scope;
+                studio.prefs.wireframe = wireframe;
+                studio.selected = selected;
+            }
+            app.update();
+            assert_trigger_view(&mut app, expected);
+        }
+    }
+}
+
+#[test]
+fn trigger_flags_and_shape_lifetimes_refresh_incremental_visibility() {
+    let (mut builder, initial) = trigger_fixture();
+    let mut app = app();
+    app.world_mut().resource_mut::<Studio>().prefs.show_triggers = false;
+    update(&mut app, initial.clone(), &[]);
+    let ordinary = &[(1, 12), (3, 11)][..];
+    let all = &[(1, 10), (1, 12), (2, 10), (3, 11), (4, 10)][..];
+    assert_trigger_view(&mut app, ordinary);
+    let ordinary_entity = app.world().resource::<Viewport>().rendered[&(1, 12)].entity;
+    let queries = frame(&mut builder, 2, vec![set(10, 28, 35, vec![2])]);
+    update(&mut app, queries, &[10]);
+    assert_trigger_view(&mut app, all);
+    assert_eq!(
+        app.world()
+            .resource::<Viewport>()
+            .incremental
+            .last_actor_count,
+        3
+    );
+    let triggers = frame(&mut builder, 3, vec![set(10, 28, 35, vec![4])]);
+    update(&mut app, triggers.clone(), &[10]);
+    assert_trigger_view(&mut app, ordinary);
+    assert_eq!(
+        app.world().resource::<Viewport>().rendered[&(1, 12)].entity,
+        ordinary_entity
+    );
+    app.world_mut().resource_mut::<Studio>().prefs.show_triggers = true;
+    app.update();
+    assert_trigger_view(&mut app, all);
+    let destroyed = frame(&mut builder, 4, vec![Event::DestroyInstance { id: 10 }]);
+    update(&mut app, destroyed.clone(), &[10]);
+    assert_trigger_view(&mut app, ordinary);
+    let reused = frame(
+        &mut builder,
+        5,
+        vec![
+            create(10, 3),
+            reference(10, 21, 20),
+            set(10, 28, 35, vec![4]),
+        ],
+    );
+    update(&mut app, reused.clone(), &[10]);
+    assert_trigger_view(&mut app, ordinary);
+    let rebound = frame(
+        &mut builder,
+        6,
+        vec![
+            array(
+                1,
+                20,
+                30,
+                2,
+                [10_u64, 12]
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes)
+                    .collect(),
+            ),
+            reference(2, 20, 10),
+            reference(4, 20, 10),
+        ],
+    );
+    update(&mut app, rebound, &[1, 2, 4]);
+    assert_trigger_view(&mut app, all);
+    for (state, expected) in [
+        (reused, ordinary),
+        (destroyed, ordinary),
+        (triggers, all),
+        (initial, all),
+    ] {
+        update(&mut app, state, &[1, 2, 4, 10]);
+        assert_trigger_view(&mut app, expected);
+    }
+}
+
+#[test]
+fn trigger_filter_requires_a_valid_captured_byte_flag() {
+    let (_, mut state) = trigger_fixture();
+    let mut app = app();
+    app.world_mut().resource_mut::<Studio>().prefs.show_triggers = false;
+    let all = &[(1, 10), (1, 12), (2, 10), (3, 11), (4, 10)][..];
+    state
+        .objects
+        .get_mut(&10)
+        .unwrap()
+        .properties
+        .remove("Flags");
+    update(&mut app, state.clone(), &[]);
+    assert_trigger_view(&mut app, all);
+    for flags in [
+        Value::I64(-1),
+        Value::U64(260),
+        Value::Bool(true),
+        Value::String("eTRIGGER_SHAPE".into()),
+        Value::U64(2),
+    ] {
+        state
+            .objects
+            .get_mut(&10)
+            .unwrap()
+            .properties
+            .insert("Flags".into(), flags);
+        update(&mut app, state.clone(), &[10]);
+        assert_trigger_view(&mut app, all);
+    }
+    for flags in [Value::I64(4), Value::U64(4)] {
+        state
+            .objects
+            .get_mut(&10)
+            .unwrap()
+            .properties
+            .insert("Flags".into(), flags);
+        update(&mut app, state.clone(), &[10]);
+        assert_trigger_view(&mut app, &[(1, 12), (3, 11)]);
+    }
+}
+
 fn array(id: u64, property: u32, datatype: u32, items: u32, data: Vec<u8>) -> Event {
     Event::SetPropertyValue {
         id,

@@ -1,6 +1,6 @@
 use super::*;
 
-fn fixture() -> Metadata {
+pub(super) fn fixture() -> Metadata {
     let strings = [
         "",
         "physx3",
@@ -26,9 +26,11 @@ fn fixture() -> Metadata {
         Some(Class {
             name: label,
             base,
+            packing: crate::native::ClassPacking::default(),
             size,
             properties,
             dynamic,
+            has_pointers: false,
             string_offsets: Vec::new(),
         })
     };
@@ -99,16 +101,16 @@ fn builder(metadata: &Metadata) -> RecordingBuilder {
     builder
 }
 
-fn word(bytes: &mut Vec<u8>, value: u32) {
+pub(super) fn word(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend(value.to_le_bytes());
 }
 
-fn blob(bytes: &mut Vec<u8>, data: &[u8]) {
+pub(super) fn blob(bytes: &mut Vec<u8>, data: &[u8]) {
     word(bytes, data.len() as u32);
     bytes.extend(data);
 }
 
-fn instance(id: u32, value: u32, peers: &[u32]) -> Vec<u8> {
+pub(super) fn instance(id: u32, value: u32, peers: &[u32]) -> Vec<u8> {
     let mut fixed = Vec::new();
     word(&mut fixed, value);
     word(&mut fixed, 10);
@@ -356,7 +358,7 @@ fn snapshot_event_buffers_are_values_without_replayed_analysis_side_effects() {
     );
 }
 
-fn metadata_bytes(metadata: &Metadata) -> Vec<u8> {
+pub(super) fn metadata_bytes(metadata: &Metadata) -> Vec<u8> {
     let mut bytes = Vec::new();
     word(&mut bytes, 1);
     word(&mut bytes, metadata.classes.len() as u32);
@@ -399,8 +401,8 @@ fn metadata_bytes(metadata: &Metadata) -> Vec<u8> {
             class.name.name,
             index as u32,
             class.base,
-            u32::MAX,
-            u32::MAX,
+            class.packing.uniform_width as u32,
+            class.packing.class_type as u32,
         ] {
             word(&mut bytes, value);
         }
@@ -426,7 +428,7 @@ fn metadata_bytes(metadata: &Metadata) -> Vec<u8> {
     bytes
 }
 
-fn frame(timestamp: u64) -> Vec<u8> {
+pub(super) fn frame(timestamp: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
     word(&mut bytes, 8);
     word(&mut bytes, 5);
@@ -608,6 +610,136 @@ fn constructed_nonempty_snapshot_and_two_pages_replay_across_boundaries() {
             .to_string()
             .contains("cancelled")
     );
+}
+
+pub(super) fn file_history_config(name: &str) -> crate::live::HistoryConfig {
+    let directory = std::env::temp_dir().join(format!(
+        "pvd-native-file-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    crate::live::HistoryConfig {
+        directory,
+        disk_budget_bytes: 32 << 20,
+        segment_target_bytes: 1 << 20,
+        segment_frames: 2,
+        min_free_disk_bytes: 0,
+    }
+}
+
+struct SparseContainer {
+    bytes: Vec<u8>,
+    length: u64,
+    position: u64,
+    read_bytes: usize,
+    largest_read: usize,
+}
+
+impl std::io::Read for SparseContainer {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let length = output
+            .len()
+            .min(self.length.saturating_sub(self.position) as usize);
+        output[..length].fill(0);
+        if let Some(available) = self.bytes.get(self.position as usize..) {
+            let copied = length.min(available.len());
+            output[..copied].copy_from_slice(&available[..copied]);
+        }
+        self.read_bytes += length;
+        self.largest_read = self.largest_read.max(length);
+        self.position += length as u64;
+        Ok(length)
+    }
+}
+
+impl std::io::Seek for SparseContainer {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let position = match from {
+            std::io::SeekFrom::Start(position) => i128::from(position),
+            std::io::SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            std::io::SeekFrom::End(offset) => i128::from(self.length) + i128::from(offset),
+        };
+        self.position = u64::try_from(position)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        Ok(self.position)
+    }
+}
+
+#[test]
+fn constructed_random_access_file_above_512_mib_reads_only_declared_blocks() {
+    let bytes = constructed_container();
+    let memory = Recording::from_bytes(&bytes).unwrap();
+    let config = file_history_config("sparse");
+    let root = config.directory.clone();
+    let mut source = SparseContainer {
+        bytes,
+        length: 513 << 20,
+        position: 0,
+        read_bytes: 0,
+        largest_read: 0,
+    };
+    let (disk, info) =
+        import::read_source_with_progress(&mut source, Some(config), |_, _| true).unwrap();
+    assert_eq!(info.source_bytes, 513 << 20);
+    assert!(info.source_blake3.is_none());
+    assert!(
+        source.read_bytes < 128 << 10,
+        "read {} bytes",
+        source.read_bytes
+    );
+    assert!(source.largest_read <= 64 << 10);
+    assert!(disk.is_disk_backed());
+    assert_eq!(disk.frame_count(), 3);
+    for frame in [0, 1, 2, 2, 1, 0] {
+        assert_eq!(
+            disk.state_at(frame).unwrap(),
+            memory.state_at(frame).unwrap()
+        );
+        assert_eq!(
+            crate::frame_metrics::source_context(&disk, 1, 0).unwrap(),
+            0x111
+        );
+    }
+    disk.verify_replay().unwrap();
+    drop(disk);
+    assert!(root.starts_with(std::env::temp_dir()));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn constructed_disk_import_rejects_cancelled_or_incomplete_history() {
+    let bytes = constructed_container();
+    let config = file_history_config("cancel");
+    let root = config.directory.clone();
+    let failure = import::read_source_with_progress(
+        std::io::Cursor::new(&bytes),
+        Some(config),
+        |event, _| event < 4,
+    )
+    .unwrap_err();
+    assert_eq!(
+        failure.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::Interrupted
+    );
+    if root.exists() {
+        assert!(root.starts_with(std::env::temp_dir()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    let mut config = file_history_config("unavailable");
+    let root = config.directory.clone();
+    std::fs::create_dir(&root).unwrap();
+    let unavailable = root.join("not-a-directory");
+    std::fs::write(&unavailable, b"reserved").unwrap();
+    config.directory = unavailable;
+    let failure =
+        import::read_source_with_progress(std::io::Cursor::new(&bytes), Some(config), |_, _| true)
+            .unwrap_err();
+    assert!(failure.to_string().contains("disk history"), "{failure}");
+    assert!(root.starts_with(std::env::temp_dir()));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

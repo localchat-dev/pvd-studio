@@ -1,15 +1,46 @@
 use super::*;
 
+mod proven;
+pub(super) use proven::{initial_properties, initial_value, proven_initial_properties};
+
 struct Instance<'a> {
     id: u32,
     class: u32,
     body: &'a [u8],
 }
 
+struct SavedInstance {
+    id: u32,
+    class: u32,
+    position: u64,
+    length: usize,
+}
+
 pub(super) fn restore(
     metadata: &Metadata,
     builder: &mut RecordingBuilder,
     backing: &[u8],
+    directory: &[u8],
+    allocation: &mut usize,
+    progress: &mut dyn FnMut() -> bool,
+) -> Result<usize, Error> {
+    let mut source = read_source::Source::new(std::io::Cursor::new(backing))?;
+    restore_from_source(
+        metadata,
+        builder,
+        &mut source,
+        0..backing.len() as u64,
+        directory,
+        allocation,
+        progress,
+    )
+}
+
+pub(super) fn restore_from_source<R: std::io::Read + std::io::Seek>(
+    metadata: &Metadata,
+    builder: &mut RecordingBuilder,
+    source: &mut read_source::Source<R>,
+    backing: std::ops::Range<u64>,
     directory: &[u8],
     allocation: &mut usize,
     progress: &mut dyn FnMut() -> bool,
@@ -21,7 +52,7 @@ pub(super) fn restore(
             "PVD3 snapshot directory length differs from its instance count",
         ));
     }
-    metadata_budget(allocation, count, size_of::<Instance<'_>>() + 96)?;
+    metadata_budget(allocation, count, size_of::<SavedInstance>() + 96)?;
     let mut instances = Vec::with_capacity(count);
     let mut ids = BTreeSet::new();
     for _ in 0..count {
@@ -33,7 +64,12 @@ pub(super) fn restore(
             return Err(error("duplicate PVD3 snapshot instance ID"));
         }
         let position = reader.u64()?;
-        let mut header = Reader::new(checked_range(backing, position, 12)?);
+        let range = import::backing_range(backing.start, position, 12)?;
+        if range.end > backing.end {
+            return Err(error("PVD3 snapshot instance exceeds backing range"));
+        }
+        let header_bytes = source.read_block(range, 12, progress)?;
+        let mut header = Reader::new(&header_bytes);
         let class = header.u32()?;
         if header.u32()? != id {
             return Err(error(
@@ -48,10 +84,16 @@ pub(super) fn restore(
         let start = position
             .checked_add(12)
             .ok_or_else(|| error("PVD3 snapshot instance position overflow"))?;
-        instances.push(Instance {
+        let range = import::backing_range(backing.start, start, length as u64)?;
+        if range.end > backing.end {
+            return Err(error("PVD3 snapshot instance exceeds backing range"));
+        }
+        source.check_range(range.clone())?;
+        instances.push(SavedInstance {
             id,
             class,
-            body: checked_range(backing, start, length as u64)?,
+            position: range.start,
+            length,
         });
     }
     reader.end()?;
@@ -68,11 +110,25 @@ pub(super) fn restore(
         )?;
     }
     for instance in &instances {
-        restore_properties(metadata, builder, instance, progress)?;
+        let body = source.read_block(
+            instance.position..instance.position + instance.length as u64,
+            MAX_METADATA,
+            progress,
+        )?;
+        restore_properties(
+            metadata,
+            builder,
+            &Instance {
+                id: instance.id,
+                class: instance.class,
+                body: &body,
+            },
+            progress,
+        )?;
     }
     if count != 0 {
         builder.recording.diagnostics.push(format!(
-            "PVD3 initial snapshot restored {count} saved instances. Snapshot event-buffer attributes are retained as values and are not replayed as newly received buffers. Profile starts, memory allocations and untimed error history preceding the snapshot are unavailable; analysis contains only subsequent history events."
+            "PVD3 initial snapshot restored {count} saved instances. Snapshot event-buffer attributes are retained as values and are not replayed as newly received buffers. Initial errors retain container identity and array order without receive positions. Earlier profile starts, memory allocations and error occurrences are unavailable; event analysis contains only subsequent history."
         ));
     }
     Ok(count)
@@ -140,47 +196,64 @@ fn restore_properties(
             } else {
                 scalar
             };
-            let id = u64::from(instance.id);
-            let name = builder.string(property.name)?;
-            let object_type = &builder.state.objects[&id].type_name;
-            if name == "events"
-                && matches!(
-                    object_type.as_str(),
-                    "_debugger_::PxProfileZone"
-                        | "_debugger_::PxProfileMemoryEventBuffer"
-                        | "_debugger_::PvdUserRenderer"
-                )
-            {
-                if property.kind != 2
-                    || builder.name(property.datatype)? != "physx3::PvdU8"
-                    || datatype.size != 1
-                {
-                    return Err(error("unsupported PVD3 snapshot event buffer layout"));
-                }
-                value_budget(builder, data.len())?;
-                builder.action(Action::Set(id, name, Value::Bytes(Arc::from(data))))?;
-            } else if metadata.is_error_property(builder, property)? {
-                metadata.validate_error_layout(builder, property)?;
-                let width = metadata_size(metadata, property)?;
-                if !data.len().is_multiple_of(width) || data.len() / width > MAX_ITEMS {
-                    return Err(error("invalid PVD3 snapshot error array length"));
-                }
-                value_budget(
-                    builder,
-                    data.len() / width * size_of::<Value>() + data.len(),
-                )?;
-                let mut values = Vec::with_capacity(data.len() / width);
-                for data in data.chunks_exact(width) {
-                    if !progress() {
-                        return Err(cancelled());
-                    }
-                    values.push(metadata.value(builder, property, data, false)?);
-                }
-                builder.action(Action::Set(id, name, Value::Array(values.into())))?;
-            } else {
-                metadata.set_with_progress(builder, id, property_id, data, progress)?;
+            restore_property(metadata, builder, instance.id, property_id, data, progress)?;
+            if metadata.is_error_property(builder, property)? {
+                metadata.restore_initial_errors(builder, u64::from(instance.id), data, progress)?;
             }
         }
     }
     reader.end()
+}
+
+fn restore_property(
+    metadata: &Metadata,
+    builder: &mut RecordingBuilder,
+    instance_id: u32,
+    property_id: u32,
+    data: &[u8],
+    progress: &mut dyn FnMut() -> bool,
+) -> Result<(), Error> {
+    let property = metadata.property(property_id)?;
+    let datatype = metadata.class(property.datatype_id)?;
+    let id = u64::from(instance_id);
+    let name = builder.string(property.name)?;
+    let object_type = &builder.state.objects[&id].type_name;
+    if name == "events"
+        && matches!(
+            object_type.as_str(),
+            "_debugger_::PxProfileZone"
+                | "_debugger_::PxProfileMemoryEventBuffer"
+                | "_debugger_::PvdUserRenderer"
+        )
+    {
+        if property.kind != 2
+            || builder.name(property.datatype)? != "physx3::PvdU8"
+            || datatype.size != 1
+        {
+            return Err(error("unsupported PVD3 snapshot event buffer layout"));
+        }
+        value_budget(builder, data.len())?;
+        builder.action(Action::Set(id, name, Value::Bytes(Arc::from(data))))?;
+    } else if metadata.is_error_property(builder, property)? {
+        metadata.validate_error_layout(builder, property)?;
+        let width = metadata_size(metadata, property)?;
+        if !data.len().is_multiple_of(width) || data.len() / width > MAX_ITEMS {
+            return Err(error("invalid PVD3 snapshot error array length"));
+        }
+        value_budget(
+            builder,
+            data.len() / width * size_of::<Value>() + data.len(),
+        )?;
+        let mut values = Vec::with_capacity(data.len() / width);
+        for data in data.chunks_exact(width) {
+            if !progress() {
+                return Err(cancelled());
+            }
+            values.push(metadata.value(builder, property, data, false)?);
+        }
+        builder.action(Action::Set(id, name, Value::Array(values.into())))?;
+    } else {
+        metadata.set_with_progress(builder, id, property_id, data, progress)?;
+    }
+    Ok(())
 }

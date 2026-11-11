@@ -351,7 +351,12 @@ fn streaming_state_takes_priority_over_optional_message_cache() {
             .push(group(vec![message(vec![arg(8, 7, 0, 8)], 8)]))
             .unwrap();
         let state_bytes = builder.streaming.as_ref().unwrap().state_bytes;
-        builder.memory_limit = builder.retained_bytes + state_bytes + "label".len() + 96 + 4096;
+        builder.memory_limit = builder.retained_bytes
+            + builder.recording.frame_sources.index_bytes()
+            + state_bytes
+            + "label".len()
+            + 96
+            + 4096;
         builder
     };
     let mut cached = make();

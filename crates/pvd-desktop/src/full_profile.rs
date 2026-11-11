@@ -13,6 +13,7 @@ use std::{
 };
 
 mod disk_index;
+pub(crate) mod timeline;
 pub(crate) use disk_index::IndexSlot;
 
 #[derive(Clone, Copy)]

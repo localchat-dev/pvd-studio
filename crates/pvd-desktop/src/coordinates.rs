@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::i18n::Language;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+mod up_axis;
+pub(crate) use up_axis::UpResolver;
+pub use up_axis::{UpMode, UpResolution, UpSettings};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UpAxis {
     X,
     #[default]
@@ -78,7 +82,19 @@ impl Default for Coordinates {
 
 impl Coordinates {
     pub fn new(up: UpAxis, handedness: Handedness, meters_per_unit: f32) -> Self {
-        let rotation = Mat3::from_quat(Quat::from_rotation_arc(up.vector(), Vec3::Y));
+        Self::from_unit_up(up.vector(), handedness, meters_per_unit)
+    }
+
+    pub fn from_up_vector(up: Vec3, handedness: Handedness, meters_per_unit: f32) -> Option<Self> {
+        Some(Self::from_unit_up(
+            up_axis::unit_vector(up)?,
+            handedness,
+            meters_per_unit,
+        ))
+    }
+
+    fn from_unit_up(up: Vec3, handedness: Handedness, meters_per_unit: f32) -> Self {
+        let rotation = Mat3::from_quat(Quat::from_rotation_arc(up, Vec3::Y));
         let mirrored = handedness == Handedness::Left;
         let reflection = Mat3::from_diagonal(if mirrored {
             Vec3::new(-1.0, 1.0, 1.0)
@@ -180,6 +196,67 @@ mod tests {
                     assert!(normal.abs_diff_eq(expected, 1e-5));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn arbitrary_up_vectors_preserve_geometry_and_axial_vector_transforms() {
+        let point = Vec3::new(1.0, -2.0, 3.0);
+        let angular = Vec3::new(0.5, 2.0, -1.0);
+        let source = Transform::from_translation(Vec3::new(3.0, 2.0, -4.0))
+            .with_rotation(Quat::from_euler(EulerRot::XYZ, 0.2, -0.6, 1.0));
+        for up in [
+            Vec3::new(1.0, 2.0, -3.0),
+            Vec3::splat(f32::MAX),
+            Vec3::new(1e-30, -2e-30, 3e-30),
+        ] {
+            let normalized = up_axis::unit_vector(up).unwrap();
+            for hand in [Handedness::Left, Handedness::Right] {
+                for scale in [1e-6, 0.001, 1.0, 1000.0, 1e6] {
+                    let coordinates = Coordinates::from_up_vector(up, hand, scale).unwrap();
+                    assert!(coordinates.direction(normalized).abs_diff_eq(Vec3::Y, 1e-5));
+                    assert!(
+                        coordinates
+                            .source_point(coordinates.point(point))
+                            .abs_diff_eq(point, 1e-5)
+                    );
+                    assert!(
+                        coordinates
+                            .source_direction(coordinates.direction(angular))
+                            .abs_diff_eq(angular, 1e-5)
+                    );
+                    assert!(
+                        coordinates
+                            .transform(source)
+                            .transform_point(point)
+                            .abs_diff_eq(
+                                coordinates.point(source.transform_point(point)),
+                                1e-4 * scale
+                            )
+                    );
+                    let angular_cross = coordinates
+                        .axial_direction(angular)
+                        .cross(coordinates.point(point));
+                    assert!(
+                        angular_cross
+                            .abs_diff_eq(coordinates.point(angular.cross(point)), 1e-4 * scale)
+                    );
+                    let a = coordinates.direction(source.rotation * Vec3::X);
+                    let b = coordinates.direction(source.rotation * Vec3::Y);
+                    let normal =
+                        a.cross(b).normalize() * if coordinates.mirrored { -1.0 } else { 1.0 };
+                    assert!(
+                        normal.abs_diff_eq(coordinates.direction(source.rotation * Vec3::Z), 1e-5)
+                    );
+                }
+            }
+        }
+        for invalid in [
+            Vec3::ZERO,
+            Vec3::splat(f32::INFINITY),
+            Vec3::new(f32::NAN, 0.0, 1.0),
+        ] {
+            assert!(Coordinates::from_up_vector(invalid, Handedness::Right, 1.0).is_none());
         }
     }
 }

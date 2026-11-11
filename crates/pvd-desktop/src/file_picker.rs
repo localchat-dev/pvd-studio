@@ -9,6 +9,7 @@ pub enum PickerKind {
     OpenCapture,
     SaveCapture,
     SaveClip,
+    SaveNativeCapture,
     SaveRetainedCapture,
     SaveRepx,
     SaveCsv,
@@ -21,6 +22,7 @@ impl PickerKind {
         match self {
             Self::OpenCapture | Self::RecordingDirectory => None,
             Self::SaveCapture | Self::SaveClip => Some("pvdstream"),
+            Self::SaveNativeCapture => Some("pxd2"),
             Self::SaveRetainedCapture => Some("pvdcapture"),
             Self::SaveRepx => Some("repx"),
             Self::SaveCsv | Self::SaveAnalysisCsv => Some("csv"),
@@ -32,6 +34,7 @@ impl PickerKind {
             Self::OpenCapture => language.text("Open physics capture", "打开物理捕获"),
             Self::SaveCapture => language.text("Save captured SDK stream", "保存捕获的 SDK 流"),
             Self::SaveClip => language.text("Save recording clip", "保存录制片段"),
+            Self::SaveNativeCapture => language.text("Save PVD3 recording", "保存 PVD3 录制"),
             Self::SaveRetainedCapture => {
                 language.text("Save retained project capture", "保存保留范围的项目捕获")
             }
@@ -78,7 +81,10 @@ impl FilePicker {
         self.request_with(kind, context, move || {
             if matches!(
                 kind,
-                PickerKind::SaveCapture | PickerKind::SaveClip | PickerKind::SaveRetainedCapture
+                PickerKind::SaveCapture
+                    | PickerKind::SaveClip
+                    | PickerKind::SaveRetainedCapture
+                    | PickerKind::SaveNativeCapture
             ) {
                 crate::atomic_output::create_parent_directory(&initial_path).map_err(|error| {
                     Message::detail(
@@ -301,7 +307,7 @@ mod windows_dialog {
             PickerKind::OpenCapture => vec![
                 (
                     language.text("Physics capture files", "物理捕获文件"),
-                    "*.pvdstream;*.pxd;*.pxd2;*.pvdcapture;*.partial",
+                    "*.pvdstream;*.pvd;*.pxd;*.pxd2;*.pvdcapture;*.partial",
                 ),
                 (language.text("All files", "所有文件"), "*.*"),
             ],
@@ -313,6 +319,7 @@ mod windows_dialog {
                 language.text("Captured SDK stream", "捕获的 SDK 流"),
                 "*.pvdstream",
             )],
+            PickerKind::SaveNativeCapture => vec![("PVD3", "*.pxd2")],
             PickerKind::SaveRepx => vec![("PhysX RepX", "*.repx")],
             PickerKind::SaveCsv | PickerKind::SaveAnalysisCsv => vec![("CSV", "*.csv")],
             PickerKind::RecordingDirectory => Vec::new(),
@@ -520,6 +527,20 @@ mod tests {
             assert!(validate_selection(kind, PathBuf::from("recording.pxd2")).is_err());
         }
         assert!(validate_selection(PickerKind::SaveCsv, PathBuf::from("DATA.CSV")).is_ok());
+        assert_eq!(
+            validate_selection(PickerKind::SaveNativeCapture, PathBuf::from("录制"))
+                .unwrap()
+                .extension()
+                .unwrap(),
+            "pxd2"
+        );
+        assert!(
+            validate_selection(
+                PickerKind::SaveNativeCapture,
+                PathBuf::from("capture.pvdstream")
+            )
+            .is_err()
+        );
         assert!(
             validate_selection(PickerKind::OpenCapture, PathBuf::from("original.pxd2")).is_ok()
         );

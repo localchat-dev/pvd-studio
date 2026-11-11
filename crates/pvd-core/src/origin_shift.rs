@@ -37,12 +37,14 @@ impl Plan {
         }
         self.charge(128)?;
         self.visited.insert(object.id);
-        let property = match object.type_name.as_str() {
-            "physx3::PxRigidStatic"
-            | "physx3::PxRigidDynamic"
-            | "physx3::PxArticulationLink"
-            | "physx3::PxCloth" => "GlobalPose",
-            "physx3::PxParticleSystem" | "physx3::PxParticleFluid" => "Positions",
+        let properties: &[&str] = match object.type_name.as_str() {
+            "physx3::PxRigidStatic" | "physx3::PxArticulationLink" | "physx3::PxCloth" => {
+                &["GlobalPose", "WorldBounds"]
+            }
+            "physx3::PxRigidDynamic" => &["GlobalPose", "WorldBounds", "KinematicTarget"],
+            "physx3::PxParticleSystem" | "physx3::PxParticleFluid" => {
+                &["Positions", "WorldBounds", "ProjectionPlane"]
+            }
             _ => {
                 return Err(error(format!(
                     "unsupported origin-shift actor {}",
@@ -50,15 +52,59 @@ impl Plan {
                 )));
             }
         };
+        for property in properties {
+            self.property(object, property, shift, progress)?;
+        }
+        Ok(())
+    }
+
+    fn property(
+        &mut self,
+        object: &Object,
+        property: &str,
+        shift: [f32; 3],
+        progress: &mut dyn FnMut() -> bool,
+    ) -> Result<(), Error> {
         let Some(value) = object.properties.get(property) else {
             return Ok(());
         };
+        check_progress(progress)?;
         self.charge(256 + property.len())?;
         let value = match (property, value) {
-            ("GlobalPose", Value::Transform { position, rotation }) => Value::Transform {
-                position: std::array::from_fn(|axis| position[axis] - shift[axis]),
-                rotation: *rotation,
-            },
+            ("GlobalPose" | "KinematicTarget", Value::Transform { position, rotation }) => {
+                Value::Transform {
+                    position: std::array::from_fn(|axis| position[axis] - shift[axis]),
+                    rotation: *rotation,
+                }
+            }
+            ("WorldBounds", _) => {
+                let values = scalars::<6>(value, property)?;
+                self.charge(6 * std::mem::size_of::<Value>())?;
+                Value::Array(
+                    values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, value)| Value::F32(value - shift[index % 3]))
+                        .collect::<Vec<_>>()
+                        .into(),
+                )
+            }
+            ("ProjectionPlane", _) => {
+                let [x, y, z, distance] = scalars::<4>(value, property)?;
+                self.charge(4 * std::mem::size_of::<Value>())?;
+                Value::Array(
+                    [
+                        x,
+                        y,
+                        z,
+                        distance + (x * shift[0] + y * shift[1] + z * shift[2]),
+                    ]
+                    .into_iter()
+                    .map(Value::F32)
+                    .collect::<Vec<_>>()
+                    .into(),
+                )
+            }
             ("Positions", Value::Array(values)) => {
                 self.charge(
                     values
@@ -110,6 +156,28 @@ impl Plan {
         }
         Ok(())
     }
+}
+
+fn scalars<const N: usize>(value: &Value, property: &str) -> Result<[f32; N], Error> {
+    let invalid = || {
+        error(format!(
+            "origin-shift {property} requires {N} PhysX scalars"
+        ))
+    };
+    let Value::Array(values) = value else {
+        return Err(invalid());
+    };
+    if values.len() != N {
+        return Err(invalid());
+    }
+    let mut result = [0.0; N];
+    for (target, value) in result.iter_mut().zip(values.iter()) {
+        let Value::F32(value) = value else {
+            return Err(invalid());
+        };
+        *target = *value;
+    }
+    Ok(result)
 }
 
 fn children<'a>(
@@ -164,6 +232,8 @@ impl RecordingBuilder {
         let budget = self
             .memory_limit
             .saturating_sub(self.retained_bytes)
+            .saturating_sub(self.recording.frame_sources.index_bytes())
+            .saturating_sub(self.draw_history_bytes())
             .saturating_sub(state_bytes)
             / 4;
         let mut plan = Plan {

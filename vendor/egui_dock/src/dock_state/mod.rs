@@ -126,8 +126,10 @@ impl<Tab> DockState<Tab> {
     /// Returns the viewport [`Rect`] and the `Tab` inside the focused leaf node or `None` if no node is in focus.
     #[inline]
     pub fn find_active_focused(&mut self) -> Option<(Rect, &mut Tab)> {
-        self.focused_surface
-            .and_then(|surface| self[surface].find_active_focused())
+        let surface = self.focused_surface?;
+        self.get_surface_mut(surface)?
+            .node_tree_mut()?
+            .find_active_focused()
     }
 
     /// Get a mutable borrow to the raw surface from a surface index.
@@ -190,6 +192,22 @@ impl<Tab> DockState<Tab> {
         if let Some(Node::Leaf(leaf)) = self[surface_index].nodes.get_mut(node_index.0) {
             leaf.active = tab_index;
         }
+    }
+
+    /// Activates a tab and expands its containing group and floating window.
+    pub fn reveal_tab(&mut self, location: (SurfaceIndex, NodeIndex, TabIndex)) {
+        let (surface, node, _) = location;
+        self.set_active_tab(location);
+        self[surface][node].set_collapsed(false);
+        self[surface].node_update_collapsed(node);
+        if let Some(window) = self.get_window_state_mut(surface) {
+            window.request_focus();
+            if window.is_minimized() {
+                window.set_new(true);
+                window.toggle_minimized();
+            }
+        }
+        self.set_focused_node_and_surface((surface, node));
     }
 
     /// Sets the currently focused leaf to `node_index` if the node at `node_index` is a leaf.
@@ -289,7 +307,10 @@ impl<Tab> DockState<Tab> {
     #[inline]
     pub fn focused_leaf(&self) -> Option<(SurfaceIndex, NodeIndex)> {
         let surface = self.focused_surface?;
-        self[surface].focused_leaf().map(|leaf| (surface, leaf))
+        self.get_surface(surface)?
+            .node_tree()?
+            .focused_leaf()
+            .map(|leaf| (surface, leaf))
     }
 
     /// Remove a tab at the specified surface, node, and tab index.
@@ -386,7 +407,10 @@ impl<Tab> DockState<Tab> {
     ///
     /// If no leaf is available then a new leaf will be created.
     pub fn push_to_focused_leaf(&mut self, tab: Tab) {
-        let surface_index = self.focused_surface.unwrap_or(SurfaceIndex::main());
+        let surface_index = self
+            .focused_surface
+            .filter(|surface| self.is_surface_valid(*surface))
+            .unwrap_or(SurfaceIndex::main());
         self.ensure_tree(surface_index);
         self[surface_index].push_to_focused_leaf(tab)
     }

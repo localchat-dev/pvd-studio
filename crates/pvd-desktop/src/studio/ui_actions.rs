@@ -15,6 +15,7 @@ pub enum UiAction {
     TogglePlayback,
     ToggleReverse,
     ReturnLive,
+    FrameSource(pvd_core::frame_sources::FrameSourceKey),
     StartListener,
     StopListener,
     ResolveClip { discard: bool },
@@ -97,6 +98,7 @@ impl Studio {
                 UiAction::TogglePlayback => self.toggle_playback(),
                 UiAction::ToggleReverse => self.toggle_reverse(),
                 UiAction::ReturnLive => self.return_to_live(),
+                UiAction::FrameSource(source) => self.select_frame_source(source),
                 UiAction::StartListener => self.start_listener(context.clone()),
                 UiAction::StopListener => self.stop_listener(),
                 UiAction::ResolveClip { discard } => {

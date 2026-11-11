@@ -1,10 +1,12 @@
 use crate::{
     Error,
-    analysis::{Analysis, ProfileSpan},
+    analysis::{Analysis, ProfileSpan, view::ProfileSource},
     analysis_export::{AnalysisExportProgress, ProfileObserver, scan_profile},
     error,
     profile_curves::SourceIdentity,
 };
+
+pub mod native;
 use pvd_protocol::Header;
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -49,20 +51,20 @@ pub struct ThreadEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ThreadCursor {
-    pub identity: SourceIdentity,
+pub struct ThreadCursor<I = SourceIdentity> {
+    pub identity: I,
     pub after: u32,
 }
 
 #[derive(Clone, Debug)]
-pub struct ThreadPageReport {
-    pub identity: SourceIdentity,
+pub struct ThreadPageReport<I = SourceIdentity> {
+    pub identity: I,
     pub clock: ClockRatio,
     pub completed_tick_range: Option<TickRange>,
     pub global_pairing: GlobalPairingStats,
     pub legacy_cuda_buffers: u64,
     pub threads: Vec<ThreadEntry>,
-    pub next: Option<ThreadCursor>,
+    pub next: Option<ThreadCursor<I>>,
     pub estimated_index_bytes: usize,
 }
 
@@ -96,8 +98,8 @@ pub struct EventNames {
 }
 
 #[derive(Clone, Debug)]
-pub struct WindowReport {
-    pub identity: SourceIdentity,
+pub struct WindowReport<I = SourceIdentity> {
+    pub identity: I,
     pub clock: ClockRatio,
     pub request: WindowRequest,
     /// Completion arrival order, with original endpoints and received_frame even outside the window.
@@ -108,6 +110,39 @@ pub struct WindowReport {
     /// Legacy GPU payloads are counted but do not contribute CPU spans or their completed range.
     pub legacy_cuda_buffers: u64,
     pub estimated_index_bytes: usize,
+}
+
+impl<I> ThreadPageReport<I> {
+    pub fn map_identity<J>(self, mut map: impl FnMut(I) -> J) -> ThreadPageReport<J> {
+        ThreadPageReport {
+            identity: map(self.identity),
+            clock: self.clock,
+            completed_tick_range: self.completed_tick_range,
+            global_pairing: self.global_pairing,
+            legacy_cuda_buffers: self.legacy_cuda_buffers,
+            threads: self.threads,
+            next: self.next.map(|cursor| ThreadCursor {
+                identity: map(cursor.identity),
+                after: cursor.after,
+            }),
+            estimated_index_bytes: self.estimated_index_bytes,
+        }
+    }
+}
+
+impl<I> WindowReport<I> {
+    pub fn map_identity<J>(self, map: impl FnOnce(I) -> J) -> WindowReport<J> {
+        WindowReport {
+            identity: map(self.identity),
+            clock: self.clock,
+            request: self.request,
+            spans: self.spans,
+            names: self.names,
+            global_pairing: self.global_pairing,
+            legacy_cuda_buffers: self.legacy_cuda_buffers,
+            estimated_index_bytes: self.estimated_index_bytes,
+        }
+    }
 }
 
 fn check(cancelled: &AtomicBool) -> Result<(), Error> {
@@ -213,6 +248,37 @@ struct Catalog<'a> {
 }
 
 impl Catalog<'_> {
+    fn span(&mut self, span: &ProfileSpan) -> Result<(), Error> {
+        check(self.cancelled)?;
+        extend(&mut self.range, span)?;
+        add(&mut self.stats.complete_spans, 1)?;
+        if let Some(entry) = self.entry(span.thread) {
+            extend(&mut entry.completed_tick_range, span)?;
+            add(&mut entry.complete_spans, 1)?;
+        }
+        Ok(())
+    }
+
+    fn finish_view(&mut self, analysis: &impl ProfileSource, header: &Header) -> Result<(), Error> {
+        self.clock = Some(clock(header)?);
+        for ((_, _, thread, _), count) in analysis.profile_open_counts() {
+            check(self.cancelled)?;
+            let count = count as u64;
+            add(&mut self.stats.open_starts, count)?;
+            if let Some(entry) = self.entry(thread) {
+                add(&mut entry.open_starts, count)?;
+            }
+        }
+        for ((_, _, thread, _), count) in analysis.unmatched_profile_events() {
+            check(self.cancelled)?;
+            add(&mut self.stats.unmatched_stops, count)?;
+            if let Some(entry) = self.entry(thread) {
+                add(&mut entry.unmatched_stops, count)?;
+            }
+        }
+        Ok(())
+    }
+
     fn entry(&mut self, thread: u32) -> Option<&mut ThreadEntry> {
         if self.after.is_some_and(|after| thread <= after) {
             return None;
@@ -237,35 +303,13 @@ impl Catalog<'_> {
 impl ProfileObserver for Catalog<'_> {
     fn batch(&mut self, analysis: &Analysis) -> Result<(), Error> {
         for span in &analysis.spans {
-            check(self.cancelled)?;
-            extend(&mut self.range, span)?;
-            add(&mut self.stats.complete_spans, 1)?;
-            if let Some(entry) = self.entry(span.thread) {
-                extend(&mut entry.completed_tick_range, span)?;
-                add(&mut entry.complete_spans, 1)?;
-            }
+            self.span(span)?;
         }
         Ok(())
     }
 
     fn finish(&mut self, analysis: &Analysis, header: &Header) -> Result<(), Error> {
-        self.clock = Some(clock(header)?);
-        for (&(_, _, thread, _), count) in analysis.open_events() {
-            check(self.cancelled)?;
-            let count = count as u64;
-            add(&mut self.stats.open_starts, count)?;
-            if let Some(entry) = self.entry(thread) {
-                add(&mut entry.open_starts, count)?;
-            }
-        }
-        for (&(_, _, thread, _), &count) in &analysis.unmatched_stop_events {
-            check(self.cancelled)?;
-            add(&mut self.stats.unmatched_stops, count)?;
-            if let Some(entry) = self.entry(thread) {
-                add(&mut entry.unmatched_stops, count)?;
-            }
-        }
-        Ok(())
+        self.finish_view(analysis, header)
     }
 }
 
@@ -341,6 +385,71 @@ fn charge(bytes: &mut usize, extra: usize, limit: usize) -> Result<(), Error> {
 }
 
 impl Window<'_> {
+    fn span(&mut self, span: &ProfileSpan) -> Result<(), Error> {
+        check(self.cancelled)?;
+        add(&mut self.stats.complete_spans, 1)?;
+        if self
+            .request
+            .thread
+            .is_some_and(|thread| span.thread != thread)
+            || self
+                .request
+                .context
+                .is_some_and(|context| span.context != context)
+        {
+            return Ok(());
+        }
+        if span.end < span.start {
+            return Err(error("profile timeline contains a reversed complete span"));
+        }
+        if span.end < self.request.ticks.start || span.start > self.request.ticks.end {
+            return Ok(());
+        }
+        if self.spans.len() == self.request.limits.spans {
+            return Err(limit_error());
+        }
+        if let Entry::Vacant(entry) = self.names.entry((span.zone, span.event)) {
+            charge(&mut self.bytes, NAME_BYTES, self.request.limits.bytes)?;
+            entry.insert(EventNames::default());
+        }
+        self.reserve_span()?;
+        self.spans.push(span.clone());
+        Ok(())
+    }
+
+    fn finish_view(&mut self, analysis: &impl ProfileSource, header: &Header) -> Result<(), Error> {
+        self.clock = Some(clock(header)?);
+        for (_, count) in analysis.profile_open_counts() {
+            check(self.cancelled)?;
+            add(&mut self.stats.open_starts, count as u64)?;
+        }
+        for (_, count) in analysis.unmatched_profile_events() {
+            check(self.cancelled)?;
+            add(&mut self.stats.unmatched_stops, count)?;
+        }
+        for (&(zone, event), names) in &mut self.names {
+            check(self.cancelled)?;
+            if analysis.profile_metadata_ambiguous(zone, event) {
+                return Err(error(format!(
+                    "timeline window has redefined profile metadata at zone {zone}, event {event}"
+                )));
+            }
+            if let Some(zone_name) = analysis.profile_zone_name(zone) {
+                let event_name = analysis.profile_event_name(zone, event);
+                charge(
+                    &mut self.bytes,
+                    zone_name
+                        .len()
+                        .saturating_add(event_name.map_or(0, str::len)),
+                    self.request.limits.bytes,
+                )?;
+                names.zone = Some(zone_name.to_owned());
+                names.event = event_name.map(str::to_owned);
+            }
+        }
+        Ok(())
+    }
+
     fn reserve_span(&mut self) -> Result<(), Error> {
         if self.spans.len() == self.request.limits.spans {
             return Err(limit_error());
@@ -380,67 +489,13 @@ impl Window<'_> {
 impl ProfileObserver for Window<'_> {
     fn batch(&mut self, analysis: &Analysis) -> Result<(), Error> {
         for span in &analysis.spans {
-            check(self.cancelled)?;
-            add(&mut self.stats.complete_spans, 1)?;
-            if self
-                .request
-                .thread
-                .is_some_and(|thread| span.thread != thread)
-                || self
-                    .request
-                    .context
-                    .is_some_and(|context| span.context != context)
-            {
-                continue;
-            }
-            if span.end < span.start {
-                return Err(error("profile timeline contains a reversed complete span"));
-            }
-            if span.end < self.request.ticks.start || span.start > self.request.ticks.end {
-                continue;
-            }
-            if self.spans.len() == self.request.limits.spans {
-                return Err(limit_error());
-            }
-            if let Entry::Vacant(entry) = self.names.entry((span.zone, span.event)) {
-                charge(&mut self.bytes, NAME_BYTES, self.request.limits.bytes)?;
-                entry.insert(EventNames::default());
-            }
-            self.reserve_span()?;
-            self.spans.push(span.clone());
+            self.span(span)?;
         }
         Ok(())
     }
 
     fn finish(&mut self, analysis: &Analysis, header: &Header) -> Result<(), Error> {
-        self.clock = Some(clock(header)?);
-        for (_, count) in analysis.open_events() {
-            check(self.cancelled)?;
-            add(&mut self.stats.open_starts, count as u64)?;
-        }
-        for &count in analysis.unmatched_stop_events.values() {
-            check(self.cancelled)?;
-            add(&mut self.stats.unmatched_stops, count)?;
-        }
-        for (&(zone, event), names) in &mut self.names {
-            check(self.cancelled)?;
-            if analysis.profile_metadata_ambiguous(zone, event) {
-                return Err(error(format!(
-                    "timeline window has redefined profile metadata at zone {zone}, event {event}"
-                )));
-            }
-            if let Some(zone) = analysis.zones.get(&zone) {
-                let name = zone.events.get(&event);
-                charge(
-                    &mut self.bytes,
-                    zone.name.len().saturating_add(name.map_or(0, String::len)),
-                    self.request.limits.bytes,
-                )?;
-                names.zone = Some(zone.name.clone());
-                names.event = name.cloned();
-            }
-        }
-        Ok(())
+        self.finish_view(analysis, header)
     }
 }
 

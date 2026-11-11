@@ -67,6 +67,22 @@ pub enum Primitive {
 pub(crate) struct RenderDecoder {
     instance: u64,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RenderBufferSummary {
+    pub(crate) primitive_count: usize,
+    pub(crate) selected_instance: Option<u64>,
+    pub(crate) uses_previous_instance: bool,
+}
+
+pub(crate) fn scan_context(
+    data: &[u8],
+    endian: Endian,
+    max_retained_bytes: usize,
+    progress: &mut dyn FnMut() -> bool,
+) -> Result<RenderBufferSummary, Error> {
+    Reader::new(data, endian, progress).validate(max_retained_bytes)
+}
 impl RenderDecoder {
     pub(crate) fn decode(&mut self, data: &[u8], endian: Endian) -> Result<Vec<Primitive>, Error> {
         self.decode_bounded(data, endian, usize::MAX, &mut || true)
@@ -79,9 +95,9 @@ impl RenderDecoder {
         max_retained_bytes: usize,
         progress: &mut dyn FnMut() -> bool,
     ) -> Result<Vec<Primitive>, Error> {
-        let count = Reader::new(data, endian, progress).validate(max_retained_bytes)?;
+        let summary = scan_context(data, endian, max_retained_bytes, progress)?;
         let mut r = Reader::new(data, endian, progress);
-        let mut output = Vec::with_capacity(count);
+        let mut output = Vec::with_capacity(summary.primitive_count);
         let mut next_instance = self.instance;
         while r.pos < data.len() {
             let instance = next_instance;
@@ -184,14 +200,17 @@ impl<'a, 'p> Reader<'a, 'p> {
         }
     }
 
-    fn validate(&mut self, max_retained_bytes: usize) -> Result<usize, Error> {
+    fn validate(&mut self, max_retained_bytes: usize) -> Result<RenderBufferSummary, Error> {
         let mut count = 0usize;
         let mut text_bytes = 0usize;
+        let mut selected_instance = None;
+        let mut uses_previous_instance = false;
         while self.pos < self.bytes.len() {
+            let previous_count = count;
             let kind = self.u8()?;
             match kind {
                 1 => {
-                    self.take(8)?;
+                    selected_instance = Some(self.u64()?);
                 }
                 2..=4 => count += self.skip_array(16 * (kind as usize - 1))?,
                 5 => {
@@ -234,6 +253,7 @@ impl<'a, 'p> Reader<'a, 'p> {
                     )));
                 }
             }
+            uses_previous_instance |= count != previous_count && selected_instance.is_none();
             if count > 1_000_000 {
                 return Err(error("renderer buffer exceeds one million primitives"));
             }
@@ -246,7 +266,11 @@ impl<'a, 'p> Reader<'a, 'p> {
                 return Err(error("renderer decoded primitives exceed memory budget"));
             }
         }
-        Ok(count)
+        Ok(RenderBufferSummary {
+            primitive_count: count,
+            selected_instance,
+            uses_previous_instance,
+        })
     }
 
     fn skip_array(&mut self, stride: usize) -> Result<usize, Error> {
@@ -367,6 +391,108 @@ impl<'a, 'p> Reader<'a, 'p> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TRIANGLE: &[u8] = &[
+        4, 1, 0, 0, 0, 0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64, 68, 51, 34, 17, 0, 0, 128, 64, 0,
+        0, 160, 64, 0, 0, 192, 64, 136, 119, 102, 85, 0, 0, 224, 64, 0, 0, 0, 65, 0, 0, 16, 65,
+        204, 187, 170, 153,
+    ];
+
+    #[test]
+    fn context_scan_preserves_explicit_zero_and_primitive_order() {
+        for bytes in [&[][..], &[11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]] {
+            assert_eq!(
+                scan_context(bytes, Endian::Little, 0, &mut || true).unwrap(),
+                RenderBufferSummary {
+                    primitive_count: 0,
+                    selected_instance: None,
+                    uses_previous_instance: false,
+                }
+            );
+        }
+        for instance in [0u64, 17] {
+            let mut bytes = vec![1];
+            bytes.extend(instance.to_le_bytes());
+            bytes.extend(TRIANGLE);
+            let summary = scan_context(&bytes, Endian::Little, usize::MAX, &mut || true).unwrap();
+            assert_eq!(summary.primitive_count, 1);
+            assert_eq!(summary.selected_instance, Some(instance));
+            assert!(!summary.uses_previous_instance);
+            let mut decoder = RenderDecoder::default();
+            let values = decoder.decode(&bytes, Endian::Little).unwrap();
+            assert!(matches!(
+                values.as_slice(),
+                [Primitive::Triangle { instance: selected, positions, colors }]
+                    if *selected == instance
+                        && *positions == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
+                        && *colors == [0x11223344, 0x55667788, 0x99aabbcc]
+            ));
+        }
+        let mut bytes = TRIANGLE.to_vec();
+        bytes.extend([1, 18, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            scan_context(&bytes, Endian::Little, usize::MAX, &mut || true).unwrap(),
+            RenderBufferSummary {
+                primitive_count: 1,
+                selected_instance: Some(18),
+                uses_previous_instance: true,
+            }
+        );
+    }
+
+    #[test]
+    fn context_scan_honors_endian_without_allocating_primitives() {
+        let bytes = [1, 1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(
+            scan_context(&bytes, Endian::Big, 0, &mut || true).unwrap(),
+            RenderBufferSummary {
+                primitive_count: 0,
+                selected_instance: Some(0x0102030405060708),
+                uses_previous_instance: false,
+            }
+        );
+        assert_eq!(
+            scan_context(&bytes, Endian::Little, 0, &mut || true)
+                .unwrap()
+                .selected_instance,
+            Some(0x0807060504030201)
+        );
+    }
+
+    #[test]
+    fn context_scan_checks_budget_and_cancellation_across_captured_commands() {
+        let mut bytes = vec![2];
+        bytes.extend(100_000u32.to_le_bytes());
+        bytes.resize(bytes.len() + 100_000 * 16, 0);
+        let commands = TRIANGLE.repeat(10_000);
+        let mut calls = 0;
+        let error = scan_context(&commands, Endian::Little, usize::MAX, &mut || {
+            calls += 1;
+            calls < 3
+        })
+        .unwrap_err();
+        assert_eq!(calls, 3);
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(
+            scan_context(&bytes, Endian::Little, 1024, &mut || true)
+                .unwrap_err()
+                .to_string()
+                .contains("memory budget")
+        );
+        assert!(
+            scan_context(
+                &bytes[..bytes.len() - 1],
+                Endian::Little,
+                usize::MAX,
+                &mut || true
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn bulk_primitives_preserve_color_and_instance_across_flushes() {
         let mut d = RenderDecoder::default();

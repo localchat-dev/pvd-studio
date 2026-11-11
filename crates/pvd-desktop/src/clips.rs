@@ -354,6 +354,9 @@ pub fn show(ui: &mut egui::Ui, studio: &mut Studio) {
 
 fn show_contents(ui: &mut egui::Ui, studio: &mut Studio) {
     crate::recording_export::retained_controls(ui, studio);
+    if studio.is_native_recording() {
+        return;
+    }
     let language = studio.prefs.language;
     let count = studio.count();
     let can_export = studio.can_trim_capture();

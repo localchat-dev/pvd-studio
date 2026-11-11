@@ -7,6 +7,9 @@ use crate::{
 use bevy_egui::egui;
 use std::{collections::BTreeMap, sync::atomic::Ordering};
 
+#[cfg(test)]
+mod context_menu_tests;
+
 const MUTED: egui::Color32 = egui::Color32::from_rgb(151, 167, 184);
 const MAX_MARKERS: usize = 32;
 
@@ -22,12 +25,19 @@ struct Marker {
     frame: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RectangleDrag {
+    start: egui::Pos2,
+    button: egui::PointerButton,
+    cancelled: bool,
+}
+
 #[derive(Clone, Default)]
 struct View {
     bounds: Option<Bounds>,
     auto_fit: bool,
     box_zoom: bool,
-    box_start: Option<egui::Pos2>,
+    box_drag: Option<RectangleDrag>,
     markers: Vec<Marker>,
 }
 
@@ -125,6 +135,55 @@ fn nearest_sample(curve: &Curve, frame: f64) -> Option<(usize, f64)> {
         })
 }
 
+fn secondary_rectangle_input(
+    input: &egui::InputState,
+    visible: egui::Rect,
+) -> (bool, Option<egui::Pos2>) {
+    let mut active = !input.pointer.button_pressed(egui::PointerButton::Secondary);
+    let mut cancelled = !input.focused;
+    for event in &input.events {
+        if matches!(
+            event,
+            egui::Event::PointerButton {
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                ..
+            }
+        ) {
+            active = true;
+        }
+        if !active {
+            continue;
+        }
+        match event {
+            egui::Event::PointerMoved(position) => cancelled |= !visible.contains(*position),
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                ..
+            } => {
+                cancelled |= !visible.contains(*pos);
+                if *button == egui::PointerButton::Secondary && !*pressed {
+                    return (cancelled, Some(*pos));
+                }
+            }
+            egui::Event::PointerGone | egui::Event::WindowFocused(false) => cancelled = true,
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                pressed: true,
+                ..
+            } => cancelled = true,
+            _ => (),
+        }
+    }
+    cancelled |= !input
+        .pointer
+        .hover_pos()
+        .is_some_and(|point| visible.contains(point));
+    (cancelled, None)
+}
+
 fn gesture(
     ui: &egui::Ui,
     response: &egui::Response,
@@ -132,17 +191,100 @@ fn gesture(
     view: &mut View,
     fitted: Bounds,
 ) -> Option<f64> {
-    if ui.ctx().wants_keyboard_input() || rect.width() < 1.0 || rect.height() < 1.0 {
+    let rectangular = view.box_zoom || ui.input(|input| input.modifiers.shift);
+    let visible = rect.intersect(ui.clip_rect());
+    let inside = ui.input(|input| {
+        input
+            .pointer
+            .hover_pos()
+            .is_some_and(|point| visible.contains(point))
+    });
+    let secondary_start = response.drag_started_by(egui::PointerButton::Secondary);
+    if secondary_start && inside {
+        egui::Popup::close_id(ui.ctx(), egui::Popup::default_response_id(response));
+    }
+    let unavailable = ui.ctx().wants_keyboard_input()
+        || rect.width() < 1.0
+        || rect.height() < 1.0
+        || response.context_menu_opened();
+    let blocked =
+        unavailable || ui.input(|input| !input.focused || input.key_pressed(egui::Key::Escape));
+    if view
+        .box_drag
+        .is_some_and(|drag| ui.input(|input| input.pointer.button_pressed(drag.button)))
+    {
+        view.box_drag = None;
+    }
+    if view.box_drag.is_none() && !blocked {
+        let button = if secondary_start {
+            Some(egui::PointerButton::Secondary)
+        } else if rectangular && response.drag_started_by(egui::PointerButton::Primary) {
+            Some(egui::PointerButton::Primary)
+        } else {
+            None
+        };
+        if let Some(button) = button
+            && let Some(start) = ui
+                .input(|input| input.pointer.press_origin())
+                .filter(|point| visible.contains(*point))
+        {
+            view.box_drag = Some(RectangleDrag {
+                start: start.clamp(rect.min, rect.max),
+                button,
+                cancelled: false,
+            });
+        }
+    }
+    if let Some(mut drag) = view.box_drag.take() {
+        let mut end = response.interact_pointer_pos();
+        if drag.button == egui::PointerButton::Secondary {
+            let (cancelled, released_at) =
+                ui.input(|input| secondary_rectangle_input(input, visible));
+            drag.cancelled |= unavailable || cancelled;
+            end = released_at.or(end);
+        } else {
+            drag.cancelled |= blocked;
+        }
+        let (down, released) = ui.input(|input| {
+            (
+                input.pointer.button_down(drag.button),
+                input.pointer.button_released(drag.button),
+            )
+        });
+        if released || !down {
+            if !drag.cancelled
+                && response.drag_stopped_by(drag.button)
+                && let Some(end) = end
+            {
+                let end = end.clamp(rect.min, rect.max);
+                if (drag.start.x - end.x).abs() >= 4.0 && (drag.start.y - end.y).abs() >= 4.0 {
+                    let bounds = view.bounds.unwrap_or(fitted);
+                    let a = data_position(rect, bounds, drag.start);
+                    let b = data_position(rect, bounds, end);
+                    let bounds = Bounds {
+                        x: [a[0].min(b[0]), a[0].max(b[0])],
+                        y: [a[1].min(b[1]), a[1].max(b[1])],
+                    };
+                    if valid_bounds(bounds) {
+                        view.bounds = Some(bounds);
+                        view.auto_fit = false;
+                    }
+                }
+            }
+        } else {
+            view.box_drag = Some(drag);
+        }
+        return None;
+    }
+    if blocked
+        || response.secondary_clicked()
+        || response.drag_stopped_by(egui::PointerButton::Secondary)
+        || ui.input(|input| input.pointer.button_down(egui::PointerButton::Secondary))
+    {
         return None;
     }
     let mut bounds = view.bounds.unwrap_or(fitted);
-    let rectangular = view.box_zoom || ui.input(|input| input.modifiers.shift);
-    if response.drag_started() && rectangular {
-        view.box_start = ui
-            .input(|input| input.pointer.press_origin())
-            .map(|point| point.clamp(rect.min, rect.max));
-    }
-    if response.dragged() && view.box_start.is_none() {
+    if response.dragged_by(egui::PointerButton::Primary) {
         let delta = ui.input(|input| input.pointer.delta());
         let x_offset = -(delta.x as f64) / rect.width() as f64;
         let y_offset = delta.y as f64 / rect.height() as f64;
@@ -157,21 +299,6 @@ fn gesture(
             ],
         };
         view.auto_fit = false;
-    }
-    if response.drag_stopped()
-        && let Some(start) = view.box_start.take()
-        && let Some(end) = response.interact_pointer_pos()
-    {
-        let end = end.clamp(rect.min, rect.max);
-        if (start.x - end.x).abs() >= 4.0 && (start.y - end.y).abs() >= 4.0 {
-            let a = data_position(rect, bounds, start);
-            let b = data_position(rect, bounds, end);
-            bounds = Bounds {
-                x: [a[0].min(b[0]), a[0].max(b[0])],
-                y: [a[1].min(b[1]), a[1].max(b[1])],
-            };
-            view.auto_fit = false;
-        }
     }
     if response.hovered() {
         let scroll = ui.input(|input| input.smooth_scroll_delta.y) as f64;
@@ -755,11 +882,11 @@ fn show_content(ui: &mut egui::Ui, studio: &mut Studio) {
             egui::Stroke::new(1.0, egui::Color32::WHITE),
         );
     }
-    if let Some(start) = view.box_start
+    if let Some(drag) = view.box_drag.filter(|drag| !drag.cancelled)
         && let Some(end) = response.interact_pointer_pos()
     {
         painter.rect_stroke(
-            egui::Rect::from_two_pos(start, end.clamp(rect.min, rect.max)),
+            egui::Rect::from_two_pos(drag.start, end.clamp(rect.min, rect.max)),
             0.0,
             egui::Stroke::new(1.0, egui::Color32::WHITE),
             egui::StrokeKind::Inside,
@@ -770,6 +897,11 @@ fn show_content(ui: &mut egui::Ui, studio: &mut Studio) {
         let label = match curve.spec.source {
             crate::curve::Source::Property => format!(
                 "{} #{}",
+                crate::curve::component_label(&curve.spec.component_name, language),
+                curve.id
+            ),
+            crate::curve::Source::PropertyElement { index, .. } => format!(
+                "[{index}].{} #{}",
                 crate::curve::component_label(&curve.spec.component_name, language),
                 curve.id
             ),
@@ -831,8 +963,8 @@ fn show_content(ui: &mut egui::Ui, studio: &mut Studio) {
     }
     if let Some(point) = response.hover_pos() {
         let frame = data_position(rect, bounds, point)[0];
-        response.on_hover_ui(|ui| {
-            ui.label(language.text("Click: jump and mark · Double-click: nearest sample · Drag: pan · Wheel: zoom · Shift+drag: rectangle zoom", "单击：跳帧并标记 · 双击：跳到最近采样 · 拖动：平移 · 滚轮：缩放 · Shift+拖动：矩形缩放"));
+        response.clone().on_hover_ui(|ui| {
+            ui.label(language.text("Click: jump and mark · Double-click: nearest sample · Drag: pan · Wheel: zoom · Right-drag / Shift+drag: rectangle zoom · Right-click: export", "单击：跳帧并标记 · 双击：跳到最近采样 · 拖动：平移 · 滚轮：缩放 · 右键拖动 / Shift+拖动：矩形缩放 · 右键单击：导出"));
             for curve in &curves {
                 if let Some((frame, value)) = nearest_sample(curve, frame) {
                     let count = curve.data.as_ref().and_then(|data| data.samples.binary_search_by_key(&frame, |(frame, _)| *frame).ok().and_then(|index| data.occurrence_counts.get(index))).map(|count| format!(" · {} {count}", language.text("occurrences", "次数"))).unwrap_or_default();
@@ -857,6 +989,26 @@ fn show_content(ui: &mut egui::Ui, studio: &mut Studio) {
     if !compact {
         export_controls(ui, studio, false);
     }
+    response.context_menu(|ui| {
+        ui.set_max_width(420.0);
+        if let Some(curve) = studio
+            .curves
+            .curves
+            .iter()
+            .find(|curve| Some(curve.id) == studio.curves.selected)
+        {
+            ui.label(format!(
+                "{} #{}",
+                language.text("Selected curve", "当前曲线"),
+                curve.id
+            ));
+            ui.add(egui::Label::new(curve.label.text(language)).wrap());
+            ui.separator();
+            export_controls(ui, studio, true);
+        } else {
+            ui.label(language.text("Select a curve to export.", "请选择要导出的曲线。"));
+        }
+    });
 }
 
 fn sampling_controls(ui: &mut egui::Ui, studio: &mut Studio) {
@@ -896,11 +1048,9 @@ fn sampling_controls(ui: &mut egui::Ui, studio: &mut Studio) {
 
 fn export_controls(ui: &mut egui::Ui, studio: &mut Studio, menu: bool) {
     let language = studio.prefs.language;
-    let exportable = studio
-        .curves
-        .curves
-        .iter()
-        .any(|curve| Some(curve.id) == studio.curves.selected && curve.data.is_some());
+    let exportable = studio.curves.curves.iter().any(|curve| {
+        Some(curve.id) == studio.curves.selected && curve.data.is_some() && !curve.pending
+    });
     ui.horizontal_wrapped(|ui| {
         ui.add(egui::TextEdit::singleline(&mut studio.curve_export_path).desired_width(180.0));
         if ui
@@ -1212,7 +1362,7 @@ mod tests {
         {
             assert!((actual - expected).abs() < 1e-5);
         }
-        assert!(view.box_start.is_none() && !view.auto_fit);
+        assert!(view.box_drag.is_none() && !view.auto_fit);
     }
 
     #[test]

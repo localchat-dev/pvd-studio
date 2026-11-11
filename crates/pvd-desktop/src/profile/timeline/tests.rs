@@ -16,7 +16,7 @@ fn memory(bytes: Vec<u8>) -> (Source, Arc<Recording>) {
     (Source::memory(Arc::new(bytes), identity), recording)
 }
 
-fn poll(
+pub(super) fn poll(
     state: &mut State,
     source: &Source,
     recording: &Arc<Recording>,
@@ -38,7 +38,7 @@ fn poll(
     );
 }
 
-fn wait(
+pub(super) fn wait(
     state: &mut State,
     source: &Source,
     recording: &Arc<Recording>,
@@ -127,11 +127,11 @@ fn hidden_complete_window_releases_its_analysis_on_session_close() {
 fn relative_time_requests_keep_integer_origin_closed_endpoints_and_exact_context() {
     let first = (1u64 << 60) + 7;
     let overview = Overview {
-        identity: pvd_core::profile_curves::SourceIdentity {
+        identity: Identity::Sdk(pvd_core::profile_curves::SourceIdentity {
             blake3: [1; 32],
             bytes: 0,
             frames: 0,
-        },
+        }),
         clock: ClockRatio {
             numerator: 1000,
             denominator: 1,
@@ -377,7 +377,7 @@ fn actual_thread_catalog_and_window_readers_cancel_on_close_shutdown_and_source_
                     state.set_read_mode(ReadMode::Streaming);
                 }
                 state.overview = Some(Overview {
-                    identity: catalog.identity,
+                    identity: catalog.identity.clone(),
                     clock: catalog.clock,
                     range: catalog.completed_tick_range,
                     stats: catalog.global_pairing,
@@ -425,10 +425,7 @@ fn actual_thread_catalog_and_window_readers_cancel_on_close_shutdown_and_source_
             if action == 2 {
                 let (next, recording) = memory(capture(2, "draw"));
                 wait(&mut state, &next, &recording, &context, &jobs, 2);
-                assert_ne!(
-                    state.overview.as_ref().unwrap().identity.blake3,
-                    *blake3::hash(&capture(2, "work")).as_bytes()
-                );
+                assert_ne!(state.overview.as_ref().unwrap().identity, catalog.identity);
                 assert!(state.window.prepared.is_none());
             }
         }
@@ -873,7 +870,7 @@ fn file_scan_choice_and_error_recovery_keep_narrow_tracks_visible() {
             ));
             let source = studio.complete_profile_source().unwrap();
             assert!(source.can_rebuild_cpu_index());
-            let source = source.with_cpu_index(path.clone(), index.clone());
+            let source = Source::from(source.with_cpu_index(path.clone(), index.clone()));
             let id = std::cell::Cell::new(None);
             let draw = |events, studio: &mut Studio| {
                 context.run(

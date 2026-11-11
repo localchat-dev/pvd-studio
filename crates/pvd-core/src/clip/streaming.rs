@@ -1,6 +1,6 @@
 use super::{
-    RendererTransaction, ValidationState, encode_append, encode_set, insert_patch,
-    renderer_instance_state, validate_renderer_datatype,
+    RendererPatch, RendererTransaction, SectionPlan, ValidationState, encode_append, encode_set,
+    frame_section, insert_patch, renderer_instance_state, validate_renderer_datatype,
 };
 use crate::{Error, RecordingBuilder, error};
 use pvd_protocol::{Decoder, Endian, Event, EventGroup, Header, Limits, rewrite::map_group_events};
@@ -33,6 +33,7 @@ pub struct TrimReport {
 }
 
 /// Writes SDK communication bytes; publish the output only after this returns `Ok`.
+/// The inclusive range follows known section End events in capture order.
 /// Cancellation and validation errors can leave partial bytes in the supplied writer.
 pub fn trim_scene_frames_streaming<R: Read + Seek, W: Write + ?Sized>(
     source: &mut R,
@@ -42,19 +43,28 @@ pub fn trim_scene_frames_streaming<R: Read + Seek, W: Write + ?Sized>(
     mut progress: impl FnMut(TrimProgress) -> bool,
 ) -> Result<TrimReport, Error> {
     if first > last {
-        return Err(error("invalid inclusive scene frame range"));
+        return Err(error("invalid inclusive frame range"));
     }
     let mut scan = Scan::new(source, TrimPhase::Inspect, &mut progress)?;
     let header_bytes = scan.header_bytes;
     let header = scan.header.clone();
     let mut builder = validator(header.clone());
     let mut plan = RendererPlan::default();
+    let mut sections = SectionPlan::default();
     let mut ordinal = 0usize;
     while let Some((_, group)) = scan.next(&mut progress)? {
         for event in group.events {
             if ordinal.is_multiple_of(512) {
                 scan.notify(&mut progress)?;
             }
+            sections.observe(
+                &event,
+                &builder.strings,
+                ordinal,
+                frames(&builder),
+                first,
+                last,
+            )?;
             if frames(&builder) < first {
                 plan.observe(
                     &event,
@@ -88,6 +98,12 @@ pub fn trim_scene_frames_streaming<R: Read + Seek, W: Write + ?Sized>(
     drop(scan);
     drop(builder);
     plan.transactions.clear();
+    sections.finish();
+    plan.patches.retain(|_, patch| {
+        sections
+            .renderer_boundary
+            .is_some_and(|(_, end)| patch.completed <= end)
+    });
 
     let mut scan = Scan::new(source, TrimPhase::Export, &mut progress)?;
     if scan.total != source_bytes || scan.header_bytes != header_bytes {
@@ -113,7 +129,8 @@ pub fn trim_scene_frames_streaming<R: Read + Seek, W: Write + ?Sized>(
                 if ordinal.is_multiple_of(512) {
                     scan.notify(&mut progress)?;
                 }
-                let patch = plan.patches.get(&ordinal);
+                let event_ordinal = ordinal;
+                let patch = plan.patches.get(&event_ordinal).map(|patch| &patch.data);
                 ordinal = ordinal
                     .checked_add(1)
                     .ok_or_else(|| error("event ordinal overflow"))?;
@@ -123,18 +140,21 @@ pub fn trim_scene_frames_streaming<R: Read + Seek, W: Write + ?Sized>(
                 let frame = frames(&source_state);
                 let boundary = match event {
                     Event::BeginSection { name, .. } | Event::EndSection { name, .. } => {
-                        source_state
-                            .strings
-                            .get(name)
-                            .is_some_and(|name| name == "frame")
+                        frame_section(&source_state.strings, *name).is_some()
                     }
                     _ => false,
                 };
-                let keep = !boundary || frame >= first;
+                let keep = if boundary && matches!(event, Event::BeginSection { .. }) {
+                    sections.retain_begin(event_ordinal, frame >= first)
+                } else {
+                    !boundary || frame >= first
+                };
                 if boundary && matches!(event, Event::EndSection { .. }) && keep {
+                    source_state.prepare_end_view(event)?;
+                    output_state.prepare_end_view(event)?;
                     if source_state.state != output_state.state {
                         return Err(error(format!(
-                            "trim cannot preserve complete scene state at source frame {frame}; renderer raw data or another boundary dependency is not representable"
+                            "trim cannot preserve complete scene state at source frame {frame}; the source rendering window, renderer raw data or another boundary dependency is not representable"
                         )));
                     }
                     done = frame == last;
@@ -376,7 +396,7 @@ fn check_progress(
 struct RendererPlan {
     renderers: BTreeSet<u64>,
     transactions: BTreeMap<u64, RendererTransaction>,
-    patches: BTreeMap<usize, Vec<u8>>,
+    patches: BTreeMap<usize, RendererPatch>,
     pending_bytes: usize,
     pending_appends: usize,
 }
@@ -417,6 +437,7 @@ impl RendererPlan {
                 let data = renderer_instance_state(data, endian)?;
                 insert_patch(
                     &mut self.patches,
+                    ordinal,
                     ordinal,
                     encode_set(*id, *property, *datatype, &data, endian),
                 )?;
@@ -464,13 +485,19 @@ impl RendererPlan {
                     self.pending_bytes -= transaction.data.len();
                     self.pending_appends -= transaction.appends.len();
                     let filtered = renderer_instance_state(&transaction.data, endian)?;
+                    let completed = ordinal;
                     for (index, ordinal) in transaction.appends.iter().enumerate() {
                         let data = if index + 1 == transaction.appends.len() {
                             &filtered[..]
                         } else {
                             &[]
                         };
-                        insert_patch(&mut self.patches, *ordinal, encode_append(data, endian))?;
+                        insert_patch(
+                            &mut self.patches,
+                            *ordinal,
+                            completed,
+                            encode_append(data, endian),
+                        )?;
                     }
                 }
             }

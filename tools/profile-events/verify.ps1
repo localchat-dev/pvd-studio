@@ -42,7 +42,9 @@ try {
         $previous = [Environment]::GetEnvironmentVariable('PVD_PROFILE_EVENTS_CAPTURE', 'Process')
         try {
             [Environment]::SetEnvironmentVariable('PVD_PROFILE_EVENTS_CAPTURE', $capture, 'Process')
-            & cargo test --locked -p pvd-core --test profile_curves -- --include-ignored
+            & cargo test --locked -p pvd-core --test profile_curves
+            if ($LASTEXITCODE -ne 0) { throw 'Profile curve tests failed.' }
+            & cargo test --locked -p pvd-core --test profile_curves sdk_arbitrary_events_preserve_inclusive_timing_thread_context_order_and_missing_windows -- --ignored --exact
             if ($LASTEXITCODE -ne 0) { throw 'Independent SDK profile event comparison failed.' }
             & cargo build --locked -p pvd-cli
             if ($LASTEXITCODE -ne 0) { throw 'CLI build failed.' }

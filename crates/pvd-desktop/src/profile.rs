@@ -19,6 +19,10 @@ use std::{
     time::Instant,
 };
 
+#[cfg(all(test, windows))]
+pub(crate) mod analysis_probe;
+#[cfg(test)]
+mod interaction_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 mod pages;
@@ -34,6 +38,7 @@ pub(crate) fn sync_session(context: &egui::Context, epoch: u64) -> bool {
         // Hidden panels cannot observe a source change through their draw path.
         data.remove_by_type::<ViewState>();
         data.remove_by_type::<EventView>();
+        data.remove_by_type::<SpanMenu>();
         timeline::clear_session(data);
         data.insert_temp(id, epoch);
         true
@@ -60,10 +65,10 @@ pub(crate) fn prepare_thread_window_render(
     context: &egui::Context,
     studio: &Studio,
 ) -> Result<bool, Message> {
-    if studio.complete_profile_source().is_none() {
+    if studio.complete_timeline_source().is_none() {
         return Err(Message::new(
-            "Thread-window render checks require an opened complete SDK file.",
-            "线程时间窗渲染检查需要已打开的完整 SDK 文件。",
+            "Thread-window render checks require an opened complete recording.",
+            "线程时间窗渲染检查需要已打开的完整录制。",
         ));
     }
     timeline::prepare_render(context, studio.profile_view_epoch)
@@ -376,7 +381,16 @@ fn interact(
     if response.drag_stopped() {
         state.anchor = None;
     }
-    if response.hovered() && (axis || ui.input(|input| input.modifiers.ctrl)) {
+    if response.hovered() && ui.input(|input| input.modifiers.shift) {
+        let scroll =
+            ui.input(|input| input.smooth_scroll_delta.x + input.smooth_scroll_delta.y) as f64;
+        if scroll != 0.0 {
+            ui.input_mut(|input| input.smooth_scroll_delta = egui::Vec2::ZERO);
+            let start = (window[0] - scroll / rect.width() as f64 * width)
+                .clamp(0.0, (total - width).max(0.0));
+            *window = [start, start + width];
+        }
+    } else if response.hovered() && (axis || ui.input(|input| input.modifiers.ctrl)) {
         let scroll = ui.input(|input| input.smooth_scroll_delta.y) as f64;
         if scroll != 0.0 {
             ui.input_mut(|input| input.smooth_scroll_delta.y = 0.0);
@@ -428,7 +442,7 @@ pub fn show(ui: &mut egui::Ui, studio: &mut Studio) {
         return;
     };
     let compact = ui.available_height() < 280.0;
-    let complete_source = studio.complete_profile_source();
+    let complete_source = studio.complete_timeline_source();
     if !compact {
         crate::recording_export::show_analysis_controls(
             ui,
@@ -474,7 +488,7 @@ pub fn show(ui: &mut egui::Ui, studio: &mut Studio) {
         ui.selectable_value(&mut studio.profile_events_view, false, language.text("Threads", "线程时间线"));
         ui.selectable_value(&mut studio.profile_events_view, true, language.text("Event curves", "事件曲线"));
         if !compact {
-            if studio.analysis_ready() { ui.label(format!(
+            if complete_source.is_none() && studio.analysis_ready() { ui.label(format!(
                 "{} {} · {} {} · {} {}", analysis.profile_summary().complete_spans, language.text("spans", "个区间"),
                 analysis.profile_summary().open_spans, language.text("open", "个未结束"),
                 analysis.profile_summary().unmatched_stops, language.text("unmatched stops", "个未匹配结束事件")
@@ -501,7 +515,7 @@ pub fn show(ui: &mut egui::Ui, studio: &mut Studio) {
                 {
                     ui.monospace(format!("{} 0x{:x} · {} {}", language.text("Reference Scene", "参考 Scene"), scene.id, language.text("generation", "代际"), scene.generation));
                 }
-                if studio.analysis_ready() { ui.label(format!("{} {} · {} {} · {} {}", analysis.profile_summary().complete_spans, language.text("spans", "个区间"), analysis.profile_summary().open_spans, language.text("open", "个未结束"), analysis.profile_summary().unmatched_stops, language.text("unmatched stops", "个未匹配结束事件"))); }
+                if complete_source.is_none() && studio.analysis_ready() { ui.label(format!("{} {} · {} {} · {} {}", analysis.profile_summary().complete_spans, language.text("spans", "个区间"), analysis.profile_summary().open_spans, language.text("open", "个未结束"), analysis.profile_summary().unmatched_stops, language.text("unmatched stops", "个未匹配结束事件"))); }
                 ui.label(language.text("Event curves use the current reference Scene's time windows, not Scene ownership. Inclusive sums add nested and overlapping durations; they are not CPU utilization.", "事件曲线按当前参考 Scene 的时间窗口对齐，不表示 Scene 归属；包含耗时总和会重复累计嵌套和重叠区间，不是 CPU 占用率。"));
                 if studio.complete_profile_source().is_some() {
                     ui.label(language.text("Full-file catalog order can be selected in Order. The filter applies to the current page.", "完整文件目录可在“排序”中选择顺序；筛选只作用于当前页。"));
@@ -733,8 +747,8 @@ fn show_tracks(
     let response = ui.interact(axis, id.with("axis"), egui::Sense::click_and_drag());
     interact(ui, &response, axis, &mut window, total, view, true);
     response.on_hover_text(language.text(
-        "Drag: pan · Wheel: zoom · Shift + drag: measure · time relative to first captured event",
-        "拖动：平移 · 滚轮：缩放 · Shift + 拖动：测量 · 时间相对首个捕获事件",
+        "Drag / Shift + wheel: pan · Wheel: zoom · Shift + drag: measure · time relative to first captured event",
+        "拖动 / Shift + 滚轮：平移 · 滚轮：缩放 · Shift + 拖动：测量 · 时间相对首个捕获事件",
     ));
     for mark in 0..=4 {
         let fraction = mark as f32 / 4.0;
@@ -790,6 +804,13 @@ fn show_tracks(
     }
     let rows = view.rows.clone();
     let mut seek = None;
+    let mut plot = None;
+    let can_plot = studio.recording.as_ref().is_some_and(|recording| {
+        recording
+            .frame_info(studio.frame)
+            .and_then(|frame| studio.state.objects.get(&frame.scene_id))
+            .is_some_and(|scene| scene.type_name == "physx3::PxScene")
+    });
     egui::ScrollArea::vertical()
         .id_salt("thread-profile-rows")
         .show_rows(ui, row_height, visible.len(), |ui, range| {
@@ -837,7 +858,7 @@ fn show_tracks(
                         );
                         ui.painter()
                             .rect_filled(rect, 1.0, egui::Color32::from_rgb(19, 27, 36));
-                        paint_lane(
+                        let individual = paint_lane(
                             ui,
                             rect,
                             &spans[visible_range.clone()],
@@ -845,7 +866,26 @@ fn show_tracks(
                             &view.layout,
                             window,
                             ms_per_tick,
-                        );
+                        )
+                        .filter(|_| response.hovered());
+                        if let Some(key) = span_menu(
+                            ui,
+                            &response,
+                            individual.map(|index| profile_span(analysis, index)),
+                            studio.profile_view_epoch,
+                            |key| {
+                                can_plot
+                                    && studio.recording.as_ref().is_some_and(|recording| {
+                                        let metadata = recording
+                                            .native_end_analysis()
+                                            .unwrap_or(&recording.analysis);
+                                        !metadata.profile_metadata_ambiguous(key.zone, key.event)
+                                    })
+                            },
+                            language,
+                        ) {
+                            plot = Some(key);
+                        }
                         let hovered = response.hover_pos().and_then(|point| {
                             let time = window[0]
                                 + ((point.x - rect.left()) / rect.width()) as f64
@@ -914,7 +954,66 @@ fn show_tracks(
             ),
         );
     }
+    if let Some(key) = plot {
+        studio.plot_profile_event(key, ui.ctx().clone());
+    }
     time_window(window, total)
+}
+
+#[derive(Clone)]
+struct SpanMenu {
+    epoch: u64,
+    key: ExactKey,
+}
+
+fn span_menu(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    hovered: Option<&ProfileSpan>,
+    epoch: u64,
+    can_plot: impl Fn(ExactKey) -> bool,
+    language: Language,
+) -> Option<ExactKey> {
+    let id = response.id.with("event-curve");
+    if response.secondary_clicked() {
+        ui.ctx().data_mut(|data| {
+            data.remove::<SpanMenu>(id);
+            if let Some(span) = hovered {
+                data.insert_temp(
+                    id,
+                    SpanMenu {
+                        epoch,
+                        key: ExactKey {
+                            zone: span.zone,
+                            event: span.event,
+                            thread: span.thread,
+                            context: span.context,
+                        },
+                    },
+                );
+            }
+        });
+    }
+    let target = ui
+        .ctx()
+        .data(|data| data.get_temp::<SpanMenu>(id))
+        .filter(|target| target.epoch == epoch);
+    let mut selected = None;
+    response.context_menu(|ui| {
+        if let Some(target) = target {
+            if ui.add_enabled(can_plot(target.key), egui::Button::new(language.text("Plot event duration", "绘制事件耗时")))
+                .on_hover_text(language.text(
+                    "Sum this exact event, thread and Context in each reference Scene interval. Nested and overlapping occurrences are included.",
+                    "按参考 Scene 的每帧时间区间累计此事件、线程和 Context 的耗时；包含嵌套及重叠的出现次数。",
+                )).clicked() {
+                selected = Some(target.key);
+                ui.close();
+            }
+        } else {
+            ui.label(language.text("Zoom in and select an individual event.", "请放大后选择单个事件。"));
+        }
+    });
+    selected
 }
 
 #[derive(Clone, Default)]
@@ -1278,7 +1377,9 @@ fn show_events(ui: &mut egui::Ui, studio: &mut Studio, compact: bool) {
     } else if !compact {
         snapshot_label(ui, language, prepared.frame, studio.follow_live);
     }
-    let analysis = &prepared.analysis;
+    let analysis = recording
+        .native_end_analysis()
+        .unwrap_or(&prepared.analysis);
     let entries = &prepared.value.entries;
     let filter = studio.profile_filter.to_lowercase();
     if view.filter.as_deref() != Some(&filter) {
@@ -1326,7 +1427,7 @@ fn paint_lane(
     layout: &Layout,
     window: [f64; 2],
     ms_per_tick: f64,
-) {
+) -> Option<usize> {
     let width = window[1] - window[0];
     let x = |tick: u64| {
         rect.left()
@@ -1336,6 +1437,8 @@ fn paint_lane(
     };
     let columns = rect.width().ceil().clamp(1.0, 4096.0);
     let mut at = 0;
+    let pointer = ui.input(|input| input.pointer.hover_pos());
+    let mut individual = None;
     while at < indices.len() {
         let span = profile_span(analysis, indices[at]);
         let left = x(span.start).min(rect.right() - 1.0);
@@ -1357,6 +1460,9 @@ fn paint_lane(
             event_color(span.zone, span.event)
         };
         ui.painter().rect_filled(bar, 2.0, color);
+        if next == at + 1 && pointer.is_some_and(|pointer| bar.contains(pointer)) {
+            individual = Some(indices[at]);
+        }
         if next == at + 1 && bar.width() > 48.0 {
             let text = layout
                 .labels
@@ -1372,6 +1478,7 @@ fn paint_lane(
         }
         at = next;
     }
+    individual
 }
 
 fn event_color(zone: u64, event: u16) -> egui::Color32 {

@@ -7,14 +7,21 @@ pub mod clip;
 pub mod cloth;
 pub mod contacts;
 pub mod debug_draw;
+mod debug_windows;
 pub mod frame_metrics;
+#[cfg(test)]
+mod frame_source_tests;
+pub mod frame_sources;
 mod history;
 pub mod joint_geometry;
 pub mod live;
 mod mesh;
+#[cfg(test)]
+mod source_debug_tests;
 pub use mesh::MeshCache;
 pub mod metrics;
 pub mod native;
+pub use native::memory_totals::{MemoryHistoryScope, NativeMemoryTotal, NativeMemoryTotals};
 mod origin_shift;
 pub mod particles;
 pub mod profile_curves;
@@ -23,8 +30,10 @@ pub use profile_disk_index::catalog as profile_catalog_index;
 pub mod profile_timeline;
 #[cfg(test)]
 mod property_message_tests;
+pub mod pvd_archive;
 pub mod queries;
 pub mod repx;
+use frame_sources::{FrameBinding, FrameDirectory, FrameSourceKey, SourceFrame};
 use metrics::{Metrics, Stage};
 use pvd_protocol::{Decoder, Endian, Event, EventGroup, Header, MessageArg, Name};
 use std::{
@@ -153,7 +162,17 @@ pub struct UntimedErrorEvent {
     pub container_instance: u64,
     pub container_generation: u32,
 }
-/// SDK camera vectors use capture coordinates; the event carries no projection parameters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialUntimedError {
+    pub code: u32,
+    pub message: String,
+    pub file: String,
+    pub line: u32,
+    pub index: u32,
+    pub container_instance: u64,
+    pub container_generation: u32,
+}
+/// Captured camera vectors carry no Scene association or projection parameters.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SourceCamera {
     pub position: [f32; 3],
@@ -251,8 +270,10 @@ enum Action {
     Error(ErrorEvent),
     Debug(u64, Arc<[debug_draw::Primitive]>),
     ClearDebug(Vec<u64>),
+    ReplaceDebug(BTreeMap<u64, Arc<Vec<debug_draw::Primitive>>>),
     Contacts(u64, Arc<[contacts::Contact]>),
     Camera(String, SourceCamera),
+    RemoveCamera(String),
 }
 impl Action {
     fn set_is_redundant(state: &SceneState, id: u64, key: &str, value: &Value) -> bool {
@@ -301,7 +322,17 @@ impl Action {
             }
             Self::Contacts(id, contacts) => state.contacts.get(id) == Some(contacts),
             Self::Camera(name, camera) => state.cameras.get(name) == Some(camera),
+            Self::RemoveCamera(name) => !state.cameras.contains_key(name),
             Self::ClearDebug(ids) => ids.iter().all(|id| !state.debug_draw.contains_key(id)),
+            Self::ReplaceDebug(draw) => {
+                draw.len() == state.debug_draw.len()
+                    && draw.iter().all(|(id, values)| {
+                        state
+                            .debug_draw
+                            .get(id)
+                            .is_some_and(|current| Arc::ptr_eq(current, values))
+                    })
+            }
             _ => false,
         }
     }
@@ -332,8 +363,22 @@ impl Action {
                 }
                 Self::Contacts(_, values) => std::mem::size_of_val(values.as_ref()),
                 Self::ClearDebug(ids) => std::mem::size_of_val(ids.as_slice()),
+                Self::ReplaceDebug(draw) => {
+                    draw.len() * 128
+                        + draw
+                            .values()
+                            .map(|values| {
+                                if Arc::strong_count(values) == 1 {
+                                    debug_windows::primitive_bytes(values)
+                                } else {
+                                    0
+                                }
+                            })
+                            .sum::<usize>()
+                }
                 Self::Destroy(_) => 0,
                 Self::Camera(name, _) => camera_entry_bytes(name) + name.len(),
+                Self::RemoveCamera(name) => name.len(),
             }
     }
     fn apply(&self, state: &mut SceneState) {
@@ -411,11 +456,15 @@ impl Action {
                     state.debug_draw.remove(id);
                 }
             }
+            Self::ReplaceDebug(draw) => state.debug_draw = draw.clone(),
             Self::Contacts(id, contacts) => {
                 state.contacts.insert(*id, contacts.clone());
             }
             Self::Camera(name, camera) => {
                 state.cameras.insert(name.clone(), *camera);
+            }
+            Self::RemoveCamera(name) => {
+                state.cameras.remove(name);
             }
         }
     }
@@ -444,10 +493,15 @@ pub struct Recording {
     pub header: Header,
     pub analysis: analysis::SharedAnalysis,
     pub frames: FrameIndex,
+    pub frame_sources: FrameDirectory,
     pub classes: BTreeMap<String, ClassDefinition>,
     pub diagnostics: Vec<String>,
     native_scene_contexts: Option<Arc<native::SceneContexts>>,
+    // Frame seeks replace displayed analysis; the recording-end root retains tail flushes.
+    native_analysis_end: Option<analysis::SharedAnalysis>,
+    native_memory: Option<Arc<native::memory_totals::CapturedMemory>>,
     untimed_errors: Vec<UntimedErrorEvent>,
+    initial_untimed_errors: Vec<InitialUntimedError>,
     actions: history::ActionLog,
     frame_ends: Vec<usize>,
     checkpoints: BTreeMap<usize, Arc<history::Checkpoint>>,
@@ -459,6 +513,20 @@ pub struct Recording {
 }
 impl Recording {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        Self::from_bytes_with_progress(bytes, |_, _| true)
+    }
+    pub fn from_bytes_with_progress(
+        bytes: &[u8],
+        mut progress: impl FnMut(u64, u64) -> bool,
+    ) -> Result<Self, Error> {
+        if pvd_archive::has_zip_signature(bytes) {
+            let archive = pvd_archive::read_with_progress(
+                &mut std::io::Cursor::new(bytes),
+                &Default::default(),
+                &mut progress,
+            )?;
+            return Self::from_bytes_with_progress(&archive.bytes, progress);
+        }
         if capture::Format::from_magic(bytes)?.is_some() {
             return Err(error(
                 "project captures require a file path for bounded random access",
@@ -470,11 +538,27 @@ impl Recording {
             ));
         }
         if bytes.starts_with(&native::MAGIC.to_le_bytes()) {
-            return native::from_bytes_with_progress(bytes, |_, _| true);
+            return native::from_bytes_with_progress(bytes, progress);
         }
         let mut live = LiveRecording::default();
+        let mut received = 0;
         for chunk in bytes.chunks(64 * 1024) {
+            if !progress(received, bytes.len() as u64) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "recording load cancelled",
+                )
+                .into());
+            }
             live.feed(chunk)?;
+            received += chunk.len() as u64;
+        }
+        if !progress(received, bytes.len() as u64) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "recording load cancelled",
+            )
+            .into());
         }
         live.finish()
     }
@@ -493,6 +577,19 @@ impl Recording {
             file.read_exact(&mut prefix)?;
             use std::io::Seek;
             file.rewind()?;
+            if pvd_archive::has_zip_signature(&prefix) {
+                let archive =
+                    pvd_archive::read_with_progress(&mut file, &Default::default(), &mut progress)?;
+                if archive.bytes.starts_with(&native::MAGIC.to_le_bytes()) {
+                    return native::read_bytes_with_history(
+                        &archive.bytes,
+                        live::HistoryConfig::default(),
+                        progress,
+                    )
+                    .map(|(recording, _)| recording);
+                }
+                return Self::from_bytes_with_progress(&archive.bytes, progress);
+            }
             if capture::Format::from_magic(&prefix)?.is_some() {
                 drop(file);
                 return capture::open_with_progress(
@@ -500,6 +597,22 @@ impl Recording {
                     &capture::CaptureLimits::default(),
                     |state| progress(state.completed, state.total),
                 );
+            }
+            if prefix.starts_with(&native::MAGIC.to_le_bytes()) {
+                drop(file);
+                return native::read_path_with_progress(
+                    path,
+                    live::HistoryConfig::default(),
+                    |event, events| {
+                        let completed = if events == 0 {
+                            0
+                        } else {
+                            (u128::from(event) * u128::from(total) / u128::from(events)) as u64
+                        };
+                        progress(completed, total)
+                    },
+                )
+                .map(|(recording, _)| recording);
             }
         }
         if total > 512 << 20 {
@@ -510,7 +623,6 @@ impl Recording {
         let mut live = LiveRecording::default();
         let mut bytes = [0u8; 64 * 1024];
         let mut loaded = 0;
-        let mut native_bytes = None;
         loop {
             if !progress(loaded, total) {
                 return Err(std::io::Error::new(
@@ -528,18 +640,8 @@ impl Recording {
                     "recording grew beyond the current 512 MiB indexing limit",
                 ));
             }
-            if loaded == 0 && bytes[..n].starts_with(&native::MAGIC.to_le_bytes()) {
-                native_bytes = Some(Vec::new());
-            }
-            if let Some(native) = &mut native_bytes {
-                native.extend_from_slice(&bytes[..n]);
-            } else {
-                live.feed(&bytes[..n])?;
-            }
+            live.feed(&bytes[..n])?;
             loaded += n as u64;
-        }
-        if let Some(bytes) = native_bytes {
-            return native::from_bytes_with_progress(&bytes, |_, _| progress(total, total));
         }
         live.finish()
     }
@@ -571,6 +673,27 @@ impl Recording {
     }
     pub fn is_disk_backed(&self) -> bool {
         self.disk.is_some()
+    }
+    /// Final native-file analysis, independent of the currently displayed frame.
+    pub fn native_end_analysis(&self) -> Option<&analysis::SharedAnalysis> {
+        (self.source == RecordingSource::Pvd3Database)
+            .then_some(self.native_analysis_end.as_ref())
+            .flatten()
+    }
+    fn frame_matches_scene(&self, frame: &FrameInfo, scene: u64) -> bool {
+        if frame.scene_id != scene {
+            return false;
+        }
+        if self.frame_sources.source(FrameSourceKey::Legacy).is_some() {
+            return true;
+        }
+        self.frame_sources
+            .source(FrameSourceKey::Captured {
+                section: frame_sources::FrameSection::PhysX,
+                source: frame.scene_id,
+            })
+            .and_then(|source| source.at_index(frame.index))
+            .is_some_and(|frame| frame.scene.is_some_and(|object| object.id == scene))
     }
     fn disk_scene_generation(&self, frame: usize) -> Option<u32> {
         self.disk
@@ -658,6 +781,9 @@ impl Recording {
     pub fn untimed_error_events(&self) -> &[UntimedErrorEvent] {
         &self.untimed_errors
     }
+    pub fn initial_untimed_errors(&self) -> &[InitialUntimedError] {
+        &self.initial_untimed_errors
+    }
     pub fn verify_replay(&self) -> Result<(), Error> {
         if let Some(disk) = &self.disk {
             return disk.verify_replay();
@@ -677,14 +803,16 @@ impl Recording {
         }
         Ok(())
     }
-    /// Returns elapsed seconds relative to the first visible frame.
-    /// Retained captures keep SDK timestamps and frame indices, but each visible
-    /// interval has its own elapsed-time origin.
+    /// Returns elapsed seconds from this source's first visible frame.
+    /// Hidden recovery frames do not define the origin. Missing source metadata
+    /// or a timestamp before that origin has no elapsed-time value.
     pub fn seconds_at(&self, index: usize) -> Option<f64> {
         let frame = self.frame_info(index)?;
-        let first = self.frames.first()?;
+        let (source, _) = self.frame_sources.frame(index)?;
+        let first = self.frame_sources.source(source)?.first()?;
+        let first = self.frame_info(first.index)?;
         Some(
-            frame.timestamp.saturating_sub(first.timestamp) as f64
+            frame.timestamp.checked_sub(first.timestamp)? as f64
                 * self.header.timestamp_numerator as f64
                 / self.header.timestamp_denominator as f64
                 / 1_000_000_000.0,
@@ -730,11 +858,11 @@ pub struct RecordingBuilder {
     generations: BTreeMap<u64, u32>,
     object_classes: BTreeMap<u64, String>,
     render_decoders: BTreeMap<u64, debug_draw::RenderDecoder>,
+    draw_history: debug_windows::DrawHistory,
     retained_bytes: usize,
     checkpoint_bytes: usize,
     skipped_redundant_actions: usize,
     memory_limit: usize,
-    frame_scenes: BTreeSet<u64>,
     streaming: Option<Box<live::Streaming>>,
     validation: Option<clip::ValidationState>,
     metrics: Metrics,
@@ -748,10 +876,14 @@ impl RecordingBuilder {
                 header,
                 analysis: analysis::SharedAnalysis::default(),
                 frames: FrameIndex::default(),
+                frame_sources: FrameDirectory::default(),
                 classes: BTreeMap::new(),
                 diagnostics: Vec::new(),
                 native_scene_contexts: None,
+                native_analysis_end: None,
+                native_memory: None,
                 untimed_errors: Vec::new(),
+                initial_untimed_errors: Vec::new(),
                 actions: history::ActionLog::default(),
                 frame_ends: Vec::new(),
                 checkpoints: BTreeMap::new(),
@@ -770,11 +902,11 @@ impl RecordingBuilder {
             generations: BTreeMap::new(),
             object_classes: BTreeMap::new(),
             render_decoders: BTreeMap::new(),
+            draw_history: debug_windows::DrawHistory::default(),
             retained_bytes: 0,
             checkpoint_bytes: 0,
             skipped_redundant_actions: 0,
             memory_limit: 512 << 20,
-            frame_scenes: BTreeSet::new(),
             streaming: None,
             validation: None,
             metrics: Metrics::default(),
@@ -792,12 +924,72 @@ impl RecordingBuilder {
         builder.memory_limit = bytes;
         builder
     }
+    fn enable_streaming(&mut self, history: live::HistoryWriter) {
+        self.recording.frame_sources = live::Streaming::frame_directory();
+        self.streaming = Some(Box::new(live::Streaming::new(history)));
+    }
+    fn retains_actions(&self) -> bool {
+        self.streaming.is_none() && self.validation.is_none()
+    }
+    fn draw_history_bytes(&self) -> usize {
+        self.draw_history.memory_bytes(self.retains_actions())
+    }
+    fn frame_binding(&self, name: u32, id: u64) -> Result<Option<FrameBinding>, Error> {
+        let name = self.string(name)?;
+        if self.recording.source != RecordingSource::SdkStream {
+            return Ok((name == "frame").then(FrameBinding::legacy));
+        }
+        Ok(FrameBinding::sdk(&name, id, &self.state))
+    }
+    pub(crate) fn prepare_end_view(&mut self, event: &Event) -> Result<(), Error> {
+        if let Event::EndSection { id, name, .. } = event
+            && let Some(binding) = self.frame_binding(*name, *id)?
+        {
+            self.prepare_frame_debug(binding)?;
+        }
+        Ok(())
+    }
+    fn prepare_frame_debug(&mut self, binding: FrameBinding) -> Result<(), Error> {
+        let available = self
+            .memory_limit
+            .saturating_sub(self.retained_bytes)
+            .saturating_sub(self.checkpoint_bytes)
+            .saturating_sub(self.current_state_bytes())
+            .saturating_sub(self.recording.frame_sources.index_bytes())
+            .saturating_sub(self.draw_history_bytes());
+        let retain_complete = self.retains_actions();
+        let draw = self.draw_history.prepare(
+            binding.source,
+            self.memory_limit,
+            retain_complete,
+            available,
+        )?;
+        self.reserve_history(0)?;
+        self.action(Action::ReplaceDebug(draw))
+    }
+    fn current_state_bytes(&self) -> usize {
+        self.streaming.as_ref().map_or_else(
+            || {
+                self.validation
+                    .as_ref()
+                    .map_or(0, |state| state.state_bytes)
+            },
+            |live| live.memory_bytes(),
+        )
+    }
     fn reserve_history(&mut self, bytes: usize) -> Result<(), Error> {
-        if self.retained_bytes.saturating_add(bytes).saturating_add(
-            self.validation
-                .as_ref()
-                .map_or(0, |state| state.state_bytes),
-        ) > self.memory_limit
+        self.reserve_frame_budget(bytes, self.recording.frame_sources.index_bytes())
+    }
+    fn reserve_frame_budget(&mut self, bytes: usize, directory_bytes: usize) -> Result<(), Error> {
+        let external = self
+            .current_state_bytes()
+            .saturating_add(directory_bytes)
+            .saturating_add(self.draw_history_bytes());
+        if self
+            .retained_bytes
+            .saturating_add(bytes)
+            .saturating_add(external)
+            > self.memory_limit
         {
             self.clear_message_cache();
         }
@@ -805,19 +997,17 @@ impl RecordingBuilder {
             .retained_bytes
             .checked_add(bytes)
             .ok_or_else(|| error("history memory accounting overflow"))?;
-        if required
-            > self.memory_limit.saturating_sub(
-                self.validation
-                    .as_ref()
-                    .map_or(0, |state| state.state_bytes),
-            )
-        {
-            return Err(error(format!(
-                "capture exceeds the configured {} MiB history memory budget",
-                self.memory_limit >> 20
-            )));
-        }
-        while self.checkpoint_bytes > self.memory_limit - required {
+        let available = self
+            .memory_limit
+            .checked_sub(external)
+            .filter(|available| required <= *available)
+            .ok_or_else(|| {
+                error(format!(
+                    "capture exceeds the configured {} MiB history memory budget",
+                    self.memory_limit >> 20
+                ))
+            })?;
+        while self.checkpoint_bytes > available - required {
             history::evict_checkpoint(&mut self.recording.checkpoints);
             self.checkpoint_bytes = history::checkpoint_bytes(&self.recording.checkpoints);
         }
@@ -838,7 +1028,7 @@ impl RecordingBuilder {
             return;
         }
         let state_bytes = match (&self.streaming, &self.validation) {
-            (Some(live), _) => live.state_bytes,
+            (Some(live), _) => live.memory_bytes(),
             (_, Some(validation)) => validation.state_bytes,
             _ => return,
         };
@@ -852,6 +1042,8 @@ impl RecordingBuilder {
         if growth.is_none_or(|bytes| {
             self.retained_bytes
                 .saturating_add(state_bytes)
+                .saturating_add(self.recording.frame_sources.index_bytes())
+                .saturating_add(self.draw_history_bytes())
                 .saturating_add(bytes)
                 > self.memory_limit
         }) {
@@ -861,7 +1053,9 @@ impl RecordingBuilder {
     fn memory_usage(&self) -> HistoryMemoryUsage {
         HistoryMemoryUsage {
             estimated_history_bytes: self.retained_bytes
-                + self.streaming.as_ref().map_or(0, |live| live.state_bytes),
+                + self.recording.frame_sources.index_bytes()
+                + self.draw_history_bytes()
+                + self.current_state_bytes(),
             estimated_checkpoint_bytes: self.checkpoint_bytes
                 + self
                     .streaming
@@ -876,7 +1070,12 @@ impl RecordingBuilder {
     fn checkpoint(&mut self, index: usize) {
         let budget = (self.memory_limit / 4)
             .max(history::state_structure_bytes(&self.state).saturating_mul(2))
-            .min(self.memory_limit.saturating_sub(self.retained_bytes));
+            .min(
+                self.memory_limit
+                    .saturating_sub(self.retained_bytes)
+                    .saturating_sub(self.recording.frame_sources.index_bytes())
+                    .saturating_sub(self.draw_history_bytes()),
+            );
         // Cache eviction changes seek cost, never the retained capture or frame numbering.
         if budget == 0 {
             return;
@@ -932,19 +1131,28 @@ impl RecordingBuilder {
     }
     fn apply_action(&mut self, action: Action) -> Result<(), Error> {
         self.release_message_cache_for_action(&action);
+        let retain_complete = self.retains_actions();
+        match &action {
+            Action::Debug(owner, values) => self.draw_history.append(
+                *owner,
+                values.clone(),
+                self.memory_limit,
+                retain_complete,
+            )?,
+            Action::Create(object) => self.draw_history.invalidate_owner(object.id),
+            Action::Destroy(id) => self.draw_history.invalidate_owner(*id),
+            _ => {}
+        }
+        let state_limit = self
+            .memory_limit
+            .saturating_sub(self.retained_bytes)
+            .saturating_sub(self.recording.frame_sources.index_bytes())
+            .saturating_sub(self.draw_history_bytes());
         if let Some(validation) = &mut self.validation {
-            return validation.apply(
-                action,
-                &mut self.state,
-                self.memory_limit.saturating_sub(self.retained_bytes),
-            );
+            return validation.apply(action, &mut self.state, state_limit);
         }
         if let Some(streaming) = &mut self.streaming {
-            return streaming.action(
-                action,
-                &mut self.state,
-                self.memory_limit.saturating_sub(self.retained_bytes),
-            );
+            return streaming.action(action, &mut self.state, state_limit);
         }
         if self.recording.actions.len() >= 20_000_000 {
             return Err(error("recording exceeds 20 million state changes"));
@@ -1175,11 +1383,9 @@ impl RecordingBuilder {
         let previous_bytes = message.compiled.as_ref().map_or(0, |layout| layout.bytes);
         let used = self.retained_bytes - previous_bytes
             + self.checkpoint_bytes
-            + self.streaming.as_ref().map_or(0, |live| live.state_bytes)
-            + self
-                .validation
-                .as_ref()
-                .map_or(0, |state| state.state_bytes);
+            + self.recording.frame_sources.index_bytes()
+            + self.draw_history_bytes()
+            + self.current_state_bytes();
         let available = MESSAGE_CACHE_LIMIT
             .saturating_sub(self.message_cache_bytes - previous_bytes)
             .min(self.memory_limit.saturating_sub(used));
@@ -1520,39 +1726,62 @@ impl RecordingBuilder {
                     name,
                     timestamp,
                 } => {
-                    if self.string(name)? == "frame" {
-                        if let Some(validation) = &mut self.validation {
-                            validation.frames = validation
-                                .frames
-                                .checked_add(1)
-                                .ok_or_else(|| error("scene frame count overflow"))?;
-                            self.recording
-                                .analysis
-                                .maintain_live_history(validation.frames)?;
-                            let renderer_ids = self.state.debug_draw.keys().copied().collect();
-                            self.action(Action::ClearDebug(renderer_ids))?;
-                            continue;
+                    let Some(binding) = self.frame_binding(name, id)? else {
+                        continue;
+                    };
+                    self.prepare_frame_debug(binding)?;
+                    if let Some(validation) = &mut self.validation {
+                        validation.frames = validation
+                            .frames
+                            .checked_add(1)
+                            .ok_or_else(|| error("scene frame count overflow"))?;
+                        self.recording
+                            .analysis
+                            .maintain_live_history(validation.frames)?;
+                        self.draw_history.commit(binding.source);
+                        let renderer_ids = self.state.debug_draw.keys().copied().collect();
+                        self.action(Action::ClearDebug(renderer_ids))?;
+                        continue;
+                    }
+                    if let Some(live) = &mut self.streaming {
+                        let index = live.frames_seen;
+                        live.prune_frame_sources(&mut self.recording.frame_sources);
+                        if index.is_multiple_of(60) {
+                            let _timer = self.metrics.measure(Stage::Analysis);
+                            let _maintenance = self.metrics.measure(Stage::AnalysisMaintenance);
+                            self.maintain_analysis(index)?;
                         }
-                        if self.frame_scenes.insert(id) && self.frame_scenes.len() == 2 {
-                            self.recording.diagnostics.push("Multiple scenes use a merged stream-order timeline; debug draws reset at each scene frame boundary. Independent asynchronous scene alignment is not yet validated.".into());
-                        }
-                        if let Some(live) = &mut self.streaming {
-                            let frame = live.frames_seen;
-                            if frame.is_multiple_of(60) {
-                                let _timer = self.metrics.measure(Stage::Analysis);
-                                let _maintenance = self.metrics.measure(Stage::AnalysisMaintenance);
-                                self.maintain_analysis(frame)?;
-                            }
-                            let live = self.streaming.as_mut().unwrap();
-                            live.complete(timestamp, id, &self.state, &self.recording.analysis);
-                            let renderer_ids = self.state.debug_draw.keys().copied().collect();
-                            self.action(Action::ClearDebug(renderer_ids))?;
-                            continue;
-                        }
+                        let directory_bytes = self
+                            .recording
+                            .frame_sources
+                            .index_bytes_after_observe(index, binding, true)?;
+                        self.reserve_frame_budget(0, directory_bytes)?;
+                        self.streaming.as_mut().unwrap().complete(
+                            FrameInfo {
+                                index,
+                                timestamp,
+                                scene_id: id,
+                            },
+                            binding,
+                            &self.state,
+                            &self.recording.analysis,
+                            &mut self.recording.frame_sources,
+                        )?;
+                    } else {
                         let index = self.recording.frames.len();
-                        self.reserve_history(std::mem::size_of::<FrameInfo>() + 16)?;
+                        let directory_bytes = self
+                            .recording
+                            .frame_sources
+                            .index_bytes_after_observe(index, binding, true)?;
+                        let mut retained = std::mem::size_of::<FrameInfo>() + 16;
                         if index == 0 {
-                            self.reserve_history(history::state_structure_bytes(&self.state))?;
+                            retained = retained
+                                .checked_add(history::state_structure_bytes(&self.state))
+                                .ok_or_else(|| error("initial frame memory accounting overflow"))?;
+                        }
+                        self.reserve_frame_budget(retained, directory_bytes)?;
+                        self.recording.frame_sources.append(index, binding)?;
+                        if index == 0 {
                             self.recording.initial = Arc::new(self.state.clone());
                         }
                         self.recording.frames.push(FrameInfo {
@@ -1564,9 +1793,10 @@ impl RecordingBuilder {
                         if index != 0 && index.is_multiple_of(60) {
                             self.checkpoint(index);
                         }
-                        let renderer_ids = self.state.debug_draw.keys().copied().collect();
-                        self.action(Action::ClearDebug(renderer_ids))?;
                     }
+                    self.draw_history.commit(binding.source);
+                    let renderer_ids = self.state.debug_draw.keys().copied().collect();
+                    self.action(Action::ClearDebug(renderer_ids))?;
                 }
                 Event::ErrorMessage {
                     code,
@@ -1724,7 +1954,7 @@ impl RecordingBuilder {
                 }
                 live.analysis_input(live::AnalysisInput::Reset(frame));
             }
-            (None, result) => result?,
+            (None, result) => result.map_err(analysis::DecodeError::new)?,
         }
         Ok(())
     }
@@ -1752,6 +1982,9 @@ impl RecordingBuilder {
             r.disk = Some(disk);
             r.stream_errors = live.errors.iter().cloned().collect();
             r.streamed_frame_end = Some(live.frames_seen);
+            if r.source == RecordingSource::Pvd3Database {
+                r.native_analysis_end = Some(r.analysis.clone());
+            }
             return Ok(r);
         }
         if r.frames.is_empty() {
@@ -1770,6 +2003,7 @@ pub struct LiveRecording {
     history: Option<live::HistoryWriter>,
     continuous: bool,
     published_frame: Option<usize>,
+    requested_frame_source: Option<FrameSourceKey>,
     metrics: Metrics,
 }
 impl LiveRecording {
@@ -1819,6 +2053,43 @@ impl LiveRecording {
             ..Self::default()
         })
     }
+    /// Selects one captured section clock; `None` follows the automatic source.
+    pub fn set_frame_source(&mut self, source: Option<FrameSourceKey>) {
+        self.requested_frame_source = source;
+        if let Some(live) = self
+            .builder
+            .as_mut()
+            .and_then(|builder| builder.streaming.as_mut())
+            && live.set_frame_source(source)
+        {
+            self.published_frame = None;
+        }
+    }
+    pub fn selected_frame_source(&self) -> Option<FrameSourceKey> {
+        self.builder
+            .as_ref()
+            .and_then(|builder| builder.streaming.as_ref())
+            .and_then(|live| live.selected_source)
+            .or(self.requested_frame_source)
+    }
+    pub fn display_frame_source(&self) -> Option<(FrameSourceKey, SourceFrame)> {
+        self.builder
+            .as_ref()?
+            .streaming
+            .as_ref()?
+            .display_source_frame
+    }
+    /// The next selected endpoint replaces the display, including changes lost by a consumer.
+    pub fn refresh_frame_source(&mut self) {
+        self.published_frame = None;
+        if let Some(live) = self
+            .builder
+            .as_mut()
+            .and_then(|builder| builder.streaming.as_mut())
+        {
+            live.refresh_frame_source();
+        }
+    }
     pub fn take_update(&mut self) -> Option<(usize, live::SceneUpdate)> {
         let live = self.builder.as_mut()?.streaming.as_mut()?;
         let frame = live.frame.as_ref()?.index;
@@ -1860,7 +2131,12 @@ impl LiveRecording {
                 if let Some(analysis) = history.initial_analysis() {
                     builder.recording.analysis = analysis;
                 }
-                builder.streaming = Some(Box::new(live::Streaming::new(history)));
+                builder.enable_streaming(history);
+                builder
+                    .streaming
+                    .as_mut()
+                    .unwrap()
+                    .set_frame_source(self.requested_frame_source);
             }
             builder.set_metrics(self.metrics.clone());
             self.builder = Some(builder);
@@ -1888,10 +2164,15 @@ impl LiveRecording {
         self.builder.as_ref().map(RecordingBuilder::memory_usage)
     }
     pub fn snapshot(&self) -> Result<Recording, Error> {
-        self.builder
+        let builder = self
+            .builder
             .as_ref()
-            .ok_or_else(|| error("waiting for stream initialization"))?
-            .snapshot()
+            .ok_or_else(|| error("waiting for stream initialization"))?;
+        let mut recording = builder.snapshot()?;
+        if let Some(live) = &builder.streaming {
+            recording.analysis = live.display_analysis.clone().unwrap_or_default();
+        }
+        Ok(recording)
     }
     pub fn finish(self) -> Result<Recording, Error> {
         if self.failed {
@@ -2092,7 +2373,7 @@ impl SceneState {
     }
     pub fn articulation_for_link(&self, id: u64) -> Option<&Object> {
         let mut link = self.objects.get(&id)?;
-        // PhysX 3.4 articulations contain at most 64 links; malformed parent cycles stay bounded.
+        // The SDK link limit also bounds traversal through malformed parent cycles.
         for _ in 0..64 {
             if !link.type_name.ends_with("::PxArticulationLink") {
                 return None;
@@ -2101,7 +2382,9 @@ impl SceneState {
                 return None;
             };
             let parent = self.resolve_reference(link.id, "Parent", *parent)?;
-            if parent.type_name.ends_with("::PxArticulation") {
+            if parent.type_name.ends_with("::PxArticulation")
+                || parent.type_name.ends_with("::PxArticulationBase")
+            {
                 return Some(parent);
             }
             link = parent;
@@ -2618,43 +2901,45 @@ mod tests {
 
     #[test]
     fn articulation_owner_rejects_stale_cycles_and_chains_beyond_sdk_limit() {
-        let mut state = SceneState::default();
-        for id in 1..=66 {
-            Action::Create(Object {
-                id,
-                generation: 0,
-                type_name: if id == 66 {
-                    "physx3::PxArticulation"
-                } else {
-                    "physx3::PxArticulationLink"
+        for root_type in ["physx3::PxArticulation", "physx3::PxArticulationBase"] {
+            let mut state = SceneState::default();
+            for id in 1..=66 {
+                Action::Create(Object {
+                    id,
+                    generation: 0,
+                    type_name: if id == 66 {
+                        root_type
+                    } else {
+                        "physx3::PxArticulationLink"
+                    }
+                    .into(),
+                    properties: BTreeMap::new(),
+                })
+                .apply(&mut state);
+                if id != 66 {
+                    Action::Set(id, "Parent".into(), Value::Ref(id + 1)).apply(&mut state);
                 }
-                .into(),
+            }
+            assert_eq!(state.articulation_for_link(2).unwrap().id, 66);
+            assert!(state.articulation_for_link(1).is_none());
+            assert!(state.articulation_for_link(66).is_none());
+            Action::Set(33, "Parent".into(), Value::Ref(2)).apply(&mut state);
+            assert!(state.articulation_for_link(2).is_none());
+            Action::Set(33, "Parent".into(), Value::Ref(34)).apply(&mut state);
+            Action::Destroy(66).apply(&mut state);
+            Action::Create(Object {
+                id: 66,
+                generation: 1,
+                type_name: root_type.into(),
                 properties: BTreeMap::new(),
             })
             .apply(&mut state);
-            if id != 66 {
-                Action::Set(id, "Parent".into(), Value::Ref(id + 1)).apply(&mut state);
-            }
+            assert!(state.articulation_for_link(2).is_none());
+            Action::Set(65, "Parent".into(), Value::Ref(66)).apply(&mut state);
+            assert_eq!(state.articulation_for_link(2).unwrap().generation, 1);
+            Action::Set(33, "Parent".into(), Value::U64(34)).apply(&mut state);
+            assert!(state.articulation_for_link(2).is_none());
         }
-        assert_eq!(state.articulation_for_link(2).unwrap().id, 66);
-        assert!(state.articulation_for_link(1).is_none());
-        assert!(state.articulation_for_link(66).is_none());
-        Action::Set(33, "Parent".into(), Value::Ref(2)).apply(&mut state);
-        assert!(state.articulation_for_link(2).is_none());
-        Action::Set(33, "Parent".into(), Value::Ref(34)).apply(&mut state);
-        Action::Destroy(66).apply(&mut state);
-        Action::Create(Object {
-            id: 66,
-            generation: 1,
-            type_name: "physx3::PxArticulation".into(),
-            properties: BTreeMap::new(),
-        })
-        .apply(&mut state);
-        assert!(state.articulation_for_link(2).is_none());
-        Action::Set(65, "Parent".into(), Value::Ref(66)).apply(&mut state);
-        assert_eq!(state.articulation_for_link(2).unwrap().generation, 1);
-        Action::Set(33, "Parent".into(), Value::U64(34)).apply(&mut state);
-        assert!(state.articulation_for_link(2).is_none());
     }
     #[test]
     fn history_budget_stops_growth_before_adding_action() {

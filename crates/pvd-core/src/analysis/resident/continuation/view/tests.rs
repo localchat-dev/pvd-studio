@@ -113,3 +113,82 @@ fn cursor_switches_source_only_after_success_and_keeps_owned_rows() {
     drop(cursor);
     assert_eq!(second_domain.statistics().logical_used, 0);
 }
+
+#[test]
+fn resident_churn_keeps_frame_cohort_survivors_after_retention_and_reverse_seek() {
+    use crate::analysis::Analysis;
+    use pvd_protocol::Endian;
+
+    let mut source = Analysis::default();
+    let mut strings = Vec::new();
+    for (handle, text) in [(1u32, "Block"), (2, "source.cpp")] {
+        strings.extend(1u16.to_le_bytes());
+        strings.extend((text.len() as u32 + 1).to_le_bytes());
+        strings.extend(text.bytes());
+        strings.push(0);
+        strings.extend(handle.to_le_bytes());
+    }
+    let alloc = |size: u8, address: u8| vec![2, 0, size, 1, 2, 17, address];
+    let free = |address: u8| vec![3, 0, address];
+    for (buffer, frame, data) in [
+        (7, 0, [strings.clone(), alloc(64, 5)].concat()),
+        (
+            7,
+            1,
+            [
+                free(5),
+                alloc(24, 6),
+                alloc(32, 6),
+                free(6),
+                alloc(0, 7),
+                alloc(40, 8),
+            ]
+            .concat(),
+        ),
+        (9, 1, [strings, alloc(12, 8)].concat()),
+        (7, 2, free(8)),
+        (9, 2, alloc(16, 8)),
+    ] {
+        source
+            .ingest(
+                buffer,
+                "PxProfileMemoryEventBuffer",
+                &data,
+                Endian::Little,
+                frame,
+            )
+            .unwrap();
+    }
+    let domain = Domain::new(8 << 20);
+    let mut actual = ResidentAnalysis::from_legacy_bytes(
+        &postcard::to_stdvec(&source).unwrap(),
+        domain,
+        &mut || false,
+    )
+    .unwrap();
+    let mut cursor = ResidentMemoryCursor::default();
+    for (frame, count, bytes) in [
+        (0, 1, 64),
+        (1, 3, 52),
+        (2, 1, 16),
+        (1, 3, 52),
+        (0, 1, 64),
+        (9, 0, 0),
+    ] {
+        MemorySource::seek(&actual, &mut cursor, frame).unwrap();
+        let churn = MemorySource::churn(&actual, frame);
+        assert_eq!(
+            (churn.surviving_allocations, churn.surviving_bytes),
+            (count, bytes)
+        );
+        assert_eq!(churn, source.memory.churn_at_frame(frame));
+    }
+    actual.try_retain_recent(1, &mut || false).unwrap();
+    source.retain_recent(1);
+    for frame in [1, 2, 1] {
+        assert_eq!(
+            MemorySource::churn(&actual, frame),
+            source.memory.churn_at_frame(frame)
+        );
+    }
+}

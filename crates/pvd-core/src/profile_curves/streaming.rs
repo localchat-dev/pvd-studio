@@ -442,7 +442,7 @@ impl<'a> Samples<'a> {
                     "complete profile curves require a contiguous SDK frame directory",
                 ));
             }
-            if frame.scene_id == scene.id {
+            if recording.frame_matches_scene(frame, scene.id) {
                 boundaries.push(frame);
             }
         }

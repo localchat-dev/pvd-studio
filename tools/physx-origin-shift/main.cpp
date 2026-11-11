@@ -16,6 +16,20 @@ static void pose(std::ostream& out, PxTransform value) {
     out << "{\"position\":"; vector(out, value.p);
     out << ",\"rotation\":[" << value.q.x << ',' << value.q.y << ',' << value.q.z << ',' << value.q.w << "]}";
 }
+static void bounds(std::ostream& out, PxBounds3 value) {
+    out << '[';
+    out << value.minimum.x << ',' << value.minimum.y << ',' << value.minimum.z << ',';
+    out << value.maximum.x << ',' << value.maximum.y << ',' << value.maximum.z << ']';
+}
+static void require_stream(pvdsdk::PvdError result) {
+    if (result != pvdsdk::PvdErrorType::Success) throw std::runtime_error("SDK data stream operation failed");
+}
+static void define_bounds(pvdsdk::PvdDataStream& stream) {
+    for (const char* name : {"PxRigidStatic", "PxRigidDynamic", "PxArticulationLink", "PxCloth", "PxParticleSystem", "PxParticleFluid"}) {
+        require_stream(stream.createProperty(pvdsdk::NamespacedName("physx3", name), "WorldBounds", "",
+            pvdsdk::getPvdNamespacedNameForType<PxBounds3>(), pvdsdk::PropertyType::Scalar));
+    }
+}
 
 struct World {
     PxScene* scene;
@@ -67,6 +81,7 @@ struct World {
             actor->setParticleReadDataFlag(PxParticleReadDataFlag::ePOSITION_BUFFER, true);
             actor->setParticleReadDataFlag(PxParticleReadDataFlag::eVELOCITY_BUFFER, true);
             actor->setParticleReadDataFlag(PxParticleReadDataFlag::eFLAGS_BUFFER, true);
+            actor->setProjectionPlane(PxVec3(0.6f, 0.8f, 0), offset + 3.25f + kind);
             scene->addActor(*actor);
             std::array<PxU32, 2> indices = {{1, 5}};
             std::array<PxVec3, 2> positions = {{PxVec3(offset + kind, 15, 2), PxVec3(offset + kind + 0.25f, 15.5f, -2)}};
@@ -86,6 +101,17 @@ struct World {
         for (unsigned i = 0; i < 3; ++i) rigid[i]->release();
     }
 
+    void publishBounds(pvdsdk::PvdDataStream& stream) const {
+        for (auto* actor : rigid) require_stream(stream.setPropertyValue(actor, "WorldBounds", actor->getWorldBounds(1.0f)));
+        require_stream(stream.setPropertyValue(cloth, "WorldBounds", cloth->getWorldBounds(1.0f)));
+        for (auto* actor : particles) require_stream(stream.setPropertyValue(actor, "WorldBounds", actor->getWorldBounds(1.0f)));
+    }
+
+    void target(float offset) const {
+        static_cast<PxRigidDynamic*>(rigid[2])->setKinematicTarget(
+            PxTransform(PxVec3(offset + 1.25f, 5.5f, -2.75f)));
+    }
+
     void write(std::ostream& out) const {
         out << "{\"scene\":" << id(scene) << ",\"poses\":[";
         bool comma = false;
@@ -95,6 +121,20 @@ struct World {
         };
         for (auto* actor : rigid) emit(id(actor), actor->getGlobalPose());
         emit(id(cloth), cloth->getGlobalPose());
+        out << "],\"bounds\":["; comma = false;
+        auto emitBounds = [&](const PxActor* actor) {
+            if (comma) out << ','; comma = true;
+            out << "{\"id\":" << id(actor) << ",\"bounds\":";
+            bounds(out, actor->getWorldBounds(1.0f)); out << '}';
+        };
+        for (auto* actor : rigid) emitBounds(actor);
+        emitBounds(cloth);
+        for (auto* actor : particles) emitBounds(actor);
+        PxTransform destination(PxIdentity);
+        auto* kinematic = static_cast<PxRigidDynamic*>(rigid[2]);
+        if (!kinematic->getKinematicTarget(destination)) throw std::runtime_error("Expected a valid kinematic target");
+        out << "],\"targets\":[{\"id\":" << id(kinematic) << ",\"pose\":";
+        pose(out, destination); out << '}';
         out << "],\"local_poses\":["; comma = false;
         for (auto* actor : rigid) {
             std::vector<PxShape*> shapes(actor->getNbShapes());
@@ -106,7 +146,10 @@ struct World {
             if (kind) out << ',';
             auto* actor = particles[kind];
             auto* data = feature_require(actor->lockParticleReadData(), "particle read data");
-            out << "{\"id\":" << id(actor) << ",\"values\":["; bool first = true;
+            PxVec3 normal; PxReal distance;
+            actor->getProjectionPlane(normal, distance);
+            out << "{\"id\":" << id(actor) << ",\"projection_plane\":[" << normal.x << ',' << normal.y << ',' << normal.z << ',' << distance;
+            out << "],\"values\":["; bool first = true;
             for (PxU32 index = 0; index < data->validParticleRange; ++index) {
                 if (!(data->validParticleBitmap[index >> 5] & (1u << (index & 31)))) continue;
                 if (!first) out << ','; first = false;
@@ -137,8 +180,11 @@ int main(int argc, char** argv) {
                 scene->simulate(1.0f / 60); scene->fetchResults(true);
             }
             auto* marker = feature_require(pvdsdk::PvdDataStream::create(context.pvd), "marker stream");
+            define_bounds(*marker);
+            a.publishBounds(*marker); b.publishBounds(*marker);
+            a.target(0); b.target(100);
             truth << std::setprecision(std::numeric_limits<float>::max_digits10)
-                  << "{\"sdk\":\"3.4.2\",\"warmup_frames\":2,\"frames\":[";
+                  << "{\"sdk\":\"3.4.2\",\"bounds_source\":\"explicit-sdk-getters\",\"warmup_frames\":2,\"frames\":[";
             for (unsigned frame = 0; frame < 144; ++frame) {
                 int shifted = -1; PxVec3 shift(0);
                 if (frame == 1) { shifted = 0; shift = PxVec3(10000.25f, -2000.125f, 50.75f); }
@@ -147,7 +193,10 @@ int main(int argc, char** argv) {
                 if (frame == 5) { shifted = 0; shift = PxVec3(-9876.75f, 2000, -44.75f); }
                 if (frame == 6) {
                     a.rigid[1]->setGlobalPose(PxTransform(PxVec3(12.125f, 4.25f, -3.5f), PxQuat(0.4f, PxVec3(1, 0, 0))));
+                    require_stream(marker->setPropertyValue(a.rigid[1], "WorldBounds", a.rigid[1]->getWorldBounds(1.0f)));
                 }
+                if (frame == 4) a.target(25);
+                if (frame == 7) b.target(80);
                 if (frame == 8) { shifted = 1; shift = PxVec3(0.125f, -0.25f, 0.5f); }
                 if (shifted >= 0) (shifted == 0 ? context.scene : other)->shiftOrigin(shift);
                 marker->beginSection(context.scene, "frame"); marker->endSection(context.scene, "frame");

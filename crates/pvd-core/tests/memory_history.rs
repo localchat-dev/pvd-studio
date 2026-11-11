@@ -110,6 +110,7 @@ fn memory_replay_preserves_allocation_lifetimes_unknown_frees_and_churn() {
         }
     }
     let one = memory.churn_at_frame(1);
+    assert_eq!((one.surviving_allocations, one.surviving_bytes), (1, 96));
     assert_eq!(
         (
             one.allocations,
@@ -121,6 +122,7 @@ fn memory_replay_preserves_allocation_lifetimes_unknown_frees_and_churn() {
     );
     assert_eq!(one.live_byte_change(), 32);
     let two = memory.churn_at_frame(2);
+    assert_eq!((two.surviving_allocations, two.surviving_bytes), (1, 32));
     assert_eq!(two.replaced_addresses, 1);
     assert_eq!(two.replaced_bytes, 96);
     assert_eq!(two.live_byte_change(), -64);
@@ -129,6 +131,51 @@ fn memory_replay_preserves_allocation_lifetimes_unknown_frees_and_churn() {
     assert_eq!(memory.state_at_frame(100).live, memory.live);
     assert_eq!(memory.state_at_frame(100).total_allocated_bytes, 240);
     assert_eq!(memory.churn_at_frame(3).unmatched_frees, 1);
+    for (frame, count, bytes) in [(0, 2, 104), (1, 1, 96), (2, 1, 32), (3, 0, 0), (4, 0, 0)] {
+        let churn = memory.churn_at_frame(frame);
+        assert_eq!(
+            (churn.surviving_allocations, churn.surviving_bytes),
+            (count, bytes)
+        );
+    }
+}
+
+#[test]
+fn churn_tracks_same_frame_survivors_across_flushes_reuse_and_retention() {
+    let mut analysis = fixture();
+    ingest(
+        &mut analysis,
+        7,
+        5,
+        &[allocate(8, 20), allocate(12, 20), free(20), allocate(0, 21)],
+    );
+    ingest(&mut analysis, 9, 5, &[allocate(16, 20)]);
+    ingest(&mut analysis, 7, 5, &[allocate(24, 22), allocate(32, 22)]);
+    let checkpoint = analysis.clone();
+    ingest(&mut analysis, 7, 6, &[free(22)]);
+    ingest(&mut analysis, 9, 40, &[allocate(44, 20)]);
+    for source in [&checkpoint, &analysis] {
+        let churn = source.memory.churn_at_frame(5);
+        assert_eq!(
+            (churn.surviving_allocations, churn.surviving_bytes),
+            (3, 48)
+        );
+        assert_eq!((churn.allocations, churn.allocated_bytes), (6, 92));
+        assert_eq!((churn.frees, churn.freed_bytes), (1, 12));
+        assert_eq!((churn.replaced_addresses, churn.replaced_bytes), (2, 32));
+    }
+    assert_eq!(analysis.memory.churn_at_frame(6).surviving_bytes, 0);
+    assert_eq!(analysis.memory.churn_at_frame(39).surviving_bytes, 0);
+    assert_eq!(analysis.memory.churn_at_frame(40).surviving_bytes, 44);
+    assert_eq!(analysis.memory.churn_at_frame(40).live_byte_change(), 28);
+    analysis.retain_recent(5);
+    assert_eq!(
+        analysis.memory.churn_at_frame(5),
+        checkpoint.memory.churn_at_frame(5)
+    );
+    assert_eq!(analysis.memory.churn_at_frame(4).surviving_bytes, 0);
+    analysis.retain_recent(6);
+    assert_eq!(analysis.memory.churn_at_frame(6).surviving_allocations, 0);
 }
 
 #[test]
@@ -223,6 +270,19 @@ fn real_sdk_memory_states_match_flush_samples_and_independent_event_replay() {
             live.values().map(|allocation| allocation.size).sum::<u64>()
         );
         assert_eq!(sample.live_allocations, live.len());
+        let survivors: Vec<_> = live
+            .values()
+            .filter(|allocation| allocation.received_frame == frame)
+            .collect();
+        let churn = memory.churn_at_frame(frame);
+        assert_eq!(churn.surviving_allocations, survivors.len() as u64);
+        assert_eq!(
+            churn.surviving_bytes,
+            survivors
+                .iter()
+                .map(|allocation| allocation.size)
+                .sum::<u64>()
+        );
         reference.insert(frame, live.clone());
     }
     assert!(

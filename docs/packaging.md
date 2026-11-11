@@ -44,8 +44,11 @@
 $captureInput = (Resolve-Path 'captures/physx-3.4.pvdstream').Path
 & (Join-Path $packageRoot 'pvd-cli.exe') verify $captureInput
 if ($LASTEXITCODE -ne 0) { throw 'Packaged CLI verification failed' }
-& (Join-Path $packageRoot 'pvd-desktop.exe') --render-check $captureInput (Join-Path $packageRoot 'render-check.png') 0 timeline 1440 960
-if ($LASTEXITCODE -ne 0) { throw 'Packaged render check failed' }
+$renderOutput = Join-Path $packageRoot 'render-check.png'
+$renderProcess = Start-Process -FilePath (Join-Path $packageRoot 'pvd-desktop.exe') `
+    -ArgumentList @('--render-check', "`"$captureInput`"", "`"$renderOutput`"", '0', 'timeline', '1440', '960') `
+    -WindowStyle Hidden -Wait -PassThru
+if ($renderProcess.ExitCode -ne 0) { throw 'Packaged render check failed' }
 ```
 
 检查图片与缓存留在解压验证目录。包体大小随输入和构建变化，不作为固定验收阈值。

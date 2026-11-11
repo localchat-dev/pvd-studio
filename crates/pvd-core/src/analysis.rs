@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 mod allocation_map;
+mod decode_error;
+pub use decode_error::DecodeError;
 #[cfg(test)]
 mod sharing_tests;
 pub mod view;
@@ -201,6 +203,9 @@ pub struct MemoryChurn {
     pub replaced_bytes: u64,
     pub unmatched_frees: u64,
     pub replaced_addresses: u64,
+    /// Allocations received in this frame that remain live at its end.
+    pub surviving_allocations: u64,
+    pub surviving_bytes: u64,
 }
 
 impl MemoryChurn {
@@ -404,15 +409,25 @@ impl MemoryAnalysis {
                 } => {
                     churn.allocations += 1;
                     churn.allocated_bytes += allocation.size;
+                    churn.surviving_allocations += 1;
+                    churn.surviving_bytes += allocation.size;
                     if let Some(replaced) = replaced {
                         churn.replaced_addresses += 1;
                         churn.replaced_bytes += replaced.size;
+                        if replaced.received_frame == received_frame {
+                            churn.surviving_allocations -= 1;
+                            churn.surviving_bytes -= replaced.size;
+                        }
                     }
                 }
                 MemoryEventKind::Free { allocation } => {
                     churn.frees += 1;
                     if let Some(allocation) = allocation {
                         churn.freed_bytes += allocation.size;
+                        if allocation.received_frame == received_frame {
+                            churn.surviving_allocations -= 1;
+                            churn.surviving_bytes -= allocation.size;
+                        }
                     } else {
                         churn.unmatched_frees += 1;
                     }
@@ -981,6 +996,24 @@ impl Analysis {
         mut resolve: impl FnMut(u32) -> Result<&'a str, Error>,
     ) -> Result<(), Error> {
         self.memory_buffer_with_resolver(id, bytes, Endian::Little, frame, Some(&mut resolve), None)
+    }
+
+    pub(crate) fn ingest_native_memory_for_export<'a>(
+        &mut self,
+        id: u64,
+        bytes: &[u8],
+        frame: usize,
+        mut resolve: impl FnMut(u32) -> Result<&'a str, Error>,
+        drain: &mut dyn FnMut(&mut Analysis) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.memory_buffer_with_resolver(
+            id,
+            bytes,
+            Endian::Little,
+            frame,
+            Some(&mut resolve),
+            Some(drain),
+        )
     }
 
     fn memory_buffer_with_resolver<'a>(
@@ -1714,12 +1747,22 @@ mod tests {
                         accounted_bytes: builder.recording.analysis.accounted_bytes(),
                     });
             }
-            builder.streaming.as_mut().unwrap().complete(
-                frame as u64,
-                1,
-                &builder.state,
-                &builder.recording.analysis,
-            );
+            builder
+                .streaming
+                .as_mut()
+                .unwrap()
+                .complete(
+                    crate::FrameInfo {
+                        index: frame,
+                        timestamp: frame as u64,
+                        scene_id: 1,
+                    },
+                    crate::frame_sources::FrameBinding::sdk("frame", 1, &builder.state).unwrap(),
+                    &builder.state,
+                    &builder.recording.analysis,
+                    &mut builder.recording.frame_sources,
+                )
+                .unwrap();
             if targets.contains(&frame) {
                 let analysis = builder.recording.analysis.legacy().unwrap();
                 let values = analysis

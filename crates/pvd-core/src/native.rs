@@ -1,7 +1,7 @@
 //! NVIDIA PVD3 client database v1 import, distinct from SDK communication streams.
 use crate::{
-    Action, Error, Recording, RecordingBuilder, RecordingSource, UntimedErrorEvent, Value,
-    analysis::view::ProfileSource, decode_value, error,
+    Action, Error, InitialUntimedError, Recording, RecordingBuilder, RecordingSource,
+    UntimedErrorEvent, Value, analysis::view::ProfileSource, decode_value, error,
 };
 use pvd_protocol::{Endian, Event, EventGroup, Header, Name};
 use std::{
@@ -9,10 +9,21 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) mod analysis_history;
 #[cfg(test)]
 mod container_tests;
 mod contexts;
+mod errors;
+pub mod export;
+mod import;
+mod memory_buffer;
+pub(crate) mod memory_totals;
+mod read_source;
+mod settings;
 mod snapshot;
+mod source_identity;
+#[cfg(test)]
+mod timeline_tests;
 pub(crate) use contexts::SceneContexts;
 
 pub const MAGIC: u32 = 0x3610_1bb0;
@@ -21,6 +32,8 @@ const MAX_METADATA: usize = 64 << 20;
 
 #[derive(Debug)]
 pub struct ContainerInfo {
+    pub source_bytes: u64,
+    pub source_blake3: Option<[u8; 32]>,
     pub object_metadata_bytes: usize,
     pub communication_metadata_bytes: usize,
     pub classes: usize,
@@ -128,20 +141,42 @@ struct Property {
     offset32: usize,
     values: Vec<(u32, u32)>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClassPacking {
+    uniform_width: i32,
+    class_type: i32,
+}
+
+impl Default for ClassPacking {
+    fn default() -> Self {
+        Self {
+            uniform_width: -1,
+            class_type: -1,
+        }
+    }
+}
+
 struct Class {
     name: Name,
     base: u32,
+    packing: ClassPacking,
     size: usize,
     properties: Vec<u32>,
     dynamic: bool,
+    has_pointers: bool,
     string_offsets: Vec<usize>,
 }
 struct MessageEntry {
+    datatype: Name,
+    datatype_id: u32,
     property: u32,
     offset: usize,
     size: usize,
+    destination_size: usize,
 }
 struct Message {
+    class_name: Name,
+    class: u32,
     size: usize,
     entries: Vec<MessageEntry>,
 }
@@ -159,14 +194,29 @@ struct ProfileCatalogEntry {
     events: Vec<(u16, String, bool)>,
 }
 
+struct CommunicationCatalog {
+    profiles: Vec<ProfileCatalogEntry>,
+    memory: memory_totals::Catalog,
+}
+
+#[cfg(test)]
 fn profile_catalog(
     comm: &mut Reader<'_>,
     sources: &BTreeMap<u64, u64>,
     allocation: &mut usize,
-    mut proceed: impl FnMut() -> bool,
+    proceed: impl FnMut() -> bool,
 ) -> Result<Vec<ProfileCatalogEntry>, Error> {
     comm.words(12)?;
     comm.words(8)?;
+    Ok(profile_catalog_tail(comm, sources, allocation, proceed)?.profiles)
+}
+
+fn profile_catalog_tail(
+    comm: &mut Reader<'_>,
+    sources: &BTreeMap<u64, u64>,
+    allocation: &mut usize,
+    mut proceed: impl FnMut() -> bool,
+) -> Result<CommunicationCatalog, Error> {
     for _ in 0..comm.count()? {
         if !proceed() {
             return Err(cancelled());
@@ -215,29 +265,36 @@ fn profile_catalog(
             events,
         });
     }
-    comm.take(8)?;
-    for _ in 0..comm.count()? {
-        if !proceed() {
-            return Err(cancelled());
-        }
-        comm.string()?;
-        comm.string()?;
-        comm.take(8)?;
-    }
+    let memory = memory_totals::Catalog::read(comm, sources, allocation, &mut proceed)?;
     comm.end()?;
-    Ok(catalog)
+    Ok(CommunicationCatalog {
+        profiles: catalog,
+        memory,
+    })
 }
 
 fn register_profile_catalog(
     builder: &mut RecordingBuilder,
     catalog: Vec<ProfileCatalogEntry>,
 ) -> Result<(), Error> {
+    register_profile_catalog_with_progress(builder, catalog, &mut || true)
+}
+
+fn register_profile_catalog_with_progress(
+    builder: &mut RecordingBuilder,
+    catalog: Vec<ProfileCatalogEntry>,
+    proceed: &mut dyn FnMut() -> bool,
+) -> Result<(), Error> {
     let mut ambiguous = BTreeSet::new();
     for zone in catalog {
-        builder
-            .recording
-            .analysis
-            .add_zone(zone.local_id, zone.name)?;
+        if !proceed() {
+            return Err(cancelled());
+        }
+        apply_analysis_input(
+            builder,
+            crate::live::AnalysisInput::Zone(zone.local_id, zone.name),
+            proceed,
+        )?;
         let mut enabled_flags = BTreeMap::new();
         for (id, name, enabled) in zone.events {
             if enabled_flags
@@ -248,10 +305,11 @@ fn register_profile_catalog(
                     "PVD3 profile catalog has conflicting event enabled definitions",
                 ));
             }
-            builder
-                .recording
-                .analysis
-                .add_event(zone.local_id, id, name)?;
+            apply_analysis_input(
+                builder,
+                crate::live::AnalysisInput::Event(zone.local_id, id, name),
+                proceed,
+            )?;
             if builder
                 .recording
                 .analysis
@@ -271,6 +329,12 @@ fn register_profile_catalog(
 }
 impl Metadata {
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_with_progress(bytes, &mut || true)
+    }
+    fn parse_with_progress(
+        bytes: &[u8],
+        progress: &mut dyn FnMut() -> bool,
+    ) -> Result<Self, Error> {
         let mut allocation = 0usize;
         let mut r = Reader::new(bytes);
         if r.u32()? != 1 {
@@ -282,13 +346,17 @@ impl Metadata {
         r.u32()?;
         let mut strings = BTreeMap::from([(0, String::new())]);
         for _ in 0..count {
+            if !progress() {
+                return Err(cancelled());
+            }
             let id = r.u32()?;
             let bytes = r.blob()?;
             if bytes.is_empty() || bytes.last() != Some(&0) || bytes.len() > 32 << 10 {
                 return Err(error("invalid PVD3 metadata string"));
             }
-            let value = std::str::from_utf8(&bytes[..bytes.len() - 1])?.to_owned();
+            let value = std::str::from_utf8(&bytes[..bytes.len() - 1])?;
             metadata_budget(&mut allocation, value.len(), 1)?;
+            let value = value.to_owned();
             if strings.insert(id, value).is_some() {
                 return Err(error("duplicate PVD3 string handle"));
             }
@@ -301,6 +369,9 @@ impl Metadata {
         )?;
         let mut properties = Vec::with_capacity(count);
         for index in 0..count {
+            if !progress() {
+                return Err(cancelled());
+            }
             if !r.marker()? {
                 properties.push(None);
                 continue;
@@ -323,6 +394,9 @@ impl Metadata {
             metadata_budget(&mut allocation, count, 8)?;
             let mut values = Vec::with_capacity(count);
             for _ in 0..count {
+                if !progress() {
+                    return Err(cancelled());
+                }
                 let value = r.u32()?;
                 values.push((r.u32()?, value));
             }
@@ -342,6 +416,9 @@ impl Metadata {
         metadata_budget(&mut allocation, count, std::mem::size_of::<Option<Class>>())?;
         let mut classes = Vec::with_capacity(count);
         for index in 0..count {
+            if !progress() {
+                return Err(cancelled());
+            }
             if !r.marker()? {
                 classes.push(None);
                 continue;
@@ -351,7 +428,10 @@ impl Metadata {
                 return Err(error("PVD3 class ID differs from table index"));
             }
             let base = r.u32()?;
-            r.take(8)?;
+            let packing = ClassPacking {
+                uniform_width: r.u32()? as i32,
+                class_type: r.u32()? as i32,
+            };
             let flags = r.take(2)?;
             if flags.iter().any(|flag| *flag > 1) {
                 return Err(error("invalid PVD3 class flags"));
@@ -363,25 +443,36 @@ impl Metadata {
             metadata_budget(&mut allocation, count, size_of::<u32>())?;
             let mut class_properties = Vec::with_capacity(count);
             for _ in 0..count {
+                if !progress() {
+                    return Err(cancelled());
+                }
                 class_properties.push(r.u32()?);
             }
             let pointer_count = r.count()?;
             metadata_budget(&mut allocation, pointer_count, 8)?;
+            let mut has_pointers = pointer_count != 0;
             let mut string_offsets = Vec::new();
             for _ in 0..pointer_count {
+                if !progress() {
+                    return Err(cancelled());
+                }
                 let kind = r.u32()?;
                 let offset = r.u32()? as usize;
                 if kind == 2 {
                     string_offsets.push(offset);
                 }
             }
-            r.words(8)?;
+            let pointer_count = r.count()?;
+            has_pointers |= pointer_count != 0;
+            r.take(pointer_count * 8)?;
             classes.push(Some(Class {
                 name,
                 base,
+                packing,
                 size,
                 properties: class_properties,
                 dynamic,
+                has_pointers,
                 string_offsets,
             }));
         }
@@ -393,11 +484,16 @@ impl Metadata {
         )?;
         let mut messages = Vec::with_capacity(count);
         for index in 0..count {
+            if !progress() {
+                return Err(cancelled());
+            }
             if !r.marker()? {
                 messages.push(None);
                 continue;
             }
-            r.take(20)?;
+            let class_name = r.name()?;
+            let class = r.u32()?;
+            r.name()?;
             if r.u32()? as usize != index {
                 return Err(error("PVD3 message ID differs from table index"));
             }
@@ -406,22 +502,34 @@ impl Metadata {
             metadata_budget(&mut allocation, count, std::mem::size_of::<MessageEntry>())?;
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
-                r.take(12)?;
+                if !progress() {
+                    return Err(cancelled());
+                }
+                let datatype = r.name()?;
+                let datatype_id = r.u32()?;
                 let offset = r.u32()? as usize;
                 let len = r.u32()? as usize;
-                r.u32()?;
+                let destination_size = r.u32()? as usize;
                 let property = r.u32()?;
                 if offset.checked_add(len).is_none_or(|end| end > size) {
                     return Err(error("PVD3 message property exceeds message size"));
                 }
                 entries.push(MessageEntry {
+                    datatype,
+                    datatype_id,
                     property,
                     offset,
                     size: len,
+                    destination_size,
                 });
             }
             r.words(4)?;
-            messages.push(Some(Message { size, entries }));
+            messages.push(Some(Message {
+                class_name,
+                class,
+                size,
+                entries,
+            }));
         }
         r.end()?;
         Ok(Self {
@@ -444,7 +552,17 @@ impl Metadata {
             .ok_or_else(|| error(format!("undefined PVD3 class {id}")))
     }
     fn register(&self, builder: &mut RecordingBuilder) -> Result<(), Error> {
+        self.register_with_progress(builder, &mut || true)
+    }
+    fn register_with_progress(
+        &self,
+        builder: &mut RecordingBuilder,
+        proceed: &mut dyn FnMut() -> bool,
+    ) -> Result<(), Error> {
         for (&handle, value) in &self.strings {
+            if !proceed() {
+                return Err(cancelled());
+            }
             push(
                 builder,
                 Event::StringHandle {
@@ -454,9 +572,15 @@ impl Metadata {
             )?;
         }
         for class in self.classes.iter().flatten() {
+            if !proceed() {
+                return Err(cancelled());
+            }
             push(builder, Event::CreateClass { name: class.name })?;
         }
         for class in self.classes.iter().flatten() {
+            if !proceed() {
+                return Err(cancelled());
+            }
             if class.base != u32::MAX {
                 push(
                     builder,
@@ -469,6 +593,9 @@ impl Metadata {
         }
         let mut missing_semantics = 0;
         for p in self.properties.iter().flatten() {
+            if !proceed() {
+                return Err(cancelled());
+            }
             let semantic = if p.semantic != 0 && !self.strings.contains_key(&p.semantic) {
                 missing_semantics += 1;
                 0
@@ -579,22 +706,39 @@ impl Metadata {
             if class.size != expected.0 || class.string_offsets != expected.1 || items > 100_000 {
                 return Err(error("unsupported PVD3 scene-query layout or record limit"));
             }
+            let mut expanded_bytes = data.len();
             for record in data.chunks_exact(class.size) {
-                expanded.extend_from_slice(record);
                 for offset in &class.string_offsets {
                     let handle = record
                         .get(*offset..*offset + 4)
                         .ok_or_else(|| error("PVD3 string offset exceeds record"))?;
-                    let value = builder.string(u32::from_le_bytes(handle.try_into()?))?;
+                    let handle = u32::from_le_bytes(handle.try_into()?);
+                    let value = self
+                        .strings
+                        .get(&handle)
+                        .ok_or_else(|| error(format!("undefined PVD3 string handle {handle}")))?;
                     if value.len() > 256 {
                         return Err(error("PVD3 scene-query array name exceeds 256 bytes"));
                     }
-                    if expanded.len() + value.len() + 1 > MAX_METADATA {
-                        return Err(error("PVD3 expanded scene queries exceed 64 MiB"));
-                    }
+                    expanded_bytes = expanded_bytes
+                        .checked_add(value.len() + 1)
+                        .ok_or_else(|| error("PVD3 expanded scene-query size overflow"))?;
+                }
+            }
+            value_budget(
+                builder,
+                value_bytes
+                    .checked_add(expanded_bytes)
+                    .ok_or_else(|| error("PVD3 decoded scene-query size overflow"))?,
+            )?;
+            expanded.try_reserve_exact(expanded_bytes)?;
+            for record in data.chunks_exact(class.size) {
+                expanded.extend_from_slice(record);
+                for offset in &class.string_offsets {
+                    let handle = u32::from_le_bytes(record[*offset..*offset + 4].try_into()?);
+                    let value = &self.strings[&handle];
                     expanded.extend_from_slice(value.as_bytes());
                     expanded.push(0);
-                    value_budget(builder, value_bytes + expanded.len())?;
                 }
             }
             expanded.as_slice()
@@ -639,7 +783,7 @@ impl Metadata {
         }
         if name == "events" {
             value_budget(builder, data.len())?;
-            let object_type = &builder.state.objects[&id].type_name;
+            let object_type = builder.state.objects[&id].type_name.clone();
             if matches!(
                 object_type.as_str(),
                 "_debugger_::PxProfileZone"
@@ -652,7 +796,7 @@ impl Metadata {
                 {
                     return Err(error("unsupported PVD3 event buffer property layout"));
                 }
-                let frame = builder.recording.frames.len();
+                let frame = received_frame(builder);
                 if object_type == "_debugger_::PvdUserRenderer" {
                     let limit = MAX_METADATA
                         .min(builder.memory_limit.saturating_sub(builder.retained_bytes));
@@ -668,12 +812,29 @@ impl Metadata {
                     if builder.recording.analysis.profile_zone_name(id).is_none() {
                         return Err(error("PVD3 profile buffer has no saved zone catalog"));
                     }
-                    builder.recording.analysis.ingest(
-                        id,
-                        object_type,
-                        data,
-                        Endian::Little,
-                        frame,
+                    apply_analysis_input(
+                        builder,
+                        crate::live::AnalysisInput::Buffer {
+                            id,
+                            kind: object_type,
+                            bytes: Arc::from(data),
+                            little_endian: true,
+                            frame,
+                        },
+                        progress,
+                    )?;
+                } else if builder.streaming.is_some() {
+                    let normalized = memory_buffer::normalize(data, &self.strings, progress)?;
+                    apply_analysis_input(
+                        builder,
+                        crate::live::AnalysisInput::Buffer {
+                            id,
+                            kind: object_type,
+                            bytes: normalized.into(),
+                            little_endian: true,
+                            frame,
+                        },
+                        progress,
                     )?;
                 } else {
                     builder
@@ -774,54 +935,6 @@ impl Metadata {
         }
         Ok(())
     }
-
-    fn append_error(
-        &self,
-        builder: &mut RecordingBuilder,
-        id: u64,
-        data: &[u8],
-        history_event: u64,
-    ) -> Result<(), Error> {
-        if data.len() != 20 {
-            return Err(error("PVD3 error record must contain exactly 20 bytes"));
-        }
-        let mut record = Reader::new(data);
-        let code = record.u32()?;
-        let message_handle = record.u32()?;
-        let file_handle = record.u32()?;
-        let line = record.u32()?;
-        let index = record.u32()?;
-        let resolve = |handle| {
-            self.strings
-                .get(&handle)
-                .map(String::as_str)
-                .ok_or_else(|| error(format!("undefined PVD3 error string handle {handle}")))
-        };
-        let message = resolve(message_handle)?;
-        let file = resolve(file_handle)?;
-        let generation = builder
-            .state
-            .objects
-            .get(&id)
-            .ok_or_else(|| error("PVD3 error container instance is missing"))?
-            .generation;
-        if builder.recording.untimed_errors.len() >= MAX_ITEMS {
-            return Err(error("PVD3 error list exceeds one million records"));
-        }
-        builder.reserve_history(message.len() + file.len() + 2 * size_of::<UntimedErrorEvent>())?;
-        builder.recording.untimed_errors.push(UntimedErrorEvent {
-            code,
-            message: message.to_owned(),
-            file: file.to_owned(),
-            line,
-            index,
-            history_event,
-            received_frame: builder.recording.frames.len(),
-            container_instance: id,
-            container_generation: generation,
-        });
-        Ok(())
-    }
 }
 
 fn metadata_budget(bytes: &mut usize, count: usize, size: usize) -> Result<(), Error> {
@@ -847,10 +960,40 @@ fn metadata_size(metadata: &Metadata, property: &Property) -> Result<usize, Erro
 }
 
 fn value_budget(builder: &RecordingBuilder, bytes: usize) -> Result<(), Error> {
-    if bytes > MAX_METADATA || bytes > builder.memory_limit.saturating_sub(builder.retained_bytes) {
+    let state_bytes = builder
+        .streaming
+        .as_ref()
+        .map_or(0, |streaming| streaming.state_bytes);
+    if bytes > MAX_METADATA
+        || bytes
+            > builder
+                .memory_limit
+                .saturating_sub(builder.retained_bytes.saturating_add(state_bytes))
+    {
         return Err(error(
             "PVD3 decoded property exceeds 64 MiB or remaining history memory budget",
         ));
+    }
+    Ok(())
+}
+
+fn received_frame(builder: &RecordingBuilder) -> usize {
+    builder
+        .streaming
+        .as_ref()
+        .map_or(builder.recording.frames.len(), |streaming| {
+            streaming.frames_seen
+        })
+}
+
+fn apply_analysis_input(
+    builder: &mut RecordingBuilder,
+    input: crate::live::AnalysisInput,
+    proceed: &mut dyn FnMut() -> bool,
+) -> Result<(), Error> {
+    builder.mutate_analysis(|analysis| input.apply_shared(analysis, &mut || !proceed()))?;
+    if let Some(streaming) = &mut builder.streaming {
+        streaming.analysis_input(input);
     }
     Ok(())
 }
@@ -897,6 +1040,7 @@ fn next_page(value: usize) -> Result<usize, Error> {
         .and_then(|v| v.checked_mul(4096))
         .ok_or_else(|| error("PVD3 page alignment overflow"))
 }
+#[cfg(test)]
 fn checked_range(bytes: &[u8], offset: u64, len: u64) -> Result<&[u8], Error> {
     let end = offset
         .checked_add(len)
@@ -919,229 +1063,61 @@ pub fn from_bytes_with_progress(
 
 pub fn read_with_progress(
     bytes: &[u8],
-    mut progress: impl FnMut(u64, u64) -> bool,
+    progress: impl FnMut(u64, u64) -> bool,
 ) -> Result<(Recording, ContainerInfo), Error> {
     if bytes.len() > 512 << 20 {
         return Err(error("PVD3 recording exceeds 512 MiB"));
     }
-    if !progress(0, 0) {
-        return Err(cancelled());
-    }
-    let mut r = Reader::new(bytes);
-    if r.u32()? != MAGIC || r.u32()? != 1 {
-        return Err(error(
-            "unsupported PVD3 client database signature or version",
-        ));
-    }
-    let object_len = r.u32()? as usize;
-    let comm_len = r.u32()? as usize;
-    if object_len > MAX_METADATA || comm_len > MAX_METADATA {
-        return Err(error("PVD3 metadata exceeds 64 MiB"));
-    }
-    let metadata = Metadata::parse(r.take(object_len)?)?;
-    if !progress(0, 0) {
-        return Err(cancelled());
-    }
-    let mut comm = Reader::new(r.take(comm_len)?);
-    if comm.u32()? != 1 {
-        return Err(error("unsupported PVD3 communication metadata version"));
-    }
-    let numerator = comm.u64()?;
-    let denominator = comm.u64()?;
-    if numerator == 0 || denominator == 0 {
-        return Err(error("invalid PVD3 clock conversion"));
-    }
-    let count = comm.count()?;
-    let mut index_allocation = 0usize;
-    metadata_budget(&mut index_allocation, count, 192)?;
-    let mut source_ids = BTreeMap::<u64, Vec<u64>>::new();
-    let mut instance_sources = BTreeMap::new();
-    for _ in 0..count {
-        let id = comm.u32()?;
-        let source = comm.u64()?;
-        if comm.u32()? != id {
-            return Err(error("PVD3 instance metadata key mismatch"));
-        }
-        comm.take(10)?;
-        if instance_sources.insert(u64::from(id), source).is_some() {
-            return Err(error("duplicate PVD3 instance metadata ID"));
-        }
-        source_ids.entry(source).or_default().push(u64::from(id));
-    }
-    let catalog = profile_catalog(&mut comm, &instance_sources, &mut index_allocation, || {
-        progress(0, 0)
-    })?;
-    let aligned = next_page(r.pos)?;
-    r.take(aligned - r.pos)?;
-    let total = r.u64()?;
-    if total > 20_000_000 {
-        return Err(error("PVD3 history exceeds 20 million events"));
-    }
-    let count = r.count()?;
-    metadata_budget(&mut index_allocation, count, 32)?;
-    let mut pages = Vec::with_capacity(count);
-    for _ in 0..count {
-        pages.push((r.u64()?, r.u64()?, r.u32()?, r.u32()?));
-    }
-    let count = r.count()?;
-    metadata_budget(&mut index_allocation, count, 32)?;
-    let mut snapshots = Vec::with_capacity(count);
-    for _ in 0..count {
-        snapshots.push((r.u64()?, r.u64()?, r.u32()?, r.u32()?));
-    }
-    let count = r.count()?;
-    metadata_budget(&mut index_allocation, count, 128)?;
-    let mut instances = BTreeMap::new();
-    for _ in 0..count {
-        if !progress(0, total) {
-            return Err(cancelled());
-        }
-        let id = r.u32()?;
-        let position = r.u64()?;
-        let len = r.u32()?;
-        if instances
-            .insert(position, (id, len))
-            .is_some_and(|previous| previous != (id, len))
-        {
-            return Err(error("conflicting PVD3 saved instance directory entries"));
-        }
-    }
-    let base = next_page(r.pos)?;
-    let data = bytes
-        .get(base..)
-        .ok_or_else(|| error("missing PVD3 history backing data"))?;
-    let Some(&(event, position, len, _)) = snapshots.first() else {
-        return Err(error("missing PVD3 initial snapshot"));
-    };
-    if event != 0 {
-        return Err(error("PVD3 initial snapshot must precede event zero"));
-    }
-    let initial_snapshot = checked_range(data, position, u64::from(len))?;
-    for (_, pos, len, _) in &snapshots {
-        checked_range(data, *pos, u64::from(*len))?;
-    }
-    validate_saved_directory(&metadata, data, &instances, &mut || progress(0, total))?;
-    let info = ContainerInfo {
-        object_metadata_bytes: object_len,
-        communication_metadata_bytes: comm_len,
-        classes: metadata.classes.iter().flatten().count(),
-        properties: metadata.properties.iter().flatten().count(),
-        property_messages: metadata.messages.iter().flatten().count(),
-        history_events: total,
-        history_pages: pages.len(),
-        source_ids: instance_sources,
-    };
-    let mut builder = RecordingBuilder::new(Header {
-        version: 1,
-        timestamp_numerator: numerator,
-        timestamp_denominator: denominator,
-        flags: 0,
-        endian: Endian::Little,
-    });
-    builder.recording.source = RecordingSource::Pvd3Database;
-    builder.recording.analysis.legacy_mut()?;
-    metadata.register(&mut builder)?;
-    register_profile_catalog(&mut builder, catalog)?;
-    snapshot::restore(
-        &metadata,
-        &mut builder,
-        data,
-        initial_snapshot,
-        &mut index_allocation,
-        &mut || progress(0, total),
-    )?;
-    builder.recording.diagnostics.push("PVD3 client database import: object IDs and profile zone IDs are container-local IDs; performance contexts retain SDK source values. Profile names are saved metadata, not a history of names. Generic profile curves use the explicitly selected Scene time windows; fixed simulation/collision/solver curves use verified saved Scene source mappings; source-pointer reuse across Scene lifetimes is conservatively excluded. Memory events use flush received_frame, not exact allocation timestamps; post-frame flushes remain part of recording-end state. Saved errors have no timestamps or affected Actor IDs; their independent untimed list preserves container instance, source Index, history order and received_frame. SDK debug rendering uses saved container-local instance IDs and resets at captured frame boundaries; paired original-file validation covers joint frames, four joint-limit kinds, an RGB triangle and multiple flushes per frame; points, lines, text, nonempty bulk drawing and renderer recreation still need native fixtures. Communication display flags and camera settings are not imported. Unsupported history/user event types stop import explicitly.".into());
-    let mut index = 0u64;
-    let mut previous_end = 0u64;
-    for (first, pos, count, len) in pages {
-        if first != index || pos < previous_end || count == 0 {
-            return Err(error("invalid PVD3 page ordering"));
-        }
-        previous_end = pos
-            .checked_add(u64::from(len))
-            .ok_or_else(|| error("PVD3 page length overflow"))?;
-        let mut page = Reader::new(checked_range(data, pos, u64::from(len))?);
-        let offsets_count = page.count()?;
-        if offsets_count != count as usize {
-            return Err(error("PVD3 page event count mismatch"));
-        }
-        let mut offsets = Vec::with_capacity(offsets_count + 1);
-        for _ in 0..offsets_count {
-            offsets.push(page.u32()? as usize);
-        }
-        let payload = page.take(page.bytes.len() - page.pos)?;
-        if offsets.first() != Some(&0) {
-            return Err(error("PVD3 first event offset is not zero"));
-        }
-        offsets.push(payload.len());
-        for window in offsets.windows(2) {
-            if !progress(index, total) {
-                return Err(cancelled());
-            }
-            if window[0] >= window[1] {
-                return Err(error("PVD3 event offsets are not strictly increasing"));
-            }
-            let bytes = payload
-                .get(window[0]..window[1])
-                .ok_or_else(|| error("PVD3 event exceeds page boundary"))?;
-            validate_saved_event(bytes, &instances)
-                .and_then(|()| {
-                    import_event_with_progress(
-                        &metadata,
-                        &source_ids,
-                        &mut builder,
-                        bytes,
-                        index,
-                        data.len(),
-                        &mut || progress(index, total),
-                    )
-                })
-                .map_err(|e| {
-                    if e.downcast_ref::<std::io::Error>()
-                        .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
-                    {
-                        e
-                    } else {
-                        error(format!("PVD3 event {index}: {e}"))
-                    }
-                })?;
-            index += 1;
-        }
-    }
-    if index != total {
-        return Err(error("PVD3 total history event count mismatch"));
-    }
-    contexts::install(
-        &mut builder,
-        &info.source_ids,
-        &mut index_allocation,
-        &mut || progress(index, total),
-    )?;
-    if !progress(total, total) {
-        return Err(cancelled());
-    }
-    Ok((builder.finish()?, info))
+    import::read_source_with_progress(std::io::Cursor::new(bytes), None, progress)
 }
 
-fn validate_saved_directory(
-    metadata: &Metadata,
-    backing: &[u8],
-    instances: &BTreeMap<u64, (u32, u32)>,
-    progress: &mut dyn FnMut() -> bool,
-) -> Result<(), Error> {
-    for (&position, &(id, len)) in instances {
-        if !progress() {
-            return Err(cancelled());
-        }
-        let mut record = Reader::new(checked_range(backing, position, u64::from(len))?);
-        metadata.class(record.u32()?)?;
-        if record.u32()? != id {
-            return Err(error("PVD3 saved instance ID differs from its directory"));
-        }
-        record.blob()?;
-        record.end()?;
+/// Imports immutable client database bytes into disk history. Progress is history events.
+pub fn read_bytes_with_history(
+    bytes: &[u8],
+    history: crate::live::HistoryConfig,
+    progress: impl FnMut(u64, u64) -> bool,
+) -> Result<(Recording, ContainerInfo), Error> {
+    if bytes.len() > 512 << 20 {
+        return Err(error("PVD3 recording exceeds 512 MiB"));
     }
-    Ok(())
+    import::read_source_with_progress(std::io::Cursor::new(bytes), Some(history), progress)
+}
+
+/// Loads the verified client database v1 subset into disk history. Progress is history events.
+pub fn read_path_with_progress(
+    path: impl AsRef<std::path::Path>,
+    history: crate::live::HistoryConfig,
+    mut progress: impl FnMut(u64, u64) -> bool,
+) -> Result<(Recording, ContainerInfo), Error> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        options.share_mode(FILE_SHARE_READ);
+    }
+    let mut file = options.open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(error("PVD3 source must be a regular file"));
+    }
+    let modified = before.modified()?;
+    let result = if before.len() > 512 << 20 {
+        let mut checked = source_identity::CheckedSource::new(&mut file, |_, _| progress(0, 0))?;
+        let (recording, mut info) =
+            import::read_source_with_progress(&mut checked, Some(history), &mut progress)?;
+        checked.recheck(|_, _| progress(info.history_events, info.history_events))?;
+        info.source_blake3 = Some(*checked.digest().as_bytes());
+        (recording, info)
+    } else {
+        import::read_source_with_progress(&mut file, Some(history), progress)?
+    };
+    let after = file.metadata()?;
+    if before.len() != after.len() || modified != after.modified()? {
+        return Err(error("PVD3 source changed during import"));
+    }
+    Ok(result)
 }
 
 fn validate_saved_event(bytes: &[u8], instances: &BTreeMap<u64, (u32, u32)>) -> Result<(), Error> {
@@ -1413,17 +1389,21 @@ mod tests {
                 Some(Class {
                     name: renderer,
                     base: u32::MAX,
+                    packing: crate::native::ClassPacking::default(),
                     size: 0,
                     properties: vec![0],
                     dynamic: true,
+                    has_pointers: false,
                     string_offsets: vec![],
                 }),
                 Some(Class {
                     name: byte,
                     base: u32::MAX,
+                    packing: crate::native::ClassPacking::default(),
                     size: 1,
                     properties: vec![],
                     dynamic: false,
+                    has_pointers: false,
                     string_offsets: vec![],
                 }),
             ],
@@ -1596,7 +1576,7 @@ mod tests {
         );
     }
 
-    fn error_fixture() -> (Metadata, RecordingBuilder) {
+    pub(super) fn error_fixture() -> (Metadata, RecordingBuilder) {
         let error_type = Name {
             namespace: 1,
             name: 2,
@@ -1667,33 +1647,41 @@ mod tests {
                 Some(Class {
                     name: uint,
                     base: u32::MAX,
+                    packing: crate::native::ClassPacking::default(),
                     size: 4,
                     properties: vec![],
                     dynamic: false,
+                    has_pointers: false,
                     string_offsets: Vec::new(),
                 }),
                 Some(Class {
                     name: string,
                     base: u32::MAX,
+                    packing: crate::native::ClassPacking::default(),
                     size: 4,
                     properties: vec![],
                     dynamic: false,
+                    has_pointers: true,
                     string_offsets: Vec::new(),
                 }),
                 Some(Class {
                     name: error_type,
                     base: u32::MAX,
+                    packing: crate::native::ClassPacking::default(),
                     size: 20,
                     properties: (0..5).collect(),
                     dynamic: false,
+                    has_pointers: true,
                     string_offsets: vec![4, 8],
                 }),
                 Some(Class {
                     name: container,
                     base: u32::MAX,
+                    packing: crate::native::ClassPacking::default(),
                     size: 0,
                     properties: vec![5],
                     dynamic: true,
+                    has_pointers: true,
                     string_offsets: Vec::new(),
                 }),
             ],
@@ -1711,7 +1699,7 @@ mod tests {
         (metadata, builder)
     }
 
-    fn error_payload(index: u32) -> Vec<u8> {
+    pub(super) fn error_payload(index: u32) -> Vec<u8> {
         [4u32, 13, 14, 248, index]
             .into_iter()
             .flat_map(u32::to_le_bytes)
@@ -1966,7 +1954,7 @@ mod tests {
         bytes
     }
 
-    fn catalog_builder() -> RecordingBuilder {
+    pub(super) fn catalog_builder() -> RecordingBuilder {
         RecordingBuilder::new(Header {
             version: 1,
             timestamp_numerator: 1,
@@ -2073,9 +2061,11 @@ mod tests {
             classes: vec![Some(Class {
                 name,
                 base: u32::MAX,
+                packing: crate::native::ClassPacking::default(),
                 size: 4,
                 properties: vec![],
                 dynamic: false,
+                has_pointers: true,
                 string_offsets: vec![],
             })],
             properties: vec![],

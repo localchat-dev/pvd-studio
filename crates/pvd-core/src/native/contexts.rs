@@ -32,6 +32,75 @@ impl SceneContexts {
     }
 }
 
+pub(super) struct Collector(SceneContexts);
+
+impl Collector {
+    pub(super) fn from_state(
+        builder: &mut RecordingBuilder,
+        sources: &BTreeMap<u64, u64>,
+        allocation: &mut usize,
+        proceed: &mut dyn FnMut() -> bool,
+    ) -> Result<Self, Error> {
+        let count = builder
+            .state
+            .objects
+            .values()
+            .filter(|object| {
+                object.type_name == "physx3::PxScene" && sources.contains_key(&object.id)
+            })
+            .count();
+        let bytes = count
+            .checked_mul(ENTRY_BYTES)
+            .and_then(|bytes| {
+                bytes.checked_add(size_of::<SceneContexts>() + 2 * size_of::<usize>())
+            })
+            .ok_or_else(|| error("PVD3 Scene context allocation overflow"))?;
+        metadata_budget(allocation, 1, bytes)?;
+        builder.reserve_history(bytes)?;
+        let mut contexts = SceneContexts::default();
+        for object in builder.state.objects.values() {
+            if !proceed() {
+                return Err(cancelled());
+            }
+            if object.type_name == "physx3::PxScene"
+                && let Some(source) = sources.get(&object.id)
+            {
+                contexts.insert((object.id, object.generation), *source);
+            }
+        }
+        Ok(Self(contexts))
+    }
+
+    pub(super) fn observe(
+        &mut self,
+        builder: &mut RecordingBuilder,
+        sources: &BTreeMap<u64, u64>,
+        id: u64,
+        allocation: &mut usize,
+    ) -> Result<(), Error> {
+        let Some(object) = builder.state.objects.get(&id) else {
+            return Ok(());
+        };
+        let Some(source) = sources.get(&id) else {
+            return Ok(());
+        };
+        if object.type_name != "physx3::PxScene" {
+            return Ok(());
+        }
+        let lifetime = (id, object.generation);
+        if !self.0.scenes.contains_key(&lifetime) {
+            metadata_budget(allocation, 1, ENTRY_BYTES)?;
+            builder.reserve_history(ENTRY_BYTES)?;
+            self.0.insert(lifetime, *source);
+        }
+        Ok(())
+    }
+
+    pub(super) fn install(self, builder: &mut RecordingBuilder) {
+        builder.recording.native_scene_contexts = Some(Arc::new(self.0));
+    }
+}
+
 pub(super) fn install(
     builder: &mut RecordingBuilder,
     sources: &BTreeMap<u64, u64>,

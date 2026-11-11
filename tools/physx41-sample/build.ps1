@@ -1,5 +1,6 @@
 param([int]$Jobs = 8)
 $ErrorActionPreference = 'Stop'
+if ($Jobs -lt 1 -or $Jobs -gt 16) { throw 'Jobs must be between 1 and 16.' }
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $sdkRoot = Join-Path $projectRoot '.deps/physx-4.1'
 $buildRoot = Join-Path $projectRoot '.deps/physx-build'
@@ -14,6 +15,8 @@ if (!(Test-Path -LiteralPath (Join-Path $sdkRoot '.git'))) {
 }
 $actualCommit = (& git -C $sdkRoot rev-parse HEAD).Trim()
 if ($actualCommit -ne $commit) { throw "Expected official SDK commit $commit, found $actualCommit at $sdkRoot" }
+& git -C $sdkRoot diff --quiet HEAD --
+if ($LASTEXITCODE -ne 0) { throw 'The SDK checkout has tracked modifications; it was preserved.' }
 $vswherePath = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 if (!(Test-Path -LiteralPath $vswherePath)) { throw 'Existing Visual Studio C++ build tools were not found.' }
 $version = (& $vswherePath -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion).Trim()

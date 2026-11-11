@@ -32,7 +32,7 @@ pub(crate) fn scan_profile<R: Read + Seek + ?Sized>(
     scan::<R, io::Sink>(
         source,
         None,
-        AnalysisCsvKind::Profile,
+        ScanKind::ProfileQuery,
         None,
         AnalysisExportPhase::Inspect,
         progress,
@@ -51,6 +51,12 @@ pub struct ProfileNameCollision {
 pub enum AnalysisCsvKind {
     Profile,
     Memory,
+}
+
+#[derive(Clone, Copy)]
+enum ScanKind {
+    Csv(AnalysisCsvKind),
+    ProfileQuery,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,16 +122,16 @@ pub fn write_analysis_csv<W: Write + ?Sized>(
     kind: AnalysisCsvKind,
     mut progress: impl FnMut(AnalysisCsvProgress) -> bool,
 ) -> Result<AnalysisCsvReport, Error> {
+    if kind == AnalysisCsvKind::Memory
+        && recording.memory_history_scope() == crate::MemoryHistoryScope::AfterInitialSnapshot
+    {
+        return Err(error(
+            "complete memory CSV is unavailable: allocation history before the initial snapshot is unknown",
+        ));
+    }
     if recording.source == crate::RecordingSource::ProjectCapture {
         return Err(error(
             "complete analysis CSV is unavailable for a retained project capture",
-        ));
-    }
-    let analysis = &recording.analysis;
-    let memory = analysis.memory_snapshot();
-    if analysis.profile_summary().first_retained_frame != 0 {
-        return Err(error(
-            "complete analysis CSV requires the original history, not a retained window",
         ));
     }
     if let Some(diagnostic) = recording.diagnostics.iter().find(|diagnostic| {
@@ -136,6 +142,16 @@ pub fn write_analysis_csv<W: Write + ?Sized>(
         return Err(error(format!(
             "complete analysis CSV is unavailable: {diagnostic}"
         )));
+    }
+    if recording.source == crate::RecordingSource::Pvd3Database && recording.is_disk_backed() {
+        return write_native_history_csv(recording, output, kind, progress);
+    }
+    let analysis = &recording.analysis;
+    let memory = analysis.memory_snapshot();
+    if analysis.profile_summary().first_retained_frame != 0 {
+        return Err(error(
+            "complete analysis CSV requires the original history, not a retained window",
+        ));
     }
     let total_rows = match kind {
         AnalysisCsvKind::Profile => analysis.profile_spans().len(),
@@ -194,6 +210,131 @@ pub fn write_analysis_csv<W: Write + ?Sized>(
     })
 }
 
+fn write_native_history_csv<W: Write + ?Sized>(
+    recording: &Recording,
+    output: &mut W,
+    kind: AnalysisCsvKind,
+    mut progress: impl FnMut(AnalysisCsvProgress) -> bool,
+) -> Result<AnalysisCsvReport, Error> {
+    crate::native::analysis_history::validate_complete(recording)?;
+    let mut status = AnalysisCsvProgress {
+        rows_written: 0,
+        total_rows: 0,
+    };
+    let mut spans = 0u64;
+    let mut values = 0u64;
+    let mut samples = 0u64;
+    for frame in 0..=recording.frame_count() {
+        let analysis = native_frame_analysis(recording, frame, &mut progress, status)?;
+        spans = spans
+            .checked_add(frame_span_range(&analysis, frame)?.len() as u64)
+            .ok_or_else(|| error("native profile CSV row count overflow"))?;
+        values = values
+            .checked_add(
+                analysis
+                    .profile_values()
+                    .rev()
+                    .take_while(|value| value.received_frame >= frame)
+                    .filter(|value| value.received_frame == frame)
+                    .count() as u64,
+            )
+            .ok_or_else(|| error("native profile value count overflow"))?;
+        samples = samples
+            .checked_add(frame_sample_range(&analysis.memory_snapshot(), frame)?.len() as u64)
+            .ok_or_else(|| error("native memory CSV row count overflow"))?;
+    }
+    status.total_rows = match kind {
+        AnalysisCsvKind::Profile => spans,
+        AnalysisCsvKind::Memory => samples,
+    };
+    let analysis_end = crate::native::analysis_history::end_analysis(recording)?;
+    let summary = summarize(
+        analysis_end,
+        analysis_end.memory_snapshot().summary(),
+        spans,
+        values,
+    )?;
+    write_header(output, kind)?;
+    let ratio = timestamp_ratio(&recording.header);
+    for frame in 0..=recording.frame_count() {
+        let analysis = native_frame_analysis(recording, frame, &mut progress, status)?;
+        match kind {
+            AnalysisCsvKind::Profile => {
+                let range = frame_span_range(&analysis, frame)?;
+                for index in range {
+                    if status.rows_written.is_multiple_of(256) {
+                        check_csv_progress(&mut progress, status)?;
+                    }
+                    let span = analysis
+                        .profile_span(index)
+                        .ok_or_else(|| error("native profile CSV span is unavailable"))?;
+                    write_span(output, span, &summary.zones, ratio)?;
+                    status.rows_written += 1;
+                }
+            }
+            AnalysisCsvKind::Memory => {
+                let memory = analysis.memory_snapshot();
+                for index in frame_sample_range(&memory, frame)? {
+                    if status.rows_written.is_multiple_of(256) {
+                        check_csv_progress(&mut progress, status)?;
+                    }
+                    let sample = memory
+                        .sample_at(index)
+                        .ok_or_else(|| error("native memory CSV sample is unavailable"))?;
+                    write_sample(output, &sample)?;
+                    status.rows_written += 1;
+                }
+            }
+        }
+    }
+    if status.rows_written != status.total_rows {
+        return Err(error("native analysis CSV row count changed during export"));
+    }
+    check_csv_progress(&mut progress, status)?;
+    Ok(AnalysisCsvReport {
+        exported_rows: status.rows_written,
+        summary,
+    })
+}
+
+fn native_frame_analysis(
+    recording: &Recording,
+    frame: usize,
+    progress: &mut dyn FnMut(AnalysisCsvProgress) -> bool,
+    status: AnalysisCsvProgress,
+) -> Result<crate::analysis::SharedAnalysis, Error> {
+    check_csv_progress(progress, status)?;
+    crate::native::analysis_history::frame_analysis(recording, frame, &mut || !progress(status))
+}
+
+fn check_csv_progress(
+    progress: &mut dyn FnMut(AnalysisCsvProgress) -> bool,
+    status: AnalysisCsvProgress,
+) -> Result<(), Error> {
+    if !progress(status) {
+        return Err(
+            io::Error::new(io::ErrorKind::Interrupted, "analysis CSV export cancelled").into(),
+        );
+    }
+    Ok(())
+}
+
+fn frame_span_range(
+    analysis: &crate::analysis::SharedAnalysis,
+    frame: usize,
+) -> Result<std::ops::Range<usize>, Error> {
+    crate::native::analysis_history::span_range(analysis, frame)
+}
+
+fn frame_sample_range(
+    memory: &impl MemorySource,
+    frame: usize,
+) -> Result<std::ops::Range<usize>, Error> {
+    crate::native::analysis_history::row_range(memory.sample_count(), frame, |index| {
+        memory.sample_at(index).map(|sample| sample.received_frame)
+    })
+}
+
 /// Exports completed profile spans or memory flush samples from the complete SDK stream.
 /// Only publish the supplied staging writer after success; errors can leave partial CSV bytes.
 pub fn export_analysis_csv_streaming<R: Read + Seek, W: Write + ?Sized>(
@@ -205,7 +346,7 @@ pub fn export_analysis_csv_streaming<R: Read + Seek, W: Write + ?Sized>(
     let inspected = scan::<R, W>(
         source,
         None,
-        kind,
+        ScanKind::Csv(kind),
         None,
         AnalysisExportPhase::Inspect,
         &mut progress,
@@ -214,7 +355,7 @@ pub fn export_analysis_csv_streaming<R: Read + Seek, W: Write + ?Sized>(
     let exported = scan(
         source,
         Some(output),
-        kind,
+        ScanKind::Csv(kind),
         Some(&inspected.summary.zones),
         AnalysisExportPhase::Export,
         &mut progress,
@@ -351,7 +492,7 @@ fn write_sample(output: &mut (impl Write + ?Sized), sample: &MemorySample) -> io
 fn scan<'a, R: Read + Seek + ?Sized, W: Write + ?Sized>(
     source: &mut R,
     mut output: Option<&'a mut W>,
-    kind: AnalysisCsvKind,
+    kind: ScanKind,
     names: Option<&'a BTreeMap<u64, ProfileZone>>,
     phase: AnalysisExportPhase,
     progress: &mut impl FnMut(AnalysisExportProgress) -> bool,
@@ -365,6 +506,11 @@ fn scan<'a, R: Read + Seek + ?Sized, W: Write + ?Sized>(
         total_bytes,
     };
     check_progress(progress, status)?;
+    let profile_only = matches!(kind, ScanKind::ProfileQuery);
+    let kind = match kind {
+        ScanKind::Csv(kind) => kind,
+        ScanKind::ProfileQuery => AnalysisCsvKind::Profile,
+    };
     if let Some(output) = &mut output {
         write_header(output, kind)?;
     }
@@ -419,7 +565,14 @@ fn scan<'a, R: Read + Seek + ?Sized, W: Write + ?Sized>(
                     check_progress(progress, status)?;
                     exporter.drain(analysis)
                 };
-                ingest_event(&mut analysis, builder, &event, group.stream_id, &mut drain)?;
+                ingest_event(
+                    &mut analysis,
+                    builder,
+                    &event,
+                    group.stream_id,
+                    profile_only,
+                    &mut drain,
+                )?;
                 if let Some(observer) = &mut exporter.observer {
                     match &event {
                         Event::AddProfileZone { id, .. } => {
@@ -602,6 +755,7 @@ fn ingest_event(
     builder: &RecordingBuilder,
     event: &Event,
     stream: u64,
+    profile_only: bool,
     drain: &mut dyn FnMut(&mut Analysis) -> Result<(), Error>,
 ) -> Result<(), Error> {
     match event {
@@ -617,7 +771,7 @@ fn ingest_event(
         }
         Event::SetPropertyValue {
             id, property, data, ..
-        } => ingest_property(analysis, builder, *id, *property, data, drain),
+        } => ingest_property(analysis, builder, *id, *property, data, profile_only, drain),
         Event::EndSetPropertyValue => {
             if let Some(property) = builder.partial.get(&stream) {
                 ingest_property(
@@ -626,17 +780,18 @@ fn ingest_event(
                     property.id,
                     property.property,
                     &property.data,
+                    profile_only,
                     drain,
                 )?;
             }
             Ok(())
         }
         Event::SetPropertyMessage { id, message, data } => {
-            ingest_message(analysis, builder, *id, *message, data, drain)
+            ingest_message(analysis, builder, *id, *message, data, profile_only, drain)
         }
         Event::SendPropertyMessageFromGroup { id, data } => {
             if let Some(message) = builder.groups.get(&stream) {
-                ingest_message(analysis, builder, *id, *message, data, drain)?;
+                ingest_message(analysis, builder, *id, *message, data, profile_only, drain)?;
             }
             Ok(())
         }
@@ -650,6 +805,7 @@ fn ingest_property(
     id: u64,
     property: u32,
     data: &[u8],
+    profile_only: bool,
     drain: &mut dyn FnMut(&mut Analysis) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if builder
@@ -657,6 +813,7 @@ fn ingest_property(
         .get(&property)
         .is_some_and(|name| name == "events")
         && let Some(kind) = builder.object_classes.get(&id)
+        && (!profile_only || kind.ends_with("PxProfileZone"))
     {
         analysis.ingest_for_export(
             id,
@@ -676,10 +833,12 @@ fn ingest_message(
     id: u64,
     message: Name,
     data: &[u8],
+    profile_only: bool,
     drain: &mut dyn FnMut(&mut Analysis) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if builder.object_classes.get(&id).is_none_or(|kind| {
-        !kind.ends_with("PxProfileZone") && !kind.ends_with("PxProfileMemoryEventBuffer")
+        !kind.ends_with("PxProfileZone")
+            && (profile_only || !kind.ends_with("PxProfileMemoryEventBuffer"))
     }) {
         return Ok(());
     }
@@ -694,7 +853,15 @@ fn ingest_message(
             let bytes = data
                 .get(arg.offset as usize..end)
                 .ok_or_else(|| error("property message exceeds its payload"))?;
-            ingest_property(analysis, builder, id, arg.property, bytes, drain)?;
+            ingest_property(
+                analysis,
+                builder,
+                id,
+                arg.property,
+                bytes,
+                profile_only,
+                drain,
+            )?;
         }
     }
     Ok(())

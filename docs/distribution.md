@@ -28,12 +28,13 @@ SDK 应使用包含 PVD 支持的 debug、checked 或 profile 配置。查看器
 
 | 操作 | 入口 |
 | --- | --- |
-| 查看对象、属性和引用 | 对象树选择；属性链接跳转，数组展开，复制或添加曲线 |
+| 查看对象、属性和引用 | 对象树选择，输入完整 ID 后 Enter 选择；属性链接跳转，数组展开，复制或绘制数值元素 |
 | 控制镜头与逐帧 | 场景左下角操作提示；完整按键见[界面说明](ui.md) |
 | 慢放 | 暂停实时，关闭“录制时序”，降低帧率后正放或倒放；左右键逐帧 |
 | 性能 | 性能页切换线程时间线/事件曲线，筛选与缩放时间窗，测量区间或绘制帧/阶段 |
 | 内存和错误 | 内存页查看存活状态与本帧活动；诊断页查看错误代码和位置 |
 | 属性或事件曲线 | 曲线页缩放、标记、跳帧及 CSV 导出 |
+| 操作帮助、版本与反馈 | 顶部“帮助”；F1 打开操作说明，反馈页可复制模板 |
 
 图表缺失值保持空缺；接收刷新帧不是事件精确发生时刻。原版手册的配色、手势和图页方式与项目存在差异，见[手册对照](manual-checklist.md#手册对照)。
 
@@ -60,10 +61,12 @@ SDK 应使用包含 PVD 支持的 debug、checked 或 profile 配置。查看器
 | 输入 | 可用操作 | 边界 |
 | --- | --- | --- |
 | 完整 SDK 原始流 | 检查、回放、保存、片段定义/流式裁剪、完整分析 CSV | 分析按实际源数据和预算处理 |
-| PVD3 数据库 v1 `.pxd2` | 部分对象/帧/分析/绘制读取和回放 | 超过 512 MiB 拒绝；原版保存和裁剪未接正式入口 |
+| PVD3 数据库 v1 `.pxd2` | 部分对象/帧/分析/绘制读取和回放；时间轴或片段页的“PVD3 录制”整份保存及受限帧区间裁剪 | 读入使用磁盘历史；写出各限 512 MiB，更广布局及原版应用互验未完成 |
 | 项目 `.pvdcapture` | 读取 01/02，保存 02，独立重开与再次裁剪 | 无完整原始字节；全源 CSV/目录和 SDK 裁剪拒绝 |
 
 完整 SDK 文件的片段定义保存在旁边的 `.pvdstudio-clips.json`，最多 64 个范围，以完整源摘要绑定；定义不修改录制本体。导出有进度、取消与无覆盖发布。项目捕获不使用 SDK 片段 sidecar。
+
+原版保存使用 `.pxd2`，默认 `captures/capture.pxd2`；CLI 对应 `native-save` 和 `native-trim`，范围见[原版容器保存](native-export.md)。这些命令不将 SDK 流转换为原版容器。
 
 RepX 支持已验证的 PhysX 3.4.2 刚体、基础/网格/地形几何、共享 Shape/资源和整帧六类官方关节。连接关节的单 Actor、特殊对象、运动学目标及其他依赖有限制，详见 [RepX](repx.md)。
 
@@ -85,9 +88,9 @@ Rust panic 尽力写入 `%LOCALAPPDATA%\pvd-studio\diagnostics\panic-*.log`；�
 
 ## 已知限制
 
-原版通信目录中的相机和显示设置未导入；真实多页、非空起点、含 OriginShift 和更多绘制布局仍需配对。Cloth 只显示捕获的当前粒子和 Fabric 约束，粒子系统以点显示，不生成表面。
+原版通信目录中的相机和显示设置已有读取路径，非空相机目录尚缺真实配对；多页、非空起点、含 OriginShift 和更多绘制布局也需独立输入。Cloth 显示捕获的当前粒子和 Fabric 约束，粒子系统以点显示，不生成表面。
 
-核心回放、egui 输入和离屏渲染已有多项验证，但动态 DPI、完整停靠、剪贴板、其他 IME、远端实际负载和长期资源趋势未全部验收。部分英文和录制相机离屏配置存在顶部工具栏绘制缺失，原因尚未定位。测试范围见[验证说明](validation.md)，剩余工作见[路线图](roadmap.md)。
+核心回放、egui 输入和离屏渲染已有多项验证，但动态 DPI、完整停靠、剪贴板、其他 IME、远端实际负载和长期资源趋势未全部验收。工具栏文字缺失报告在双语及录制相机离屏复核中未复现，仍需对应环境验证。测试范围见[验证说明](validation.md)，剩余工作见[路线图](roadmap.md)。
 
 ## 从源码打包
 
@@ -110,6 +113,6 @@ Enable permanent raw recording before listening when a complete `.pvdstream` is 
 
 For disk history, **Save capture** saves all available frames as `.pvdcapture`, including while receiving or after an incomplete raw recording. Use **Raw stream → Save raw stream as** for a complete original SDK stream.
 
-Native PVD3 database-v1 import is partial and rejects files above 512 MiB. Native-format Save/Trim is not a production feature. Project captures are distinct from SDK streams and native databases. Full compatibility and interaction limits are listed in the linked matrices.
+Native PVD3 database-v1 import is partial and uses bounded random reads with disk history. Restricted whole-file saving and frame-range export are available under **Clips → PVD3 recording**, with separate 512 MiB input/output limits. Original-application acceptance and broader layouts remain unverified or unsupported. Project captures, SDK streams and native databases are distinct formats; see the linked compatibility matrix.
 
 Choose Simplified Chinese or English from the top menu. For opt-in timing diagnostics, use `start-with-diagnostics.cmd`. Reports stay local. The packaging script builds from cached locked dependencies and writes local output only.

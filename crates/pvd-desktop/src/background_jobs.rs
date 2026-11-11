@@ -45,7 +45,6 @@ impl Drop for Completion {
 }
 
 impl BackgroundJobs {
-    #[cfg(test)]
     pub fn active_count(&self) -> usize {
         self.0
             .lock()
