@@ -12,6 +12,7 @@ mod tests;
 mod wire;
 
 pub use atomic::write_retained_new;
+pub(super) use export::write_bank;
 pub use export::write_retained;
 pub use read::open_with_progress;
 pub const MAGIC: &[u8; 8] = b"PVDCAP03";
@@ -202,6 +203,7 @@ struct Metadata {
     little_endian: bool,
     classes: BTreeMap<String, crate::ClassDefinition>,
     diagnostics: Vec<String>,
+    rooms: Option<crate::rooms::RoomDirectory>,
 }
 
 struct Segment {

@@ -34,9 +34,10 @@ fn main() -> Result<(), pvd_core::Error> {
     let args: Vec<_> = std::env::args_os().collect();
     let input = args
         .get(1)
-        .ok_or("usage: throughput INPUT HISTORY_DIR [--profile] [--no-history]")?;
+        .ok_or("usage: throughput INPUT HISTORY_DIR [--profile] [--no-history] [--persistent]")?;
     let directory = PathBuf::from(args.get(2).ok_or("missing history directory")?);
-    let mut live = LiveRecording::with_history(HistoryConfig {
+    let persistent = args.iter().any(|v| v == "--persistent");
+    let config = HistoryConfig {
         directory,
         min_free_disk_bytes: if args.iter().any(|v| v == "--no-history") {
             u64::MAX
@@ -44,7 +45,12 @@ fn main() -> Result<(), pvd_core::Error> {
             512 << 20
         },
         ..Default::default()
-    })?;
+    };
+    let mut live = if persistent {
+        LiveRecording::with_persistent_history(config)
+    } else {
+        LiveRecording::with_history(config)
+    }?;
     let metrics = args
         .iter()
         .any(|v| v == "--profile")
@@ -57,6 +63,11 @@ fn main() -> Result<(), pvd_core::Error> {
     let started = Instant::now();
     let mut last_publish = started;
     let mut updates = 0u64;
+    let mut feed_calls = 0u64;
+    let mut feed_seconds = 0.0;
+    let mut max_feed_seconds: f64 = 0.0;
+    let mut snapshot_seconds = 0.0;
+    let mut max_snapshot_seconds: f64 = 0.0;
     let mut apply_seconds = 0.0;
     let mut analysis_observations = AnalysisObservations::default();
     loop {
@@ -65,9 +76,18 @@ fn main() -> Result<(), pvd_core::Error> {
             break;
         }
         bytes += count as u64;
+        let feed_started = Instant::now();
         live.feed(&buffer[..count])?;
+        let elapsed = feed_started.elapsed().as_secs_f64();
+        feed_calls += 1;
+        feed_seconds += elapsed;
+        max_feed_seconds = max_feed_seconds.max(elapsed);
         if last_publish.elapsed() >= Duration::from_micros(16_667) && live.frame_count() > 0 {
+            let snapshot_started = Instant::now();
             let recording = live.snapshot()?;
+            let elapsed = snapshot_started.elapsed().as_secs_f64();
+            snapshot_seconds += elapsed;
+            max_snapshot_seconds = max_snapshot_seconds.max(elapsed);
             analysis_observations.observe(&recording.analysis);
             latest = Some(recording);
             if let Some((_, update)) = live.take_update() {
@@ -89,17 +109,37 @@ fn main() -> Result<(), pvd_core::Error> {
     let profile = analysis.profile_summary();
     let memory = analysis.memory_snapshot();
     let summary = memory.summary();
+    let history = recording.disk_usage().map(|stats| {
+        serde_json::json!({
+            "persistent": stats.persistent,
+            "disk_bytes": stats.disk_bytes,
+            "cache_disk_bytes": stats.cache_disk_bytes,
+            "budget_bytes": stats.budget_bytes,
+            "first_frame": recording.frames.first().map(|frame| frame.index),
+            "last_frame": recording.frames.last().map(|frame| frame.index),
+            "retained_frames": stats.retained_frames,
+            "segments": stats.segments,
+            "warning": stats.warning,
+        })
+    });
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "input_bytes": bytes,
+            "history_mode": if persistent { "persistent" } else { "rolling" },
             "elapsed_seconds": elapsed,
+            "feed_calls": feed_calls,
+            "feed_seconds": feed_seconds,
+            "max_feed_seconds": max_feed_seconds,
+            "snapshot_seconds": snapshot_seconds,
+            "max_snapshot_seconds": max_snapshot_seconds,
             "frames": recording.frame_count(),
             "objects": state.objects.len(),
             "updates": updates,
             "display_apply_seconds": apply_seconds,
             "metrics": metrics.as_ref().map(|m| m.snapshot()),
             "published_frames": latest.as_ref().map(|r| r.frame_count()),
+            "history": history,
             "diagnostics": &recording.diagnostics,
             "analysis": {
                 "samples": analysis_observations.samples,

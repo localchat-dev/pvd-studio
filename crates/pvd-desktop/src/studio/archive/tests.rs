@@ -43,7 +43,7 @@ fn pvd_archive_load_binds_inner_bytes_and_rejects_corruption_and_cancellation() 
         let path = scratch.write(name, &fixture::stored("nested/recording.pxd2", &inner));
         let loaded = read_recording(
             &path,
-            &AtomicBool::new(false),
+            &Arc::new(AtomicBool::new(false)),
             &AtomicU64::new(0),
             scratch.history(),
         )
@@ -68,7 +68,7 @@ fn pvd_archive_load_binds_inner_bytes_and_rejects_corruption_and_cancellation() 
         assert!(
             read_recording(
                 &path,
-                &AtomicBool::new(true),
+                &Arc::new(AtomicBool::new(true)),
                 &AtomicU64::new(0),
                 scratch.history()
             )
@@ -81,7 +81,7 @@ fn pvd_archive_load_binds_inner_bytes_and_rejects_corruption_and_cancellation() 
     assert!(
         read_recording(
             &path,
-            &AtomicBool::new(false),
+            &Arc::new(AtomicBool::new(false)),
             &AtomicU64::new(0),
             scratch.history()
         )

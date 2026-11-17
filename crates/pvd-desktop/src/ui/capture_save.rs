@@ -55,8 +55,8 @@ pub(crate) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
             .to_owned()
     } else if history {
         language.text(
-            &format!("Save available frames {}–{} as .pvdcapture. Previously expired history cannot be recovered. TCP reception continues.", studio.first_frame(), studio.count().saturating_sub(1)),
-            &format!("将当前可用的 {}–{} 帧保存为 .pvdcapture；已淘汰历史无法补回，TCP 接收继续。", studio.first_frame(), studio.count().saturating_sub(1)),
+            &format!("Save all scenes' available frames {}–{} as .pvdcapture. Previously expired history cannot be recovered. TCP reception continues.", studio.first_frame(), studio.count().saturating_sub(1)),
+            &format!("将全部场景当前可用的 {}–{} 帧保存为 .pvdcapture；已淘汰历史无法补回，TCP 接收继续。", studio.first_frame(), studio.count().saturating_sub(1)),
         ).to_owned()
     } else {
         raw_detail(studio).to_owned()

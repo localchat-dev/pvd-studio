@@ -463,7 +463,7 @@ mod tests {
             assert!(cancelled.load(Ordering::Relaxed));
             assert!(studio.profile_catalog_cancel.is_none());
             assert!(studio.recording.is_none());
-            assert_eq!(jobs.active_count(), 1);
+            assert_eq!(jobs.active_work_count(), 1);
             release.send(()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while jobs.active_count() != 0 {

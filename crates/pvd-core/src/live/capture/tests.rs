@@ -3,6 +3,7 @@ use crate::analysis::resident::full_fixture_inputs;
 use std::io::Cursor;
 use std::sync::atomic::Ordering;
 
+mod admission_tests;
 mod key_schema;
 mod reexport_tests;
 mod source_tests;

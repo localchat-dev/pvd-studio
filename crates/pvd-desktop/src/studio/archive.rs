@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn read(
     file: &mut File,
     archive_length: u64,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
     progress: &AtomicU64,
     history: pvd_core::live::HistoryConfig,
 ) -> LoadResult {

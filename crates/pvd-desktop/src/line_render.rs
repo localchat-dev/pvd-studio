@@ -2,11 +2,17 @@ use std::path::{Path, PathBuf};
 
 use bevy::{
     asset::io::embedded::EmbeddedAssetRegistry,
-    gizmos::config::{DefaultGizmoConfigGroup, GizmoConfigStore},
+    gizmos::{
+        AppGizmoBuilder,
+        config::{DefaultGizmoConfigGroup, GizmoConfig, GizmoConfigGroup, GizmoConfigStore},
+    },
     prelude::*,
 };
 
 pub const DEFAULT_LINE_WIDTH: f32 = 1.25;
+
+#[derive(Default, Reflect, GizmoConfigGroup)]
+pub(crate) struct GridConfig;
 
 pub struct Plugin {
     pub smooth_lines: bool,
@@ -14,10 +20,19 @@ pub struct Plugin {
 
 impl bevy::prelude::Plugin for Plugin {
     fn build(&self, app: &mut App) {
+        app.insert_gizmo_config(
+            GridConfig,
+            GizmoConfig {
+                depth_bias: -0.001,
+                ..default()
+            },
+        );
         app.add_systems(Update, sync_style.before(crate::scene::draw_grid));
-        if !self.smooth_lines {
-            return;
-        }
+        let shader = format!(
+            "const SMOOTH_EDGES: bool = {};\n{}",
+            self.smooth_lines,
+            include_str!("../../../vendor/bevy_gizmo_lines/lines.wgsl"),
+        );
         // The pinned Bevy 0.18.1 gizmo renderer resolves this path during RenderStartup.
         app.world()
             .resource::<EmbeddedAssetRegistry>()
@@ -27,7 +42,7 @@ impl bevy::prelude::Plugin for Plugin {
                     "/../../vendor/bevy_gizmo_lines/lines.wgsl"
                 )),
                 Path::new("bevy_gizmos_render/lines.wgsl"),
-                include_bytes!("../../../vendor/bevy_gizmo_lines/lines.wgsl").as_slice(),
+                shader.into_bytes(),
             );
     }
 }
@@ -41,5 +56,8 @@ fn sync_style(studio: Res<crate::studio::Studio>, mut configs: ResMut<GizmoConfi
     };
     if configs.config::<DefaultGizmoConfigGroup>().0.line.width != width {
         configs.config_mut::<DefaultGizmoConfigGroup>().0.line.width = width;
+    }
+    if configs.config::<GridConfig>().0.line.width != width {
+        configs.config_mut::<GridConfig>().0.line.width = width;
     }
 }

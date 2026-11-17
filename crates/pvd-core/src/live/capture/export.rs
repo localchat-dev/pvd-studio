@@ -5,14 +5,38 @@ pub fn write_retained<W: Read + Write + Seek>(
     output: &mut W,
     range: CaptureRange,
     limits: &CaptureLimits,
+    callback: impl FnMut(CaptureProgress) -> bool,
+) -> Result<CaptureReport, Error> {
+    write(source, output, range, limits, callback, false)
+}
+
+/// Internal banks preserve scene history and its original analysis-failure
+/// diagnostic. They must not imply that a permanent complete-analysis export
+/// is possible after the analysis decoder stopped.
+pub(in crate::live) fn write_bank<W: Read + Write + Seek>(
+    source: &crate::Recording,
+    output: &mut W,
+    range: CaptureRange,
+    limits: &CaptureLimits,
+    callback: impl FnMut(CaptureProgress) -> bool,
+) -> Result<CaptureReport, Error> {
+    write(source, output, range, limits, callback, true)
+}
+
+fn write<W: Read + Write + Seek>(
+    source: &crate::Recording,
+    output: &mut W,
+    range: CaptureRange,
+    limits: &CaptureLimits,
     mut callback: impl FnMut(CaptureProgress) -> bool,
+    temporary_bank: bool,
 ) -> Result<CaptureReport, Error> {
     limits.validate()?;
     if output.stream_position()? != 0 || output.seek(std::io::SeekFrom::End(0))? != 0 {
         return Err(error("project capture output must be a new empty stream"));
     }
     output.seek(std::io::SeekFrom::Start(0))?;
-    let mut report = copy(source, output, range, limits, &mut callback)?;
+    let mut report = copy(source, output, range, limits, &mut callback, temporary_bank)?;
     output.flush()?;
     output.seek(std::io::SeekFrom::Start(0))?;
     let directory = read::directory(output, report.bytes, limits, &mut callback)?;
@@ -38,6 +62,7 @@ fn copy<W: Write>(
     range: CaptureRange,
     limits: &CaptureLimits,
     callback: &mut impl FnMut(CaptureProgress) -> bool,
+    temporary_bank: bool,
 ) -> Result<CaptureReport, Error> {
     if !matches!(
         source.source,
@@ -51,10 +76,11 @@ fn copy<W: Write>(
         .disk
         .as_ref()
         .ok_or_else(|| error("retained export requires disk history"))?;
-    if source
-        .diagnostics
-        .iter()
-        .any(|text| text.starts_with("Analysis decoding stopped at frame"))
+    if !temporary_bank
+        && source
+            .diagnostics
+            .iter()
+            .any(|text| text.starts_with("Analysis decoding stopped at frame"))
     {
         return Err(error(
             "cannot export complete analysis after its decoder stopped",
@@ -100,22 +126,9 @@ fn copy<W: Write>(
         limits,
     };
     let mut copied_frames = 0;
-    for segment in disk
-        .segments
-        .iter()
-        .map(Arc::as_ref)
-        .chain(&disk.active)
-        .filter(|segment| {
-            segment
-                .frames
-                .first()
-                .is_some_and(|frame| frame.info.index <= range.last)
-                && segment
-                    .frames
-                    .last()
-                    .is_some_and(|frame| frame.info.index >= range.first)
-        })
-    {
+    let mut next_frame = Some(range.first);
+    while let Some(first) = next_frame {
+        let _transition = disk.history_guard()?;
         progress(callback, CapturePhase::Copy, copied_frames, count as u64)?;
         let mut cancelled = || {
             !callback(CaptureProgress {
@@ -123,6 +136,24 @@ fn copy<W: Write>(
                 completed: copied_frames,
                 total: count as u64,
             })
+        };
+        // Resolve one bank at a time. The returned segment keeps its resources
+        // alive while the archive's bounded reader cache moves to another bank.
+        let owned = disk.owned_segment(first, &mut cancelled)?;
+        let segment = owned.as_ref();
+        let last = segment
+            .frames
+            .last()
+            .map(|frame| frame.info.index.min(range.last))
+            .filter(|&last| last >= first)
+            .ok_or_else(|| error("capture segment does not advance its frame range"))?;
+        next_frame = if last == range.last {
+            None
+        } else {
+            Some(
+                last.checked_add(1)
+                    .ok_or_else(|| error("capture frame index overflow"))?,
+            )
         };
         copied.resource(
             segment,

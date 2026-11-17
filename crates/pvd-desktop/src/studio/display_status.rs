@@ -124,6 +124,7 @@ impl Studio {
             };
         }
         if self.live_connected
+            && !self.viewing_temporary_recording()
             && !self.follow_live
             && self
                 .displayed_frame_source
@@ -180,5 +181,67 @@ impl Studio {
         ) {
             self.playing = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pvd_protocol::{Endian, Event, EventGroup, Header};
+    use std::sync::Arc;
+
+    #[test]
+    fn temporary_recording_position_does_not_compare_another_live_session() {
+        let mut builder = pvd_core::RecordingBuilder::new(Header {
+            version: 1,
+            timestamp_numerator: 1,
+            timestamp_denominator: 1,
+            flags: 1,
+            endian: Endian::Little,
+        });
+        builder
+            .push(EventGroup {
+                stream_id: 1,
+                timestamp: 0,
+                offset: 0,
+                events: vec![
+                    Event::StringHandle {
+                        handle: 1,
+                        value: "frame".into(),
+                    },
+                    Event::EndSection {
+                        id: 1,
+                        name: 1,
+                        timestamp: 0,
+                    },
+                    Event::EndSection {
+                        id: 1,
+                        name: 1,
+                        timestamp: 1,
+                    },
+                ],
+            })
+            .unwrap();
+        let mut studio = Studio::default();
+        studio.recording = Some(Arc::new(builder.finish().unwrap()));
+        studio.temporary_recordings.selected = Some(1);
+        studio.live_session = Some(2);
+        studio.live_connected = true;
+        studio.follow_live = false;
+        studio.frame = 1;
+        studio.live_frame = 15;
+
+        assert_eq!(studio.display_mode(), DisplayMode::Paused);
+        assert_eq!(studio.display_position(Language::English), "Frame 1");
+        assert_eq!(studio.display_position(Language::Chinese), "帧 1");
+
+        studio.seeking = Some(0);
+        assert_eq!(studio.display_position(Language::English), "Frame 1 → 0");
+        studio.seeking = None;
+        studio.temporary_recordings.selected = None;
+        assert_eq!(
+            studio.display_position(Language::English),
+            "Frame 1 · 14 behind live (15)"
+        );
     }
 }

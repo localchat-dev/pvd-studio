@@ -55,6 +55,7 @@ fn app(context: &egui::Context) -> App {
     crate::ui::configure(context);
     let mut app = App::new();
     app.insert_resource(studio())
+        .init_resource::<crate::navmesh::NavMeshOverlay>()
         .init_resource::<crate::scene::Viewport>()
         .init_resource::<Assets<Mesh>>()
         .init_resource::<Assets<StandardMaterial>>()
@@ -133,6 +134,30 @@ fn accepted(app: &App) -> (usize, u64, SceneState) {
         studio.revision
     );
     (studio.frame, studio.revision, studio.state.clone())
+}
+
+fn publish_live_head(studio: &mut Studio) {
+    let recording = studio.recording.as_ref().unwrap().clone();
+    let frame = recording.frame_count() - 1;
+    let state = recording.state_at(frame).unwrap();
+    let source_frame = recording
+        .frame_sources
+        .frame(frame)
+        .map(|(source, frame)| (source, *frame));
+    assert!(source_frame.is_some());
+    studio.live_session = Some(1);
+    studio.live_connected = true;
+    studio.accept_live_snapshot(crate::network::LiveSnapshot {
+        session: 1,
+        frame,
+        source_frame,
+        recording: (*recording).clone(),
+        update: pvd_core::live::SceneUpdate::full(&state),
+        display_updated: true,
+    });
+    assert_eq!(studio.live_frame, frame);
+    assert_eq!(studio.live_frame_source, source_frame);
+    assert_eq!(studio.live_state, state);
 }
 
 #[test]
@@ -241,7 +266,14 @@ fn ordered_requests_coalesce_one_control_per_input_frame_and_bound_pending_paths
     assert!(studio.recording.is_some());
     assert!(studio.job.is_none());
     assert!(studio.ui_actions.0.is_empty());
-    assert!(studio.poll_shutdown());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !studio.poll_shutdown() || studio.background_jobs.active_count() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shutdown did not release the recording"
+        );
+        std::thread::yield_now();
+    }
     studio.request_ui_action(
         &context,
         "reopen",
@@ -311,12 +343,7 @@ fn return_live_and_clip_jump_keep_scene_until_the_next_prepare() {
     let mut app = app(&context);
     {
         let mut studio = app.world_mut().resource_mut::<Studio>();
-        let recording = studio.recording.as_ref().unwrap().clone();
-        studio.live_recording = Some(recording.clone());
-        studio.live_frame = 7;
-        studio.live_state = recording.state_at(7).unwrap();
-        studio.live_session = Some(1);
-        studio.live_connected = true;
+        publish_live_head(&mut studio);
     }
     let before = accepted(&app);
     let label = app
@@ -347,12 +374,7 @@ fn actual_next_click_at_live_head_keeps_live_and_pause_click_shows_its_reason() 
     let mut app = app(&context);
     {
         let mut studio = app.world_mut().resource_mut::<Studio>();
-        let recording = studio.recording.as_ref().unwrap().clone();
-        studio.live_recording = Some(recording.clone());
-        studio.live_frame = 7;
-        studio.live_state = recording.state_at(7).unwrap();
-        studio.live_session = Some(1);
-        studio.live_connected = true;
+        publish_live_head(&mut studio);
         studio.return_to_live();
     }
     app.update();

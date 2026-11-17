@@ -53,7 +53,7 @@ impl<W: Write> Encoder<W> {
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<(), Error> {
         for number in [
-            1,
+            if source.rooms.is_empty() { 1 } else { 2 },
             range.first as u64,
             range.last as u64,
             u64::from(source.header.version),
@@ -90,6 +90,35 @@ impl<W: Write> Encoder<W> {
         for text in &source.diagnostics {
             check_replay_cancelled(cancelled)?;
             self.text(text)?;
+        }
+        if !source.rooms.is_empty() {
+            let include_tail = range.last.checked_add(1) == Some(source.frame_count());
+            let entries = || {
+                source
+                    .rooms
+                    .iter()
+                    .filter(|room| include_tail || room.first_observed_frame <= range.last)
+            };
+            self.number(if include_tail {
+                source.rooms.observed_count()
+            } else {
+                entries().map(|room| room.number).max().unwrap_or(0)
+            })?;
+            self.number(entries().count() as u64)?;
+            for room in entries() {
+                check_replay_cancelled(cancelled)?;
+                for number in [
+                    room.scene.id,
+                    u64::from(room.scene.generation),
+                    room.number,
+                    room.first_observed_frame as u64,
+                    room.destroyed_at_frame
+                        .filter(|frame| include_tail || *frame <= range.last)
+                        .map_or(u64::MAX, |frame| frame as u64),
+                ] {
+                    self.number(number)?;
+                }
+            }
         }
         Ok(())
     }
@@ -130,7 +159,7 @@ pub(super) fn decode(
     let timestamp_denominator = input.u64()?;
     let flags = u32::try_from(input.u64()?)?;
     let little_endian = flag(&mut input)?;
-    if version != 1 || timestamp_denominator == 0 || first > last || last == u64::MAX {
+    if !matches!(version, 1 | 2) || timestamp_denominator == 0 || first > last || last == u64::MAX {
         return Err(error("invalid capture metadata version or frame bounds"));
     }
     let count = input.count(LIMIT / 24, 24)?;
@@ -192,6 +221,42 @@ pub(super) fn decode(
         check_replay_cancelled(cancelled)?;
         diagnostics.push(text(&mut input, budget)?);
     }
+    let rooms = if version == 2 {
+        let observed = input.u64()?;
+        let count = input.count(crate::rooms::ROOM_LIMIT, 40)?;
+        budget.entries(count, 256 + size_of::<crate::rooms::RoomInfo>())?;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            check_replay_cancelled(cancelled)?;
+            let scene = crate::frame_sources::FrameObject {
+                id: input.u64()?,
+                generation: u32::try_from(input.u64()?)?,
+            };
+            let number = input.u64()?;
+            let first_observed_frame = input.usize()?;
+            let destroyed = input.u64()?;
+            if first_observed_frame as u64 > last + 1
+                || (destroyed != u64::MAX && destroyed > last + 1)
+            {
+                return Err(error("capture room lifecycle exceeds its history endpoint"));
+            }
+            entries.push(crate::rooms::RoomInfo {
+                scene,
+                number,
+                first_observed_frame,
+                destroyed_at_frame: if destroyed == u64::MAX {
+                    None
+                } else {
+                    Some(usize::try_from(destroyed)?)
+                },
+            });
+        }
+        Some(crate::rooms::RoomDirectory::from_entries(
+            entries, observed,
+        )?)
+    } else {
+        None
+    };
     input.finish()?;
     Ok(Metadata {
         first,
@@ -203,5 +268,6 @@ pub(super) fn decode(
         little_endian,
         classes,
         diagnostics,
+        rooms,
     })
 }

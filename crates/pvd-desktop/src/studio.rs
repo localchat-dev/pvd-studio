@@ -47,8 +47,11 @@ mod playback_tests;
 #[cfg(all(test, windows))]
 mod profile_index_tests;
 mod retained_capture;
+mod rooms;
 mod seeking;
 mod selection;
+mod shutdown;
+pub(crate) mod temporary_recordings;
 mod ui_actions;
 pub use ui_actions::UiAction;
 #[cfg(test)]
@@ -183,6 +186,8 @@ pub struct Preferences {
     pub capture_directory: String,
     pub history_directory: String,
     pub history_budget_gib: u32,
+    pub temporary_budget_gib: u32,
+    pub temporary_max_count: u32,
     pub receive_budget_gib: u32,
     pub min_free_disk_mib: u32,
     pub live_refresh_hz: u32,
@@ -284,6 +289,8 @@ impl Default for Preferences {
                 .to_string_lossy()
                 .into_owned(),
             history_budget_gib: 8,
+            temporary_budget_gib: 8,
+            temporary_max_count: 16,
             receive_budget_gib: 0,
             min_free_disk_mib: 512,
             live_refresh_hz: 60,
@@ -365,6 +372,8 @@ impl Preferences {
         });
         layout::repair(&mut preferences.dock);
         preferences.min_free_disk_mib = preferences.min_free_disk_mib.max(512);
+        preferences.temporary_budget_gib = preferences.temporary_budget_gib.clamp(1, 1024);
+        preferences.temporary_max_count = preferences.temporary_max_count.clamp(1, 256);
         preferences.display_colors.sanitize();
         if Path::new(&preferences.history_directory) == std::env::temp_dir().join("pvd-studio-live")
         {
@@ -456,6 +465,8 @@ pub struct LoadJob {
 
 #[derive(Resource)]
 pub struct Studio {
+    pub(crate) room_scope: crate::room_scope::RoomScope,
+    pub(crate) room_view: rooms::RoomView,
     pub(crate) display_trace: Option<crate::display_probe::Trace>,
     pub(crate) display_request: u64,
     pub prefs: Preferences,
@@ -500,6 +511,10 @@ pub struct Studio {
     display_reason: Option<DisplayReason>,
     live_state: SceneState,
     live_recording: Option<Arc<Recording>>,
+    pub(crate) temporary_recordings: temporary_recordings::TemporaryRecordings,
+    close_after_capture: bool,
+    pending_open_after_capture: Option<PathBuf>,
+    retained_live_recording: Option<u64>,
     live_frame: usize,
     live_update_times: VecDeque<Instant>,
     seek_worker: Option<seeking::Worker>,
@@ -515,8 +530,10 @@ pub struct Studio {
     playback_recovery: playback_recovery::Recovery,
     pub background_jobs: crate::background_jobs::BackgroundJobs,
     shutdown_started: bool,
+    shutdown: shutdown::Progress,
     ui_actions: ui_actions::UiActions,
     pub capture_path: Option<PathBuf>,
+    live_capture_path: Option<PathBuf>,
     source_identity: Option<crate::clip_store::Identity>,
     pub connection: Message,
     pub profile_filter: String,
@@ -554,7 +571,6 @@ pub struct Studio {
 
 impl Default for Studio {
     fn default() -> Self {
-        let path_input = String::new();
         let persist_layout = !cfg!(test)
             && !std::env::args().any(|arg| {
                 matches!(
@@ -562,21 +578,30 @@ impl Default for Studio {
                     "--render-check" | "--render-playback-check" | "--render-ui-actions-check"
                 )
             });
+        let prefs = if persist_layout {
+            Preferences::load()
+        } else {
+            Preferences::default()
+        };
+        Self::with_preferences(prefs, persist_layout)
+    }
+}
+
+impl Studio {
+    fn with_preferences(prefs: Preferences, persist_layout: bool) -> Self {
         let background_jobs = crate::background_jobs::BackgroundJobs::default();
         Self {
-            prefs: if persist_layout {
-                Preferences::load()
-            } else {
-                Preferences::default()
-            },
+            prefs,
             recording: None,
+            room_scope: crate::room_scope::RoomScope::default(),
+            room_view: rooms::RoomView::default(),
             state: SceneState::default(),
             scene_changes: crate::scene::SceneChanges::default(),
             up_resolver: crate::coordinates::UpResolver::default(),
             activity: crate::activity::ActivityCache::default(),
             bytes: None,
             source: String::new(),
-            path_input,
+            path_input: String::new(),
             export_path: "captures/capture.pvdstream".into(),
             native_export_path: "captures/capture.pxd2".into(),
             filter: String::new(),
@@ -615,6 +640,10 @@ impl Default for Studio {
             display_reason: None,
             live_state: SceneState::default(),
             live_recording: None,
+            temporary_recordings: temporary_recordings::TemporaryRecordings::default(),
+            close_after_capture: false,
+            pending_open_after_capture: None,
+            retained_live_recording: None,
             live_frame: 0,
             live_update_times: VecDeque::new(),
             seek_worker: None,
@@ -630,8 +659,10 @@ impl Default for Studio {
             playback_recovery: playback_recovery::Recovery::default(),
             background_jobs: background_jobs.clone(),
             shutdown_started: false,
+            shutdown: shutdown::Progress::default(),
             ui_actions: ui_actions::UiActions::default(),
             capture_path: None,
+            live_capture_path: None,
             source_identity: None,
             connection: Message::new("Offline", "离线"),
             profile_filter: String::new(),
@@ -673,6 +704,7 @@ impl Studio {
     pub fn pick_file(&mut self, kind: crate::file_picker::PickerKind, context: egui::Context) {
         use crate::file_picker::PickerKind;
         let initial = match kind {
+            PickerKind::OpenNavMesh => return,
             PickerKind::OpenCapture => &self.path_input,
             PickerKind::SaveCapture | PickerKind::SaveClip => &self.export_path,
             PickerKind::SaveNativeCapture => &self.native_export_path,
@@ -749,7 +781,9 @@ impl Studio {
         }
     }
     pub fn source_text(&self, language: Language) -> &str {
-        if self.live_session.is_some() {
+        if self.viewing_temporary_recording() {
+            language.text("Temporary recording", "临时录制")
+        } else if self.live_session.is_some() {
             language.text("TCP capture", "TCP 捕获")
         } else if self.source.is_empty() {
             language.text("No capture loaded", "未加载录制")
@@ -759,7 +793,10 @@ impl Studio {
     }
     pub fn count(&self) -> usize {
         let count = self.timeline_recording().map_or(0, Recording::frame_count);
-        if self.live_recording.is_some() {
+        if !self.viewing_temporary_recording()
+            && self.live_recording.is_some()
+            && (count > 0 || self.live_frame_source.is_some())
+        {
             count.max(self.live_frame.saturating_add(1))
         } else {
             count
@@ -769,7 +806,23 @@ impl Studio {
         self.timeline_recording().map_or(0, Recording::first_frame)
     }
     pub fn timeline_recording(&self) -> Option<&Recording> {
-        self.live_recording.as_deref().or(self.recording.as_deref())
+        if self.viewing_temporary_recording() {
+            self.recording.as_deref()
+        } else {
+            self.live_recording.as_deref().or(self.recording.as_deref())
+        }
+    }
+    fn timeline_recording_arc(&self) -> Option<Arc<Recording>> {
+        if let Some(id) = self.temporary_recordings.selected {
+            self.temporary_recordings
+                .get(id)
+                .map(|entry| entry.recording.clone())
+        } else {
+            self.live_recording
+                .as_ref()
+                .or(self.recording.as_ref())
+                .cloned()
+        }
     }
     pub fn has_history(&self) -> bool {
         self.timeline_recording()
@@ -806,7 +859,7 @@ impl Studio {
             return false;
         }
         self.bytes.is_some()
-            || (!self.live_connected
+            || (!self.timeline_is_live()
                 && self.capture_path.as_ref().is_some_and(|path| {
                     path.extension()
                         .is_none_or(|extension| extension != "partial")
@@ -844,12 +897,12 @@ impl Studio {
     }
     fn start_playback(&mut self, direction: i32) {
         let Some((first, last)) = self.playback_bounds() else {
-            if direction > 0 && self.live_connected {
+            if direction > 0 && self.timeline_is_live() {
                 self.return_to_live();
             }
             return;
         };
-        if direction > 0 && self.frame >= last && self.live_connected {
+        if direction > 0 && self.frame >= last && self.timeline_is_live() {
             self.return_to_live();
             return;
         }
@@ -880,21 +933,15 @@ impl Studio {
     fn continue_from_retained_start(&mut self) {
         use playback_recovery::Decision;
         let range = self.retained_playback_bounds();
+        let live = self.timeline_is_live();
         let decision = match range {
-            Some((first, last)) => self
-                .playback_recovery
-                .target(first, last, self.live_connected),
-            None => self
-                .playback_recovery
-                .unavailable(self.live_connected, Instant::now()),
+            Some((first, last)) => self.playback_recovery.target(first, last, live),
+            None => self.playback_recovery.unavailable(live, Instant::now()),
         };
         let decision = if let Decision::Seek(target) = decision {
             self.retained_playback_at_or_after(target)
                 .map(Decision::Seek)
-                .unwrap_or_else(|| {
-                    self.playback_recovery
-                        .unavailable(self.live_connected, Instant::now())
-                })
+                .unwrap_or_else(|| self.playback_recovery.unavailable(live, Instant::now()))
         } else {
             decision
         };
@@ -918,6 +965,27 @@ impl Studio {
         ));
     }
     pub fn return_to_live(&mut self) {
+        if self.viewing_temporary_recording() {
+            if self.recording_export.is_some() || self.save_job.is_some() {
+                self.notice(Message::new(
+                    "Wait for this recording to finish saving before changing the view.",
+                    "请等待当前录制保存完成后再切换视图。",
+                ));
+                return;
+            }
+            if self.live_recording.is_none() && !self.live_connected {
+                return;
+            }
+            self.temporary_recordings.selected = None;
+            self.reset_display_for_recording();
+            self.selected_frame_source = self.live_frame_source.map(|(source, _)| source);
+            self.recording = self.live_recording.clone();
+            self.capture_path = self.live_capture_path.clone();
+            self.follow_live = self.live_connected;
+        }
+        if self.requested_room_destroyed() {
+            return;
+        }
         let Some(recording) = self.live_recording.clone() else {
             return;
         };
@@ -926,6 +994,13 @@ impl Studio {
         self.playing = 0;
         self.follow_live = self.live_connected;
         self.display_reason = None;
+        if self.room_view.requested.is_some()
+            && self
+                .live_frame_source
+                .is_none_or(|(_, frame)| frame.scene != self.room_view.requested)
+        {
+            return;
+        }
         self.refresh_selection();
         self.state = self.live_state.clone();
         self.refresh_selection();
@@ -941,6 +1016,7 @@ impl Studio {
         self.displayed_analysis = analysis_demand::DisplayedAnalysis::Complete;
         self.refresh_live_errors();
         self.revision += 1;
+        self.commit_room_display();
     }
     fn cancel_seek(&mut self) {
         #[cfg(test)]
@@ -980,12 +1056,7 @@ impl Studio {
         if self.shutdown_started || self.seeking == Some(target) {
             return false;
         }
-        let Some(recording) = self
-            .live_recording
-            .as_ref()
-            .or(self.recording.as_ref())
-            .cloned()
-        else {
+        let Some(recording) = self.timeline_recording_arc() else {
             return false;
         };
         if recording.frame_count() == 0 {
@@ -1002,7 +1073,7 @@ impl Studio {
         }
         if target < recording.first_frame()
             || target >= recording.frame_count()
-            || (self.follow_live && target == self.frame)
+            || (self.follow_live && target == self.frame && !self.room_selection_pending())
         {
             return false;
         }
@@ -1069,6 +1140,7 @@ impl Studio {
                 self.select_source_of_frame(target);
                 self.remember_display_frame(target);
                 self.revision += 1;
+                self.commit_room_display();
                 true
             }
             Err(error) => {
@@ -1078,8 +1150,30 @@ impl Studio {
         }
     }
     pub fn close(&mut self) {
+        if self.viewing_temporary_recording()
+            && (self.recording_export.is_some() || self.save_job.is_some())
+        {
+            self.notice(Message::new(
+                "Wait for this recording to finish saving before closing it.",
+                "请等待当前录制保存完成后再关闭。",
+            ));
+            return;
+        }
         if self.allow_clip_transition(crate::clips::PendingAction::Close) {
-            self.clear_recording();
+            self.pending_open_after_capture = None;
+            if self.viewing_temporary_recording() {
+                if self.live_connected {
+                    self.return_to_live();
+                } else {
+                    self.clear_recording();
+                }
+            } else if self.server.is_some() {
+                self.close_after_capture = true;
+                self.stop_listener();
+            } else {
+                self.retain_current_capture(temporary_recordings::Status::Closed);
+                self.clear_recording();
+            }
         }
     }
     pub fn allow_clip_transition(&mut self, action: crate::clips::PendingAction) -> bool {
@@ -1097,7 +1191,12 @@ impl Studio {
         true
     }
     fn clear_recording(&mut self) {
+        self.temporary_recordings.selected = None;
+        self.close_after_capture = false;
+        self.retained_live_recording = None;
         self.capture_epoch.fetch_add(1, Ordering::Relaxed);
+        self.room_scope = crate::room_scope::RoomScope::default();
+        self.room_view = rooms::RoomView::default();
         self.cancel_seek();
         self.recording_export = None;
         self.captured_camera = None;
@@ -1135,27 +1234,22 @@ impl Studio {
         self.clear_selection();
         self.live_session = None;
         self.capture_path = None;
+        self.live_capture_path = None;
         self.playing = 0;
         self.frame = 0;
         self.revision += 1;
-    }
-    pub fn poll_shutdown(&mut self) -> bool {
-        if !self.shutdown_started {
-            self.shutdown_started = true;
-            self.ui_actions = ui_actions::UiActions::default();
-            self.background_jobs.cancel_all_and_check_finished();
-            self.server = None;
-            self.seek_worker = None;
-            self.clear_recording();
-        }
-        let background_finished = self.background_jobs.cancel_all_and_check_finished();
-        let exports_finished = self.export_workers.cancel_all_and_check_finished();
-        background_finished && exports_finished
     }
     pub fn open(&mut self, path: PathBuf, context: egui::Context) {
         if !self.allow_clip_transition(crate::clips::PendingAction::Open(path.clone())) {
             return;
         }
+        if self.server.is_some() {
+            self.pending_open_after_capture = Some(path);
+            self.close_after_capture = true;
+            self.stop_listener();
+            return;
+        }
+        self.retain_current_capture(temporary_recordings::Status::Completed);
         if let Some(profile) = self
             .server
             .as_ref()
@@ -1208,6 +1302,9 @@ impl Studio {
         });
     }
     pub fn poll(&mut self, context: &egui::Context) {
+        if !self.shutdown_started && self.shutdown.context.is_none() {
+            self.shutdown.context = Some(context.clone());
+        }
         let wake = context.clone();
         self.background_jobs
             .set_wake(move || wake.request_repaint());
@@ -1221,6 +1318,8 @@ impl Studio {
                 Ok(Some(path)) => {
                     if let Some(text) = path.to_str().map(str::to_owned) {
                         match result.kind {
+                            // NavMesh owns a separate picker and import lifecycle.
+                            PickerKind::OpenNavMesh => {}
                             PickerKind::OpenCapture => {
                                 self.path_input = text;
                                 self.open(path, context.clone());
@@ -1244,7 +1343,10 @@ impl Studio {
             }
         }
         self.poll_network(context);
+        self.cleanup_temporary_recordings();
         self.poll_seek(context);
+        self.commit_room_display();
+        self.refresh_room_directory();
         if let Some(message) = self.clip_persistence.poll(&mut self.clip_set) {
             self.notice(message);
         }
@@ -1405,7 +1507,7 @@ impl Studio {
                 if next.is_none() {
                     if self.playing > 0 && self.frame < self.first_frame() {
                         self.continue_from_retained_start();
-                    } else if self.playing > 0 && self.live_connected {
+                    } else if self.playing > 0 && self.timeline_is_live() {
                         self.return_to_live();
                     } else {
                         self.pause_display_for(if self.playing < 0 {
@@ -1478,7 +1580,7 @@ impl Studio {
             return;
         }
         let bytes = self.bytes.clone();
-        let capture = (!self.live_connected)
+        let capture = (!self.timeline_is_live())
             .then(|| self.capture_path.clone())
             .flatten();
         if bytes.is_none() && capture.is_none() {
@@ -2229,6 +2331,8 @@ impl Studio {
                     }
                     self.tree
                         .retain_for_update(&update, &self.state, self.revision);
+                    self.room_scope
+                        .retain_for_update(&update, &self.state, self.revision);
                     if let Some(trace) = &completed.trace {
                         trace.event("tree_end", 0);
                     }
@@ -2245,6 +2349,7 @@ impl Studio {
                     self.refresh_live_errors();
                     self.remember_display_frame(completed.frame);
                     self.revision += 1;
+                    self.commit_room_display();
                     if let Some(trace) = &completed.trace {
                         self.display_request = trace.id;
                         trace.event("accepted", self.revision);
@@ -2293,7 +2398,7 @@ impl Studio {
     fn handle_seek_failure(&mut self, frame: usize, expired: bool, error: String) {
         if self.playing > 0
             && self.has_history()
-            && (frame < self.first_frame() || expired && self.live_connected)
+            && (frame < self.first_frame() || expired && self.timeline_is_live())
         {
             self.continue_from_retained_start();
         } else {
@@ -2318,6 +2423,7 @@ impl Studio {
         }
         if !snapshot.display_updated {
             self.live_recording = Some(Arc::new(snapshot.recording));
+            self.refresh_room_directory();
             return;
         }
         self.live_frame_source = snapshot.source_frame.or_else(|| {
@@ -2328,7 +2434,11 @@ impl Studio {
                 .map(|(source, frame)| (source, *frame))
         });
         self.live_analysis = snapshot.recording.analysis.clone();
-        if self.follow_live {
+        let display_matches = self.room_view.requested.is_none()
+            || self
+                .live_frame_source
+                .is_some_and(|(_, frame)| frame.scene == self.room_view.requested);
+        if self.follow_live && display_matches {
             snapshot.update.apply(&mut self.live_state);
         }
         let now = Instant::now();
@@ -2343,9 +2453,13 @@ impl Studio {
         self.live_frame = snapshot.frame;
         let recording = Arc::new(snapshot.recording);
         self.live_recording = Some(recording.clone());
-        self.source = "Live TCP capture".into();
-        if self.follow_live {
+        if !self.viewing_temporary_recording() {
+            self.source = "Live TCP capture".into();
+        }
+        if self.follow_live && display_matches {
             self.tree
+                .retain_for_update(&snapshot.update, &self.state, self.revision);
+            self.room_scope
                 .retain_for_update(&snapshot.update, &self.state, self.revision);
             self.scene_changes.record(&snapshot.update, self.revision);
             self.refresh_selection();
@@ -2357,15 +2471,31 @@ impl Studio {
             self.displayed_analysis = analysis_demand::DisplayedAnalysis::Complete;
             self.refresh_live_errors();
             self.revision += 1;
+            self.commit_room_display();
         } else {
             snapshot.update.apply_owned(&mut self.live_state);
         }
+        self.refresh_room_directory();
     }
     fn connect_live_session(&mut self, session: u64) {
-        self.clear_recording();
+        let closing = self.close_after_capture;
+        self.retain_current_capture(temporary_recordings::Status::Completed);
+        if self.viewing_temporary_recording() {
+            self.live_recording = None;
+            self.live_state = SceneState::default();
+            self.live_frame = 0;
+            self.live_frame_source = None;
+            self.live_analysis = Default::default();
+            self.live_update_times.clear();
+        } else {
+            self.clear_recording();
+        }
         self.live_session = Some(session);
+        self.live_capture_path = None;
+        self.retained_live_recording = None;
         self.live_connected = true;
-        self.follow_live = true;
+        self.follow_live = !self.viewing_temporary_recording();
+        self.close_after_capture = closing;
     }
     fn poll_network(&mut self, context: &egui::Context) {
         if let Some(status) = self
@@ -2405,7 +2535,10 @@ impl Studio {
                             format!("Recording incoming bytes to {}", path.display()),
                             format!("正在将接收数据录制到 {}", path.display()),
                         ));
-                        self.capture_path = Some(path);
+                        self.live_capture_path = Some(path.clone());
+                        if !self.viewing_temporary_recording() {
+                            self.capture_path = Some(path);
+                        }
                     }
                 }
                 LiveEvent::Empty { session } => {
@@ -2424,7 +2557,9 @@ impl Studio {
                     capture,
                 } => {
                     if self.live_session == Some(session) {
-                        self.source = "Live TCP capture".into();
+                        if !self.viewing_temporary_recording() {
+                            self.source = "Live TCP capture".into();
+                        }
                         if let Some(snapshot) = self
                             .server
                             .as_ref()
@@ -2442,13 +2577,27 @@ impl Studio {
                                 format!("Captured stream retained at {}", path.display()),
                                 format!("捕获数据流已保存在 {}", path.display()),
                             ));
-                            self.capture_path = Some(path);
+                            self.live_capture_path = Some(path.clone());
+                            if !self.viewing_temporary_recording() {
+                                self.capture_path = Some(path);
+                            }
                         }
+                        let ended_status = if result.is_err() {
+                            temporary_recordings::Status::Interrupted
+                        } else if self.close_after_capture {
+                            temporary_recordings::Status::Closed
+                        } else {
+                            temporary_recordings::Status::Completed
+                        };
                         match *result {
                             Ok(recording) => {
                                 let recording = Arc::new(recording);
                                 self.live_recording = Some(recording.clone());
-                                if self.follow_live {
+                                if self.viewing_temporary_recording() {
+                                    // The active connection finishes independently of the selected archive.
+                                } else if self.room_selection_pending() {
+                                    self.select_room(self.room_view.requested);
+                                } else if self.follow_live {
                                     let mut displayed = (*recording).clone();
                                     displayed.analysis = self.live_analysis.clone();
                                     self.recording = Some(Arc::new(displayed));
@@ -2461,17 +2610,19 @@ impl Studio {
                                             self.displayed_frame_source.map(|(source, _)| source);
                                     }
                                 }
-                                self.clip_persistence.bind_complete_capture(
-                                    None,
-                                    Arc::default(),
-                                    self.count(),
-                                    context.clone(),
-                                    &self.background_jobs,
-                                );
-                                self.clip_persistence.issue = Some(Message::new(
-                                    "Clip editing and clip export are not yet supported for live disk history. Complete raw recordings can be saved independently.",
-                                    "片段编辑和片段导出暂不支持实时磁盘历史。完整的原始录制仍可单独保存。",
-                                ));
+                                if !self.viewing_temporary_recording() {
+                                    self.clip_persistence.bind_complete_capture(
+                                        None,
+                                        Arc::default(),
+                                        self.count(),
+                                        context.clone(),
+                                        &self.background_jobs,
+                                    );
+                                    self.clip_persistence.issue = Some(Message::new(
+                                        "Clip editing and clip export are not yet supported for live disk history. Complete raw recordings can be saved independently.",
+                                        "片段编辑和片段导出暂不支持实时磁盘历史。完整的原始录制仍可单独保存。",
+                                    ));
+                                }
                             }
                             Err(error) => {
                                 if self.follow_live {
@@ -2484,6 +2635,7 @@ impl Studio {
                                 ));
                             }
                         }
+                        self.retain_current_capture(ended_status);
                     }
                 }
                 LiveEvent::Error(message) => {
@@ -2517,6 +2669,14 @@ impl Studio {
                     self.server = None;
                     self.live_connected = false;
                     self.connection = Message::new("Offline", "离线");
+                    self.retain_current_capture(if self.close_after_capture {
+                        temporary_recordings::Status::Closed
+                    } else {
+                        temporary_recordings::Status::Interrupted
+                    });
+                    if self.close_after_capture {
+                        self.clear_recording();
+                    }
                 }
             }
         }
@@ -2529,6 +2689,11 @@ impl Studio {
         }
         if !self.live_connected && self.follow_live {
             self.pause_display_for(self.display_reason.unwrap_or(DisplayReason::Disconnected));
+        }
+        if self.server.is_none()
+            && let Some(path) = self.pending_open_after_capture.take()
+        {
+            self.open(path, context.clone());
         }
     }
 
@@ -2666,7 +2831,7 @@ impl Drop for Studio {
 
 fn read_recording(
     path: &Path,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
     progress: &AtomicU64,
     history: pvd_core::live::HistoryConfig,
 ) -> LoadResult {
@@ -2687,7 +2852,11 @@ fn read_recording(
         .is_some()
     {
         drop(file);
-        let recording = pvd_core::capture::open_with_progress(path, &Default::default(), |value| {
+        let limits = pvd_core::capture::CaptureLimits {
+            output_bytes: length.max(pvd_core::capture::CaptureLimits::default().output_bytes),
+            ..Default::default()
+        };
+        let recording = pvd_core::capture::open_with_progress(path, &limits, |value| {
             progress.store(value.completed.min(length), Ordering::Relaxed);
             !cancelled.load(Ordering::Relaxed)
         })
@@ -2743,6 +2912,7 @@ fn read_recording(
     }
     let mut bytes = Vec::with_capacity(length as usize);
     let mut decoder = LiveRecording::default();
+    decoder.set_cancellation(cancelled.clone());
     let mut chunk = [0u8; 65536];
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -2806,7 +2976,7 @@ fn read_recording(
 fn read_recording_on_disk(
     path: &Path,
     file: File,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
     progress: &AtomicU64,
     history: pvd_core::live::HistoryConfig,
 ) -> LoadResult {
@@ -2821,7 +2991,7 @@ fn read_recording_on_disk(
 
 fn read_sdk_reader(
     mut file: impl Read + Seek,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
     progress: &AtomicU64,
     history: pvd_core::live::HistoryConfig,
 ) -> LoadResult {
@@ -2829,9 +2999,10 @@ fn read_sdk_reader(
         Message::detail("Cannot restart capture read", "无法重新读取录制", error)
     })?;
     progress.store(0, Ordering::Relaxed);
-    let mut decoder = LiveRecording::with_history(history).map_err(|error| {
+    let mut decoder = LiveRecording::with_persistent_history(history).map_err(|error| {
         Message::detail("Cannot create disk history", "无法创建磁盘历史", error)
     })?;
+    decoder.set_cancellation(cancelled.clone());
     let mut chunk = [0u8; 65536];
     let mut received = 0u64;
     let mut checked_at = 0u64;
@@ -3004,7 +3175,23 @@ mod tests {
                 .as_nanos(),
         ));
         studio.open(missing.clone(), context.clone());
-        assert!(studio.server.is_none());
+        assert!(studio.server.as_ref().unwrap().is_stopping());
+        assert!(
+            studio.job.is_none(),
+            "file loading must wait for capture drain"
+        );
+        assert_eq!(studio.pending_open_after_capture.as_ref(), Some(&missing));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while studio.server.is_some() {
+            studio.poll_network(&context);
+            assert!(
+                Instant::now() < deadline,
+                "listener did not finish draining"
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        assert!(studio.pending_open_after_capture.is_none());
+        assert!(studio.job.is_some());
         for _ in 0..3 {
             studio.poll_network(&context);
             let retained = studio.last_live_profile.as_ref().unwrap();
@@ -4146,7 +4333,7 @@ mod tests {
         let loaded = read_recording_on_disk(
             &path,
             File::open(&path).unwrap(),
-            &AtomicBool::new(false),
+            &Arc::new(AtomicBool::new(false)),
             &AtomicU64::new(0),
             Default::default(),
         )
@@ -4158,7 +4345,7 @@ mod tests {
     #[ignore = "Requires official PhysX 3.4.2 output"]
     fn disk_file_loader_matches_sdk_replay_and_rejects_incomplete_cache() {
         let path = sdk_baseline_path();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let progress = AtomicU64::new(0);
         let expected = Recording::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
         let config = pvd_core::live::HistoryConfig {
@@ -4369,7 +4556,7 @@ mod tests {
         studio.close();
         assert!(studio.recording.is_none());
         assert!(studio.state.objects.is_empty());
-        let cancel = AtomicBool::new(true);
+        let cancel = Arc::new(AtomicBool::new(true));
         assert!(read_recording(&path, &cancel, &AtomicU64::new(0), Default::default()).is_err());
     }
 

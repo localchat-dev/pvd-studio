@@ -43,6 +43,9 @@ macro_rules! localized_format {
     };
 }
 
+mod rooms;
+mod temporary_recordings;
+
 fn shortcut(context: &egui::Context, key: egui::Key) -> bool {
     !crate::camera_controller::keyboard_input_blocked(context)
         && context.input(|input| {
@@ -444,6 +447,7 @@ pub fn prepare(mut contexts: EguiContexts, mut studio: ResMut<Studio>) -> Result
 pub fn draw(
     mut contexts: EguiContexts,
     mut studio: ResMut<Studio>,
+    mut navmesh: ResMut<crate::navmesh::NavMeshOverlay>,
     mut viewport: ResMut<Viewport>,
     mut images: ResMut<Assets<Image>>,
 ) -> Result {
@@ -462,7 +466,15 @@ pub fn draw(
                 .find_map(|file| file.path.clone())
         })
     {
-        studio.request_ui_action(context, "dropped-capture", UiAction::Open(path));
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("bin"))
+        {
+            navmesh.open = true;
+            navmesh.request_import(path, &studio, Some(context.clone()));
+        } else {
+            studio.request_ui_action(context, "dropped-capture", UiAction::Open(path));
+        }
     }
     if !modal && !crate::camera_controller::keyboard_input_blocked(context) {
         if shortcut(context, egui::Key::Space) && studio.count() > 0 {
@@ -482,8 +494,11 @@ pub fn draw(
         if modal {
             ui.disable();
         }
-        toolbar::show(ui, &mut studio);
+        toolbar::show(ui, &mut studio, &mut navmesh);
     });
+    if !modal {
+        crate::navmesh::window(context, &mut navmesh, &studio);
+    }
     egui::TopBottomPanel::bottom("status").show(context, |ui| {
         if modal {
             ui.disable();
@@ -752,7 +767,7 @@ fn live_profile_diagnostics(
 
 fn activity_counts(ui: &mut egui::Ui, studio: &Studio) -> egui::Response {
     let language = studio.prefs.language;
-    let counts = studio.activity.summary();
+    let counts = studio.activity.summary_scoped(&studio.room_scope);
     let sdk = |value: Option<u64>| value.map_or_else(|| "—".to_owned(), |value| value.to_string());
     let mut summary = localized_format!(
         language,
@@ -774,8 +789,8 @@ fn activity_counts(ui: &mut egui::Ui, studio: &Studio) -> egui::Response {
     }
     let detail = localized_format!(
         language,
-        "Displayed frame {}. Counts include all captured rigid bodies, independent of visibility filters. Articulation links: {}. Cloth and particles are excluded.\nAwake means a non-kinematic dynamic body with IsSleeping=false. It is separate from SDK activity statistics.\nSDK active bodies: dynamic {}, kinematic {}, total {}. Reporting scenes: {}/{}. A dash means unknown. Each scene uses its last reported value, which may refer to a different simulation time.",
-        "当前显示帧 {}，统计全部捕获刚体，不受显示过滤影响；包含 {} 个关节体 Link，不含布料和粒子。\n唤醒表示 IsSleeping=false 的非运动学动态刚体，与 SDK 活动数分别统计。\nSDK 活动数：动态 {}，运动学 {}，合计 {}。已上报场景 {}/{}；— 表示未知。采用各场景最后上报的值，不保证来自同一仿真时刻。",
+        "Displayed frame {}. Counts follow the selected scene, independent of category visibility. Articulation links: {}. Cloth and particles are excluded.\nAwake means a non-kinematic dynamic body with IsSleeping=false. It is separate from SDK activity statistics.\nSDK active bodies: dynamic {}, kinematic {}, total {}. Reporting scenes: {}/{}. A dash means unknown. Each scene uses its last reported value, which may refer to a different simulation time.",
+        "当前显示帧 {}，统计所选场景的刚体，不受类别显示开关影响；包含 {} 个关节体 Link，不含布料和粒子。\n唤醒表示 IsSleeping=false 的非运动学动态刚体，与 SDK 活动数分别统计。\nSDK 活动数：动态 {}，运动学 {}，合计 {}。已上报场景 {}/{}；— 表示未知。采用各场景最后上报的值，不保证来自同一仿真时刻。",
         studio.frame,
         counts.articulation_links,
         sdk(counts.sdk_active_dynamic),
@@ -794,7 +809,7 @@ fn playback(ui: &mut egui::Ui, studio: &mut Studio) {
     let (first_index, last_index) = studio.playback_bounds().unwrap_or((0, 0));
     let count = last.saturating_add(1);
     let history = studio.has_history() && studio.playback_bounds().is_some();
-    ui.add_enabled_ui(studio.count() > 0, |ui| {
+    ui.add_enabled_ui(studio.count() > 0 || (studio.viewing_temporary_recording() && studio.live_connected), |ui| {
         if studio.live_session.is_some() && playback_status::live_button(ui, studio)
             .on_hover_text(language.text("Follow the newest decoded frame; it may lag behind TCP reception. Pausing or seeking only pauses this view; reception and history continue.", "跟随最新解码帧，可能落后于 TCP 接收进度。暂停或跳帧只暂停显示，数据接收和历史存储继续。"))
             .clicked() {
@@ -940,6 +955,8 @@ impl TabViewer for Viewer<'_> {
 impl Viewer<'_> {
     fn objects(&mut self, ui: &mut egui::Ui) {
         let language = self.studio.prefs.language;
+        temporary_recordings::show(ui, self.studio);
+        rooms::show(ui, self.studio);
         ui.add_space(7.0);
         let search = ui.add(
             egui::TextEdit::singleline(&mut self.studio.filter)
@@ -956,16 +973,21 @@ impl Viewer<'_> {
                         .iter()
                         .any(|event| matches!(event, egui::Event::Ime(_)))
             })
-            && let Some(id) = crate::tree::exact_object_id(&self.studio.state, &self.studio.filter)
+            && let Some(id) = crate::tree::exact_object_id_scoped(
+                &self.studio.state,
+                &self.studio.filter,
+                &self.studio.room_scope,
+            )
         {
             self.studio.select_object(Some(id), false);
         }
         ui.add_space(5.0);
-        self.studio.tree.update(
+        self.studio.tree.update_scoped(
             &self.studio.state,
             self.studio.revision,
             &self.studio.filter,
             language,
+            &self.studio.room_scope,
         );
         if self.studio.state.objects.is_empty() {
             ui.add_space(18.0);
@@ -1255,12 +1277,15 @@ impl Viewer<'_> {
                                     .state
                                     .resolve_reference(id, name, *target)
                                     .is_some();
+                                let in_room = self.studio.room_scope.contains(*target);
                                 if ui
                                     .add_enabled(
-                                        resolved,
+                                        resolved && in_room,
                                         egui::Link::new(format!("→ 0x{target:016x}")),
                                     )
-                                    .on_hover_text(if resolved {
+                                    .on_hover_text(if resolved && !in_room {
+                                        language.text("Outside this scene; available in All scenes", "不属于当前场景，可在“全部场景”中查看")
+                                    } else if resolved {
                                         language.text("Inspect referenced object", "查看引用对象")
                                     } else {
                                         language.text(
@@ -1343,11 +1368,12 @@ impl Viewer<'_> {
                                                                     .is_some();
                                                                 if ui
                                                                     .add_enabled(
-                                                                        valid,
+                                                                        valid && self.studio.room_scope.contains(*target),
                                                                         egui::Link::new(format!(
                                                                             "0x{target:x}"
                                                                         )),
                                                                     )
+                                                                    .on_disabled_hover_text(language.text("Unavailable in this scene or frame", "不属于当前场景，或此帧中不存在"))
                                                                     .clicked()
                                                                 {
                                                                     jump = Some(*target);
@@ -1566,7 +1592,7 @@ impl Viewer<'_> {
         );
         let rect = response.rect;
         if self.studio.prefs.show_debug_draw {
-            for primitive in crate::scene::debug_primitives(&self.studio.state) {
+            for primitive in crate::scene::display_debug_primitives(self.studio) {
                 if !crate::scene::drawable_debug(primitive) {
                     continue;
                 }
@@ -1738,21 +1764,44 @@ impl Viewer<'_> {
                     "历史文件 {:.1} MiB",
                     stats.disk_bytes as f64 / 1_048_576.0,
                 )
+            } else if stats.persistent {
+                localized_format!(
+                    language,
+                    "Temporary recording on disk {:.2} GiB",
+                    "临时录制磁盘占用 {:.2} GiB",
+                    stats.disk_bytes as f64 / 1_073_741_824.0,
+                )
             } else {
                 localized_format!(
                     language,
-                    "History cache {:.2} / {:.2} GiB",
-                    "历史缓存 {:.2} / {:.2} GiB",
+                    "Playback disk cache {:.2} / {:.2} GiB",
+                    "回放磁盘缓存 {:.2} / {:.2} GiB",
                     stats.disk_bytes as f64 / 1_073_741_824.0,
                     stats.budget_bytes as f64 / 1_073_741_824.0,
                 )
             };
-            ui.label(usage).on_hover_text(localized_format!(
+            let mut detail = localized_format!(
                 language,
                 "{} disk segments",
                 "{} 个磁盘分段",
                 stats.segments
-            ));
+            );
+            if stats.persistent {
+                detail.push('\n');
+                detail.push_str(&localized_format!(
+                    language,
+                    "Hot history {:.2} / {:.2} GiB; sealed history stays available.",
+                    "热历史 {:.2} / {:.2} GiB；已封存的历史仍可回放。",
+                    stats.cache_disk_bytes as f64 / 1_073_741_824.0,
+                    stats.budget_bytes as f64 / 1_073_741_824.0,
+                ));
+                detail.push('\n');
+                detail.push_str(language.text(
+                    "The active recording retains its beginning on disk. Ended temporary recordings are cleaned up separately according to Capture setup.",
+                    "活动录制在磁盘保留起点。已结束的临时录制按录制设置单独清理。",
+                ));
+            }
+            ui.label(usage).on_hover_text(detail);
             if let Some(warning) = stats.warning {
                 ui.colored_label(egui::Color32::YELLOW, warning);
             }
@@ -1764,7 +1813,7 @@ impl Viewer<'_> {
         }
         ui.horizontal_wrapped(|ui| {
             if !self.studio.is_native_recording() {
-                ui.label(language.text("Clip scene frames", "裁剪场景帧"));
+                ui.label(language.text("Clip capture frames", "裁剪录制帧"));
                 ui.add(
                     egui::DragValue::new(&mut self.studio.trim_first)
                         .range(0..=count.saturating_sub(1)),
@@ -1803,6 +1852,7 @@ impl Viewer<'_> {
                 ui,
                 language.text("Export frame RepX", "导出帧 RepX"),
                 |ui| {
+                    ui.weak(language.text("All scenes in this frame", "范围：当前帧的全部场景"));
                     ui.text_edit_singleline(&mut self.studio.repx_path);
                     if ui
                         .add_enabled(
@@ -2156,7 +2206,7 @@ impl Viewer<'_> {
         ui.checkbox(
             &mut self.studio.prefs.show_debug_draw,
             language.text("Debug drawing", "调试绘制"),
-        );
+        ).on_hover_text(language.text("Drawing without verified scene ownership is available in All scenes.", "无法确定场景归属的绘制可在“全部场景”中查看。"));
         ui.checkbox(
             &mut self.studio.prefs.show_contacts,
             language.text("Contacts and normals", "接触点与法线"),
@@ -2288,9 +2338,25 @@ impl Viewer<'_> {
         });
     }
     fn performance(&mut self, ui: &mut egui::Ui) {
+        if self.studio.displayed_room().is_some() {
+            ui.weak(
+                self.studio
+                    .prefs
+                    .language
+                    .text("Capture-wide analysis", "整个录制的分析"),
+            );
+        }
         crate::profile::show(ui, self.studio);
     }
     fn memory(&mut self, ui: &mut egui::Ui) {
+        if self.studio.displayed_room().is_some() {
+            ui.weak(
+                self.studio
+                    .prefs
+                    .language
+                    .text("Capture-wide analysis", "整个录制的分析"),
+            );
+        }
         crate::memory::show(ui, self.studio);
     }
     fn curves(&mut self, ui: &mut egui::Ui) {
@@ -2600,7 +2666,11 @@ mod tests {
                                         let response = egui::TopBottomPanel::top("toolbar-test")
                                             .show(context, |ui| {
                                                 let right = ui.max_rect().right();
-                                                toolbar::show(ui, &mut studio);
+                                                toolbar::show(
+                                                    ui,
+                                                    &mut studio,
+                                                    &mut crate::navmesh::NavMeshOverlay::default(),
+                                                );
                                                 assert!(ui.min_rect().right() <= right + 0.1);
                                             });
                                         assert!(response.response.rect.right() <= width + 0.1);

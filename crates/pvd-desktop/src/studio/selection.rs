@@ -10,6 +10,9 @@ pub(super) struct Selection {
 
 impl Studio {
     pub fn is_selected(&self, id: u64) -> bool {
+        if !self.room_scope.contains(id) {
+            return false;
+        }
         if self.selected != self.selection.primary {
             return self.selected == Some(id);
         }
@@ -25,7 +28,7 @@ impl Studio {
         if self.selected != self.selection.primary {
             return self
                 .selected
-                .filter(|id| self.state.objects.contains_key(id))
+                .filter(|id| self.state.objects.contains_key(id) && self.room_scope.contains(*id))
                 .into_iter()
                 .collect();
         }
@@ -49,6 +52,9 @@ impl Studio {
             }
             return;
         };
+        if !self.room_scope.contains(id) {
+            return;
+        }
         let Some(object) = self.state.objects.get(&id) else {
             return;
         };
@@ -98,10 +104,12 @@ impl Studio {
         }
         let count = self.selection.objects.len();
         self.selection.objects.retain(|id, generation| {
-            self.state
-                .objects
-                .get(id)
-                .is_some_and(|object| object.generation == *generation)
+            self.room_scope.contains(*id)
+                && self
+                    .state
+                    .objects
+                    .get(id)
+                    .is_some_and(|object| object.generation == *generation)
         });
         let primary = self.selected;
         if self

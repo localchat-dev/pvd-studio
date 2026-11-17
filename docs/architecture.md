@@ -24,7 +24,7 @@ flowchart LR
     SDK[SDK TCP / 文件] --> Input[接收缓存 / 文件读取]
     Input --> Decode[协议或容器解码]
     Decode --> Model[对象状态与帧]
-    Model --> History[共享资源与滚动历史]
+    Model --> History[共享资源与完整临时历史]
     History --> Replay[回放游标]
     Replay --> View[Bevy 场景 / egui 属性]
     Decode --> Analysis[性能 / 内存 / 错误]
@@ -61,7 +61,7 @@ SDK 的 `frame` / `ApexFrame` 按捕获顺序建立全局索引，各来源另�
 
 场景撤销不包含完整 Analysis。默认共享分页分析以有界根缓存和磁盘基线恢复；场景与分析按需加载，目标根未命中时仍可能向前重放分析输入。冷定位、超出缓存的倒放和随机定位不保证恒定耗时。
 
-默认历史上限 8 GiB，目录为当前工作目录的 `pvd-cache/history`。帧数、元数据、资源和可用空间边界可能更早推动淘汰，因此磁盘上限不对应固定保留时长。完整额度与所有权见[共享历史](shared-history.md)，独立持久化见[项目捕获](retained-capture.md)。
+目录为当前工作目录的 `pvd-cache/history`，默认热历史预算 8 GiB。完整模式在热数据回收前封存历史，旧帧按需读取冷存储；活动录制总占盘受剩余空间与独立导航边界约束，到限停止追加并保留起点。显式滚动模式仍可淘汰最早数据。完整额度与所有权见[共享历史](shared-history.md)，临时条目生命周期见[完整临时录制](temporary-recordings.md)，独立持久化见[项目捕获](retained-capture.md)。
 
 ## 容器与分析语义
 

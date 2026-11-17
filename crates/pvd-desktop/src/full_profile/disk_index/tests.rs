@@ -197,6 +197,7 @@ fn capability_upgrade_waits_for_old_queries_and_close_cancels_the_wait() {
     assert_eq!(case.payloads(), 1);
     case.slot.close();
     assert!(worker.join().unwrap().is_err());
+    assert_eq!(case.slot.jobs.active_work_count(), 1);
     assert!(
         held.owner
             .index
@@ -584,6 +585,8 @@ fn retirement_never_runs_blocking_file_cleanup_on_the_caller() {
     caller.join().unwrap();
     entered.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(case.payloads(), 1);
+    assert_eq!(case.slot.jobs.active_work_count(), 0);
+    assert_eq!(case.slot.jobs.active_count(), 1);
     assert!(!case.slot.jobs.cancel_all_and_check_finished());
     release.send(()).unwrap();
     wait_cleanup(&case.slot);

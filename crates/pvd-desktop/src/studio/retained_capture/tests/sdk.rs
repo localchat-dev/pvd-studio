@@ -59,7 +59,7 @@ fn actual_sdk_disk_save_reopen_and_display_match_independent_raw_prefixes() {
         let loaded = read_recording_on_disk(
             &path,
             File::open(&path).unwrap(),
-            &AtomicBool::new(false),
+            &Arc::new(AtomicBool::new(false)),
             &AtomicU64::new(0),
             pvd_core::live::HistoryConfig {
                 directory: case.root.join("history"),

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -24,6 +24,8 @@ pub(super) struct SpoolDirectory {
 #[derive(Debug, Default)]
 pub struct SpoolCleanupReport {
     pub removed_sessions: usize,
+    /// Valid sessions with a reclaimed batch and more files left for a later pass.
+    pub partial_sessions: usize,
     /// Raw segment lengths, excluding ownership records and filesystem allocation overhead.
     pub removed_bytes: u64,
     pub skipped_sessions: usize,
@@ -143,7 +145,7 @@ fn verify_bytes(path: &Path, expected: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn remove_stale(root: &Path, path: &Path) -> io::Result<u64> {
+fn remove_stale(root: &Path, path: &Path, max_files: usize) -> io::Result<(u64, bool)> {
     if !plain_metadata(path)?.is_dir() || path.parent() != Some(root) {
         return Err(io::Error::other(
             "receive session is outside the spool root",
@@ -162,14 +164,12 @@ fn remove_stale(root: &Path, path: &Path) -> io::Result<u64> {
     if contents != expected {
         return Err(io::Error::other("receive ownership record changed"));
     }
-    let mut segments = BTreeMap::<String, bool>::new();
-    let mut registrations = Vec::new();
+    let mut segments = BTreeSet::new();
     let mut bytes = 0u64;
-    for (index, entry) in fs::read_dir(path)?.enumerate() {
+    // An interrupted large receive may leave more files than one cleanup pass
+    // can inspect. Validate a bounded batch before removing any of its pairs.
+    for entry in fs::read_dir(path)?.take(max_files.max(1)) {
         let entry = entry?;
-        if index > MAX_CLEANUP_FILES {
-            return Err(io::Error::other("receive cleanup file limit reached"));
-        }
         if entry.file_name() == OWNER_FILE {
             continue;
         }
@@ -182,23 +182,33 @@ fn remove_stale(root: &Path, path: &Path) -> io::Result<u64> {
             .into_string()
             .map_err(|_| io::Error::other("unrecognized receive filename"))?;
         if segment_name(&name) {
-            bytes = bytes.saturating_add(metadata.len());
-            segments.entry(name).or_insert(false);
+            segments.insert(name);
         } else if let Some(name) = name
             .strip_suffix(REGISTRATION_SUFFIX)
             .filter(|name| segment_name(name))
         {
             verify_bytes(&entry.path(), &registration_bytes(path, name)?)?;
-            segments.insert(name.to_owned(), true);
-            registrations.push(entry.path());
+            segments.insert(name.to_owned());
         } else {
             return Err(io::Error::other("unrecognized receive directory contents"));
         }
     }
-    if segments.values().any(|registered| !registered) {
-        return Err(io::Error::other("unregistered receive segment"));
+    for name in &segments {
+        // A pair can straddle the scan boundary; verify its registration
+        // directly instead of rejecting or deleting an unregistered segment.
+        verify_bytes(
+            &registration_path(path, name),
+            &registration_bytes(path, name)?,
+        )?;
+        match plain_metadata(&path.join(name)) {
+            Ok(metadata) if metadata.is_file() => {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(io::Error::other("receive segment is not a plain file")),
+        }
     }
-    for name in segments.keys() {
+    for name in &segments {
         let file = path.join(name);
         match plain_metadata(&file) {
             Ok(metadata) if metadata.is_file() => fs::remove_file(file)?,
@@ -206,19 +216,35 @@ fn remove_stale(root: &Path, path: &Path) -> io::Result<u64> {
             _ => return Err(io::Error::other("receive segment changed during cleanup")),
         }
     }
-    for file in registrations {
-        plain_metadata(&file)?;
-        fs::remove_file(file)?;
+    for name in &segments {
+        let registration = registration_path(path, name);
+        verify_bytes(&registration, &registration_bytes(path, name)?)?;
+        fs::remove_file(registration)?;
+    }
+    if fs::read_dir(path)?
+        .any(|entry| entry.is_err() || entry.is_ok_and(|entry| entry.file_name() != OWNER_FILE))
+    {
+        // Keep the ownership marker so another bind can reclaim the next batch.
+        return Ok((bytes, false));
     }
     drop(lease);
     fs::remove_file(marker)?;
     drop(guard);
     fs::remove_dir(path)?;
-    Ok(bytes)
+    Ok((bytes, true))
 }
 
-/// Reclaims marked, unlocked receive spools after validating every registered file.
+/// Reclaims bounded batches from marked, unlocked receive spools.
+/// Every selected pair is validated before its batch is deleted; larger sessions
+/// retain their ownership marker so later calls can continue reclaiming them.
 pub fn cleanup_stale_spools(root: &Path) -> io::Result<SpoolCleanupReport> {
+    cleanup_stale_spools_with_limit(root, MAX_CLEANUP_FILES)
+}
+
+fn cleanup_stale_spools_with_limit(
+    root: &Path,
+    max_files: usize,
+) -> io::Result<SpoolCleanupReport> {
     if !plain_metadata(root)?.is_dir() {
         return Err(io::Error::other("receive cleanup requires a directory"));
     }
@@ -230,9 +256,13 @@ pub fn cleanup_stale_spools(root: &Path) -> io::Result<SpoolCleanupReport> {
         if !entry.file_name().to_str().is_some_and(session_name) {
             continue;
         }
-        match remove_stale(&root, &entry.path()) {
-            Ok(bytes) => {
-                report.removed_sessions += 1;
+        match remove_stale(&root, &entry.path(), max_files) {
+            Ok((bytes, removed)) => {
+                if removed {
+                    report.removed_sessions += 1;
+                } else {
+                    report.partial_sessions += 1;
+                }
                 report.removed_bytes = report.removed_bytes.saturating_add(bytes);
             }
             Err(_) => report.skipped_sessions += 1,

@@ -7,6 +7,7 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickerKind {
     OpenCapture,
+    OpenNavMesh,
     SaveCapture,
     SaveClip,
     SaveNativeCapture,
@@ -20,7 +21,7 @@ pub enum PickerKind {
 impl PickerKind {
     fn extension(self) -> Option<&'static str> {
         match self {
-            Self::OpenCapture | Self::RecordingDirectory => None,
+            Self::OpenCapture | Self::OpenNavMesh | Self::RecordingDirectory => None,
             Self::SaveCapture | Self::SaveClip => Some("pvdstream"),
             Self::SaveNativeCapture => Some("pxd2"),
             Self::SaveRetainedCapture => Some("pvdcapture"),
@@ -32,6 +33,7 @@ impl PickerKind {
     fn title(self, language: Language) -> &'static str {
         match self {
             Self::OpenCapture => language.text("Open physics capture", "打开物理捕获"),
+            Self::OpenNavMesh => language.text("Import Detour NavMesh", "导入 Detour 导航网格"),
             Self::SaveCapture => language.text("Save captured SDK stream", "保存捕获的 SDK 流"),
             Self::SaveClip => language.text("Save recording clip", "保存录制片段"),
             Self::SaveNativeCapture => language.text("Save PVD3 recording", "保存 PVD3 录制"),
@@ -293,7 +295,7 @@ mod windows_dialog {
             FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
         if kind == PickerKind::RecordingDirectory {
             options |= FOS_PICKFOLDERS;
-        } else if kind == PickerKind::OpenCapture {
+        } else if matches!(kind, PickerKind::OpenCapture | PickerKind::OpenNavMesh) {
             options |= FOS_FILEMUSTEXIST;
         } else {
             options |= FOS_STRICTFILETYPES | FOS_NOREADONLYRETURN;
@@ -304,6 +306,10 @@ mod windows_dialog {
         }
 
         let filters: Vec<(&str, &str)> = match kind {
+            PickerKind::OpenNavMesh => vec![
+                ("Detour NavMesh", "*.bin"),
+                (language.text("All files", "所有文件"), "*.*"),
+            ],
             PickerKind::OpenCapture => vec![
                 (
                     language.text("Physics capture files", "物理捕获文件"),

@@ -147,7 +147,10 @@ impl SourceResources {
 }
 
 pub(super) fn object_visible(studio: &Studio, object: &RenderObject) -> bool {
-    (studio.prefs.show_kinematic || !object.dynamic || !is_kinematic(&studio.state, object.id))
+    studio.room_scope.contains(object.id)
+        && (studio.prefs.show_kinematic
+            || !object.dynamic
+            || !is_kinematic(&studio.state, object.id))
         && (!object.sleeping
             || (studio.prefs.show_sleeping
                 && studio
@@ -247,6 +250,7 @@ fn dependencies(state: &SceneState, id: u64) -> HashSet<u64> {
 impl SceneIndex {
     pub fn rebuild(
         state: &SceneState,
+        scope: &crate::room_scope::RoomScope,
         objects: &[RenderObject],
         assets: HashMap<ObjectKey, AssetUse>,
         source: SourceResources,
@@ -257,7 +261,11 @@ impl SceneIndex {
             source,
             ..default()
         };
-        for object in state.objects.values().filter(|object| actor(object)) {
+        for object in state
+            .objects
+            .values()
+            .filter(|object| actor(object) && scope.contains(object.id))
+        {
             result.reindex(state, object.id);
         }
         result.last_actor_count = result.dependencies.len();

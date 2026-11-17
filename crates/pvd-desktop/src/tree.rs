@@ -1,8 +1,13 @@
 use std::collections::{BTreeSet, HashSet};
 
+use pvd_core::frame_sources::FrameObject;
 use pvd_core::{Object, SceneState, Value};
 
 use crate::i18n::Language;
+use crate::room_scope::RoomScope;
+
+#[cfg(test)]
+mod room_tests;
 
 const CHILD_PROPERTIES: &[&str] = &[
     "Aggregates",
@@ -44,6 +49,14 @@ pub(crate) fn exact_object_id(state: &SceneState, query: &str) -> Option<u64> {
     state.objects.contains_key(&id).then_some(id)
 }
 
+pub(crate) fn exact_object_id_scoped(
+    state: &SceneState,
+    query: &str,
+    scope: &RoomScope,
+) -> Option<u64> {
+    exact_object_id(state, query).filter(|id| scope.contains(*id))
+}
+
 pub struct Row {
     pub id: Option<u64>,
     pub generation: u32,
@@ -59,6 +72,7 @@ pub struct TreeCache {
     revision: u64,
     filter: String,
     language: Language,
+    room: Option<FrameObject>,
     pub dirty: bool,
 }
 
@@ -70,6 +84,7 @@ impl Default for TreeCache {
             revision: u64::MAX,
             filter: String::new(),
             language: Language::English,
+            room: None,
             dirty: true,
         }
     }
@@ -95,13 +110,20 @@ impl TreeCache {
             if previous.type_name != next.type_name
                 || update.changes_object_properties(state, id, CHILD_PROPERTIES)
                 || update.changes_object_properties(state, id, &["Name", "$top_level"])
+                || (self.room.is_some()
+                    && update.changes_object_properties(
+                        state,
+                        id,
+                        &["Scene", "Parent", "Articulation", "Link", "Fabric", "Asset"],
+                    ))
             {
                 return;
             }
             if previous.generation == next.generation {
                 continue;
             }
-            if !self.filter.is_empty()
+            if self.room.is_some()
+                || !self.filter.is_empty()
                 || CHILD_PROPERTIES
                     .iter()
                     .any(|name| previous.properties.contains_key(*name))
@@ -134,10 +156,35 @@ impl TreeCache {
         }
         self.revision = revision.wrapping_add(1);
     }
+    #[cfg(test)]
     pub fn update(&mut self, state: &SceneState, revision: u64, filter: &str, language: Language) {
+        self.update_with_scope(state, revision, filter, language, None);
+    }
+
+    pub fn update_scoped(
+        &mut self,
+        state: &SceneState,
+        revision: u64,
+        filter: &str,
+        language: Language,
+        scope: &RoomScope,
+    ) {
+        self.update_with_scope(state, revision, filter, language, Some(scope));
+    }
+
+    fn update_with_scope(
+        &mut self,
+        state: &SceneState,
+        revision: u64,
+        filter: &str,
+        language: Language,
+        scope: Option<&RoomScope>,
+    ) {
+        let room = scope.and_then(RoomScope::room);
         if self.revision == revision
             && self.filter == filter
             && self.language == language
+            && self.room == room
             && !self.dirty
         {
             return;
@@ -145,12 +192,13 @@ impl TreeCache {
         self.revision = revision;
         self.filter = filter.into();
         self.language = language;
+        self.room = room;
         self.dirty = false;
         self.rows.clear();
         if !filter.is_empty() {
             let query = filter.to_lowercase();
             let exact = exact_object_id(state, filter);
-            for object in state.objects.values() {
+            for object in objects_in_scope(state, scope) {
                 let row = row(object, 0, false);
                 if exact == Some(object.id)
                     || format!("{} {} {}", row.label, row.detail, object.id)
@@ -168,19 +216,16 @@ impl TreeCache {
             visited: BTreeSet::new(),
             rows: &mut self.rows,
             language,
+            scope,
         };
-        for object in state
-            .objects
-            .values()
+        for object in objects_in_scope(state, scope)
             .filter(|o| o.type_name.ends_with("::PxScene") || is_top_level(o))
         {
             builder.append(object.id, 0, false);
         }
-        let remaining: Vec<_> = state
-            .objects
-            .keys()
+        let remaining: Vec<_> = objects_in_scope(state, scope)
+            .map(|object| object.id)
             .filter(|id| !builder.visited.contains(id))
-            .copied()
             .collect();
         if !remaining.is_empty() {
             builder.rows.push(Row {
@@ -197,6 +242,21 @@ impl TreeCache {
                 }
             }
         }
+    }
+}
+
+fn objects_in_scope<'a>(
+    state: &'a SceneState,
+    scope: Option<&'a RoomScope>,
+) -> Box<dyn Iterator<Item = &'a Object> + 'a> {
+    match scope.filter(|scope| scope.room().is_some()) {
+        Some(scope) => Box::new(
+            scope
+                .objects()
+                .iter()
+                .filter_map(|id| state.objects.get(id)),
+        ),
+        None => Box::new(state.objects.values()),
     }
 }
 
@@ -260,11 +320,16 @@ struct TreeBuilder<'a> {
     visited: BTreeSet<u64>,
     rows: &'a mut Vec<Row>,
     language: Language,
+    scope: Option<&'a RoomScope>,
 }
 
 impl TreeBuilder<'_> {
+    fn contains(&self, id: u64) -> bool {
+        self.scope.is_none_or(|scope| scope.contains(id))
+    }
+
     fn append(&mut self, id: u64, depth: usize, hidden: bool) {
-        if self.rows.len() >= 100_000 || depth > 128 {
+        if self.rows.len() >= 100_000 || depth > 128 || !self.contains(id) {
             return;
         }
         let Some(object) = self.state.objects.get(&id) else {
@@ -275,6 +340,9 @@ impl TreeBuilder<'_> {
             Vec::new()
         } else {
             children(self.state, object)
+                .into_iter()
+                .filter(|id| self.contains(*id))
+                .collect()
         };
         if !hidden {
             let mut row = row(object, depth, !descendants.is_empty());

@@ -23,9 +23,28 @@ pub(in crate::live) struct CaptureBacking {
     pub file: File,
     pub path: PathBuf,
     pub bytes: u64,
+    // Close the file before releasing ownership can remove its cache directory.
+    pub(in crate::live) owner: Mutex<Option<Arc<CacheDirectory>>>,
 }
 
 impl CaptureBacking {
+    pub(in crate::live) fn keep_owner(&self, owner: Arc<CacheDirectory>) -> Result<(), Error> {
+        if self.path.parent() != Some(owner.path.as_path()) {
+            return Err(error(
+                "capture backing is outside its cache owner directory",
+            ));
+        }
+        let mut current = self.owner.lock().map_err(|_| lock_error())?;
+        if let Some(current) = current.as_ref() {
+            if !Arc::ptr_eq(current, &owner) {
+                return Err(error("capture backing already has a different cache owner"));
+            }
+        } else {
+            *current = Some(owner);
+        }
+        Ok(())
+    }
+
     pub(in crate::live) fn read_exact_at(
         &self,
         mut offset: u64,

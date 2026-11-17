@@ -316,27 +316,62 @@ fn active_directory_and_segment_cannot_be_replaced() {
 }
 
 #[test]
-fn cleanup_bounds_leave_an_oversized_session_intact() {
+fn bounded_cleanup_reclaims_large_sessions_over_multiple_passes() {
     let root = root();
     let owner = SpoolDirectory::new(&root).unwrap();
-    let path = abandon(owner);
-    for index in 0..=MAX_CLEANUP_FILES / 2 {
-        let name = format!("{:016}-{index:016}.bin", 1);
-        fs::write(path.join(&name), b"x").unwrap();
-        fs::write(
-            registration_path(&path, &name),
-            registration_bytes(&path, &name).unwrap(),
-        )
-        .unwrap();
+    for index in 0..7 {
+        raw(&owner, index, b"abc");
     }
-    assert_eq!(cleanup_stale_spools(&root).unwrap().removed_sessions, 0);
-    assert_eq!(fs::read_dir(&path).unwrap().count(), MAX_CLEANUP_FILES + 3);
-    let last = format!("{:016}-{:016}.bin", 1, MAX_CLEANUP_FILES / 2);
-    fs::remove_file(path.join(&last)).unwrap();
-    fs::remove_file(registration_path(&path, &last)).unwrap();
-    let report = cleanup_stale_spools(&root).unwrap();
-    assert_eq!(report.removed_sessions, 1);
-    assert_eq!(report.removed_bytes, (MAX_CLEANUP_FILES / 2) as u64);
+    let path = abandon(owner);
+    let mut total_bytes = 0;
+    let mut passes = 0;
+    while path.exists() {
+        let before = fs::read_dir(&path).unwrap().count();
+        let report = cleanup_stale_spools_with_limit(&root, 3).unwrap();
+        assert_eq!(report.skipped_sessions, 0);
+        assert!(report.removed_bytes > 0 && report.removed_bytes <= 9);
+        total_bytes += report.removed_bytes;
+        passes += 1;
+        assert!(passes <= 7, "every pass must reclaim at least one pair");
+        if path.exists() {
+            assert_eq!((report.removed_sessions, report.partial_sessions), (0, 1));
+            assert_eq!(
+                fs::read(path.join(OWNER_FILE)).unwrap(),
+                owner_bytes(&path).unwrap()
+            );
+            assert!(fs::read_dir(&path).unwrap().count() < before);
+        } else {
+            assert_eq!((report.removed_sessions, report.partial_sessions), (1, 0));
+        }
+    }
+    assert!(passes > 1);
+    assert_eq!(total_bytes, 21);
+    fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn bounded_cleanup_validates_the_whole_selected_batch_before_deletion() {
+    let root = root();
+    let owner = SpoolDirectory::new(&root).unwrap();
+    let name = raw(&owner, 0, b"owned");
+    let path = abandon(owner);
+    let foreign = path.join("foreign.txt");
+    fs::write(&foreign, b"permanent bytes").unwrap();
+    let report = cleanup_stale_spools_with_limit(&root, 4).unwrap();
+    assert_eq!(
+        (
+            report.removed_sessions,
+            report.partial_sessions,
+            report.removed_bytes
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(report.skipped_sessions, 1);
+    assert_eq!(fs::read(path.join(&name)).unwrap(), b"owned");
+    assert_eq!(fs::read(&foreign).unwrap(), b"permanent bytes");
+    assert!(path.join(OWNER_FILE).exists());
+    fs::remove_file(foreign).unwrap();
+    assert_eq!(cleanup_stale_spools(&root).unwrap().removed_sessions, 1);
     fs::remove_dir(root).unwrap();
 }
 

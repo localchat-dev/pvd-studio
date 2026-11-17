@@ -4,6 +4,7 @@ param(
     [ValidateSet('zip', '7z')]
     [string]$ArchiveFormat = 'zip',
     [string]$SevenZipPath,
+    [string]$VCRedistPath,
     [string]$TargetDirectory = 'target',
     [ValidatePattern('^\d{8}-\d{6}$')]
     [string]$BuildStamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
@@ -52,6 +53,12 @@ $targetPath = if ([System.IO.Path]::IsPathRooted($TargetDirectory)) {
 }
 $targetRoot = [System.IO.Path]::GetFullPath($targetPath)
 $releaseDirectory = Join-Path $targetRoot 'release'
+if ($VCRedistPath) {
+    if (-not (Test-Path -LiteralPath $VCRedistPath -PathType Leaf)) {
+        throw "VC++ x64 redistributable installer not found: $VCRedistPath"
+    }
+    $VCRedistPath = (Resolve-Path -LiteralPath $VCRedistPath).Path
+}
 $sevenZip = Find-SevenZip $SevenZipPath
 if ($ArchiveFormat -eq '7z' -and -not $sevenZip) {
     throw '7z packaging requires 7-Zip. Specify -SevenZipPath or use -ArchiveFormat zip.'
@@ -78,9 +85,17 @@ try {
     foreach ($name in $executables) {
         Copy-Item -LiteralPath (Join-Path $releaseDirectory $name) -Destination $distribution
     }
+    if ($VCRedistPath) {
+        $prerequisites = Join-Path $distribution 'prerequisites'
+        New-Item -ItemType Directory -Path $prerequisites | Out-Null
+        Copy-Item -LiteralPath $VCRedistPath -Destination (Join-Path $prerequisites 'vc_redist.x64.exe')
+    }
     Copy-Item -LiteralPath (Join-Path $projectRoot 'tools\start-with-diagnostics.cmd') -Destination $distribution
     $readme = Get-Content -LiteralPath (Join-Path $projectRoot 'docs\distribution.md') -Raw -Encoding utf8
     $readme = $readme -replace '\]\((?![a-zA-Z][a-zA-Z0-9+.-]*:|/|#)([^)]+)\)', '](docs/$1)'
+    if ($IncludeSource) {
+        $readme = $readme -replace '\]\(docs/\.\./((?:tools|crates|vendor|test-support)/[^)]+)\)', '](source/$1)'
+    }
     Set-Content -LiteralPath (Join-Path $distribution 'README.md') -Value $readme -Encoding utf8
     $documentationRoot = Join-Path $projectRoot 'docs'
     foreach ($file in Get-ChildItem -LiteralPath $documentationRoot -File -Recurse -Force) {
@@ -113,6 +128,15 @@ try {
             $samples = Join-Path $distribution 'samples'
             New-Item -ItemType Directory -Path $samples -Force | Out-Null
             Copy-Item -LiteralPath $cctSample -Destination $samples
+        }
+    }
+    $navmeshFixtures = Join-Path $projectRoot 'crates/pvd-core/src/navmesh/fixtures'
+    foreach ($name in @('recast-0.43.1.bin', 'synthetic-detail.bin')) {
+        $navmeshSample = Join-Path $navmeshFixtures $name
+        if (Test-Path -LiteralPath $navmeshSample -PathType Leaf) {
+            $samples = Join-Path $distribution 'samples/navmesh'
+            New-Item -ItemType Directory -Path $samples -Force | Out-Null
+            Copy-Item -LiteralPath $navmeshSample -Destination $samples
         }
     }
     foreach ($extension in @('pvdstream', 'json')) {

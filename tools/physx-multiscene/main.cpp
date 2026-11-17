@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include "lifecycle.h"
+
 using namespace physx;
 
 namespace {
@@ -259,6 +261,9 @@ void write_truth(std::ostream& out, Simulation& simulation, const std::vector<Fr
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--lifecycle") {
+        return run_lifecycle(argc, argv);
+    }
     if (argc != 3 || std::string(argv[1]) == argv[2]) {
         std::cerr << "usage: pvd-physx-multiscene capture.pvdstream truth.json\n";
         return 2;

@@ -14,6 +14,7 @@ mod full_update_tests;
 mod object_keys;
 #[cfg(test)]
 mod owned_apply_tests;
+mod persistent;
 #[cfg(test)]
 mod real_seek_probe;
 #[cfg(test)]
@@ -27,7 +28,8 @@ mod scene_undo_real_probe;
 mod segments;
 mod undo;
 use crate::{
-    Action, Error, ErrorEvent, FrameInfo, Object, SceneState, SourceCamera, Value,
+    Action, Error, ErrorEvent, FrameInfo, IngestCancellation, Object, SceneState, SourceCamera,
+    Value,
     analysis::{Analysis, SharedAnalysis},
     camera_entry_bytes, check_replay_cancelled,
     contacts::Contact,
@@ -41,7 +43,10 @@ use crate::{
 };
 use analysis_cache::AnalysisCache;
 use cache_directory::CacheDirectory;
-pub use cache_directory::{CacheCleanupReport, cleanup_stale_history};
+pub use cache_directory::{
+    CacheCleanupReport, cleanup_stale_history, enable_background_stale_history_cleanup,
+    pending_history_cleanups, queue_stale_history_cleanup,
+};
 pub use replay::{ReplayCursor, ReplayFrame, ReplaySeekMetrics, SceneReplayFrame};
 use resources::{ResourceHandle, ResourcePlan, ResourceReader, Resources};
 use segments::{SegmentWriter, WriteState};
@@ -91,6 +96,9 @@ impl Default for HistoryConfig {
 #[derive(Clone, Debug, Default)]
 pub struct HistoryStats {
     pub disk_bytes: u64,
+    /// Complete-session retention; the disk budget applies only to the hot writer.
+    pub persistent: bool,
+    pub cache_disk_bytes: u64,
     pub budget_bytes: u64,
     pub first_frame: usize,
     pub retained_frames: usize,
@@ -963,6 +971,7 @@ pub(crate) struct DiskRecording {
     pub stats: HistoryStats,
     analysis_cache: AnalysisCache,
     analysis_pages: Option<analysis_pages::AnalysisPageReader>,
+    archive: Option<persistent::ArchiveReader>,
 }
 impl DiskRecording {
     pub(crate) fn resident_analysis_at_with_cancel(
@@ -1037,6 +1046,18 @@ impl DiskRecording {
         Ok(analysis)
     }
     pub(crate) fn is_frame_retained(&self, frame: usize) -> bool {
+        let _transition = self.history_guard().ok();
+        if self
+            .frames
+            .binary_search_by_key(&frame, |info| info.index)
+            .is_ok()
+            && self
+                .archive
+                .as_ref()
+                .is_some_and(|archive| archive.contains(frame))
+        {
+            return true;
+        }
         self.segment(frame)
             .is_ok_and(|segment| segment.lease.available())
     }
@@ -1155,6 +1176,10 @@ impl DiskRecording {
             .map(|backing| backing.format)
     }
     pub fn scene_generation(&self, frame: usize) -> Option<u32> {
+        let _transition = self.history_guard().ok()?;
+        if let Some(recording) = self.archived(frame, &mut || false).ok().flatten() {
+            return recording.disk.as_ref()?.scene_generation(frame);
+        }
         let frames = &self.segment(frame).ok()?.frames;
         let position = frames
             .binary_search_by_key(&frame, |entry| entry.info.index)
@@ -1163,7 +1188,18 @@ impl DiskRecording {
     }
     pub fn verify_replay(&self) -> Result<(), Error> {
         let mut prior: Option<(usize, StateIndex)> = None;
-        for segment in self.segments.iter().map(Arc::as_ref).chain(&self.active) {
+        let mut position = 0;
+        while let Some(info) = self.frames.get(position) {
+            let _transition = self.history_guard()?;
+            let owned = self.owned_segment(info.index, &mut || false)?;
+            let segment = owned.as_ref();
+            let last = segment
+                .frames
+                .last()
+                .ok_or_else(|| error("history segment has no frames"))?
+                .info
+                .index;
+            position = self.frames.partition_point(|info| info.index <= last);
             let mut reader = Self::open(segment)?;
             let first = segment
                 .frames
@@ -1238,6 +1274,14 @@ impl DiskRecording {
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<SceneState, Error> {
         check_replay_cancelled(cancelled)?;
+        let _transition = self.history_guard()?;
+        if let Some(recording) = self.archived(frame, cancelled)? {
+            return recording
+                .disk
+                .as_ref()
+                .unwrap()
+                .state_at_with_cancel(frame, cancelled);
+        }
         let segment = self.segment(frame)?;
         let mut reader = Self::open(segment)?;
         let (&checkpoint, &offset) = segment
@@ -1319,6 +1363,14 @@ impl DiskRecording {
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<SharedAnalysis, Error> {
         check_replay_cancelled(cancelled)?;
+        let _transition = self.history_guard()?;
+        if let Some(recording) = self.archived(frame, cancelled)? {
+            return recording
+                .disk
+                .as_ref()
+                .unwrap()
+                .analysis_at_with_cancel(frame, cancelled);
+        }
         if self.analysis_pages.is_some() {
             return self
                 .resident_analysis_at_with_cancel(frame, cancelled)
@@ -1388,6 +1440,11 @@ pub(crate) struct HistoryWriter {
     metrics: Metrics,
     analysis_cache: AnalysisCache,
     analysis_pages: Option<analysis_pages::HistoryPages>,
+    archive: Option<persistent::ArchiveReader>,
+    retention_stopped: bool,
+    pending_archive_bytes: u64,
+    persistent_baseline: Option<persistent::PressureBaseline>,
+    cancellation: IngestCancellation,
 }
 
 impl HistoryWriter {
@@ -1430,6 +1487,11 @@ impl HistoryWriter {
             metrics: Metrics::default(),
             analysis_cache: AnalysisCache::default(),
             analysis_pages: None,
+            archive: None,
+            retention_stopped: false,
+            pending_archive_bytes: 0,
+            persistent_baseline: None,
+            cancellation: IngestCancellation::default(),
         })
     }
 
@@ -1449,8 +1511,13 @@ impl HistoryWriter {
         self.metrics = metrics;
     }
 
+    pub(crate) fn set_cancellation(&mut self, cancellation: IngestCancellation) {
+        self.cancellation = cancellation;
+    }
+
     fn bytes(&self) -> u64 {
         self.completed_bytes
+            .saturating_add(self.pending_archive_bytes)
             .saturating_add(self.active.as_ref().map_or(0, |segment| segment.view.bytes))
             .saturating_add(self.resources.as_ref().map_or(0, Resources::physical_bytes))
             .saturating_add(
@@ -1529,6 +1596,20 @@ impl HistoryWriter {
         let Some(segment) = self.completed.front() else {
             return Ok(false);
         };
+        if self.archive.as_ref().is_some_and(|archive| {
+            !segment
+                .frames
+                .first()
+                .is_some_and(|frame| archive.contains(frame.info.index))
+                || !segment
+                    .frames
+                    .last()
+                    .is_some_and(|frame| archive.contains(frame.info.index))
+        }) {
+            return Err(error(
+                "complete-session history needs a sealed bank before cache reclamation",
+            ));
+        }
         segment.lease.invalidate()?;
         self.analysis_cache.discard_expired();
         if segment.readers.active() || self.owner.as_ref().unwrap().remove(&segment.path).is_err() {
@@ -1542,7 +1623,9 @@ impl HistoryWriter {
         }
         let segment = Arc::make_mut(&mut self.completed).pop_front().unwrap();
         self.completed_bytes -= segment.bytes;
-        self.frame_infos.discard_front(segment.frames.len());
+        if self.archive.is_none() {
+            self.frame_infos.discard_front(segment.frames.len());
+        }
         if let Some(resources) = &self.resources {
             let _timer = self.metrics.measure(Stage::HistoryCollect);
             resources.collect()?;
@@ -1631,6 +1714,9 @@ impl HistoryWriter {
         resident: Option<&crate::analysis::resident::ResidentAnalysis>,
         inputs: Vec<AnalysisInput>,
     ) {
+        if self.retention_stopped {
+            return;
+        }
         let _timer = self.metrics.measure(Stage::HistoryAppend);
         let preparation = if let Some(pages) = &mut self.analysis_pages {
             match resident {
@@ -1648,6 +1734,9 @@ impl HistoryWriter {
             self.warning = Some(format!("Shared analysis history unavailable: {failure}"));
             self.close_segment();
             self.analysis_continuity = false;
+            if self.archive.is_some() {
+                self.stop_retention(failure);
+            }
             return;
         }
         if Instant::now() < self.retry_after {
@@ -1664,6 +1753,9 @@ impl HistoryWriter {
                 let _ = resources.collect();
             }
             self.retry_after = Instant::now() + Duration::from_secs(2);
+            if self.archive.is_some() {
+                self.stop_retention(error.to_string());
+            }
         } else {
             self.warning = None;
         }
@@ -1762,7 +1854,9 @@ impl HistoryWriter {
             .saturating_add(patch.debug.len())
             .saturating_add(patch.contacts.len())
             .saturating_add(2);
-        if resources.needs_reclaim(planned_records) {
+        // Complete-session pressure is handled by sealing before this append;
+        // rolling eviction cannot retire an unsealed persistent segment.
+        if self.archive.is_none() && resources.needs_reclaim(planned_records) {
             self.close_segment();
             resources.collect()?;
             while resources.needs_reclaim(planned_records) && self.evict_one()? {}
@@ -1840,6 +1934,11 @@ impl HistoryWriter {
                 loop {
                     let Some(space) = available_disk_space(&self.owner.as_ref().unwrap().path)?
                     else {
+                        if self.archive.is_some() && self.config.min_free_disk_bytes != 0 {
+                            return Err(error(
+                                "free disk space cannot verify the configured reserve on this platform",
+                            ));
+                        }
                         break;
                     };
                     if space.saturating_sub(self.config.min_free_disk_bytes)
@@ -1890,7 +1989,7 @@ impl HistoryWriter {
             }
             break;
         }
-        while self.frames() > MAX_INDEX_FRAMES
+        while (self.archive.is_none() && self.frames() > MAX_INDEX_FRAMES)
             || self.completed.len() > 4096
             || self.lease_bytes() > 128 << 20
         {
@@ -1914,12 +2013,19 @@ impl HistoryWriter {
                 .analysis_pages
                 .as_ref()
                 .map(analysis_pages::HistoryPages::reader),
+            archive: self.archive.clone(),
             stats: HistoryStats {
-                disk_bytes: self.bytes(),
+                disk_bytes: self
+                    .bytes()
+                    .saturating_add(self.archive.as_ref().map_or(0, |archive| archive.bytes())),
+                persistent: self.archive.is_some(),
+                cache_disk_bytes: self.bytes(),
                 budget_bytes: self.config.disk_budget_bytes,
                 first_frame,
                 retained_frames: self.frames(),
-                segments: self.completed.len() + usize::from(self.active.is_some()),
+                segments: self.completed.len()
+                    + usize::from(self.active.is_some())
+                    + self.archive.as_ref().map_or(0, |archive| archive.len()),
                 warning: self.warning.clone(),
             },
         }
@@ -1976,6 +2082,28 @@ pub(crate) struct Streaming {
     pub errors: VecDeque<(usize, ErrorEvent)>,
 }
 impl Streaming {
+    pub(crate) fn prepare_persistent(&mut self, source: &crate::Recording) -> Result<(), Error> {
+        let planned_records = self.dirty.len().saturating_mul(3).saturating_add(2);
+        self.history.prepare_persistent(source, planned_records)
+    }
+    pub(crate) fn directory_bytes(
+        &mut self,
+        index: usize,
+        binding: FrameBinding,
+        directory: &FrameDirectory,
+    ) -> Result<usize, Error> {
+        match directory.index_bytes_after_observe(index, binding, self.history.accepting_frames()) {
+            Err(failure)
+                if self.history.archive.is_some()
+                    && failure.to_string().contains("limit exceeded") =>
+            {
+                self.history
+                    .stop_retention(format!("complete-session navigation directory: {failure}"));
+                directory.index_bytes_after_observe(index, binding, false)
+            }
+            result => result,
+        }
+    }
     pub fn new(history: HistoryWriter) -> Self {
         Self {
             history,

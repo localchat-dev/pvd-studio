@@ -52,6 +52,13 @@ pub(super) fn show(ui: &mut egui::Ui, studio: &Studio) -> egui::Response {
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
                 ui.painter().circle_filled(dot.center(), 3.0, foreground);
+                if let Some(room) = studio.displayed_room() {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(studio.room_label(room)).strong())
+                            .truncate(),
+                    )
+                    .on_hover_text(format!("PxScene 0x{:X} / {}", room.id, room.generation));
+                }
                 ui.label(
                     egui::RichText::new(mode.label(language))
                         .strong()

@@ -24,6 +24,7 @@ pub fn open_with_progress(
         file,
         path: path.clone(),
         bytes,
+        owner: std::sync::Mutex::new(None),
     });
     let mut budget = Budget::new(limits.index_bytes);
     budget.charge(directory.retained_bytes)?;
@@ -76,11 +77,14 @@ pub fn open_with_progress(
     }
     let mut disk = DiskRecording {
         _owner: None,
+        archive: None,
         segments: Arc::new(segments),
         active: None,
         frames: frames.clone(),
         stats: HistoryStats {
             disk_bytes: bytes,
+            cache_disk_bytes: bytes,
+            persistent: false,
             budget_bytes: bytes,
             first_frame: report.range.first,
             retained_frames: report.frames,
@@ -111,6 +115,8 @@ pub fn open_with_progress(
     recording.frames = frames;
     recording.frame_sources = directory.frame_sources;
     recording.classes = metadata.classes;
+    let has_room_directory = metadata.rooms.is_some();
+    recording.rooms = metadata.rooms.unwrap_or_default();
     recording.diagnostics = metadata.diagnostics;
     recording.diagnostics.push(format!("Project capture retains source frames {}..={}; hidden restoration history and analysis retention boundaries are preserved. Type metadata belongs to the export snapshot.", report.range.first, report.range.last));
     recording.streamed_frame_end = Some(
@@ -130,6 +136,31 @@ pub fn open_with_progress(
     };
     recording.initial =
         Arc::new(recording.state_at_with_cancel(report.range.first, &mut cancelled)?);
+    if !has_room_directory {
+        recording
+            .rooms
+            .observe_state(&recording.initial, report.range.first);
+        let mut first_observed = BTreeMap::new();
+        for source in recording.frame_sources.sources() {
+            let mut previous = None;
+            for frame in source.frames() {
+                check_replay_cancelled(&mut cancelled)?;
+                if let Some(scene) = frame.scene
+                    && previous != Some(scene)
+                {
+                    previous = Some(scene);
+                    if recording.rooms.len() + first_observed.len() < crate::rooms::ROOM_LIMIT
+                        && recording.rooms.get(scene).is_none()
+                    {
+                        first_observed.entry(frame.index).or_insert(scene);
+                    }
+                }
+            }
+        }
+        for (frame, scene) in first_observed {
+            recording.rooms.observe(scene, frame);
+        }
+    }
     recording.analysis = recording.analysis_at_with_cancel(report.range.first, &mut cancelled)?;
     check_replay_cancelled(&mut cancelled)?;
     Ok(recording)

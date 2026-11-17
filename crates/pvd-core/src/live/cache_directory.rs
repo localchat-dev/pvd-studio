@@ -11,7 +11,12 @@ use std::{
 const OWNER_FILE: &str = ".pvd-studio-owner";
 const OWNER_MAGIC: &str = "pvd-studio temporary history v1\n";
 const MAX_SCAN_DIRECTORIES: usize = 256;
-const MAX_CLEANUP_FILES: usize = 8320;
+const MAX_CLEANUP_FILES: usize = 12416;
+
+mod background;
+pub use background::{
+    enable_background_stale_history_cleanup, pending_history_cleanups, queue_stale_history_cleanup,
+};
 
 #[derive(Debug)]
 pub(super) struct CacheDirectory {
@@ -135,7 +140,11 @@ fn remove_stale(root: &Path, path: &Path) -> io::Result<u64> {
         }
         let mut header = [0; 8];
         File::open(entry.path())?.read_exact(&mut header)?;
-        if &header != MAGIC && &header != b"PVDHIS01" && &header != b"PVDHIS02" {
+        if &header != MAGIC
+            && &header != b"PVDHIS01"
+            && &header != b"PVDHIS02"
+            && &header != b"PVDCAP03"
+        {
             return Err(io::Error::other("history file has an unknown signature"));
         }
         bytes = bytes.saturating_add(metadata.len());
@@ -177,7 +186,11 @@ impl CacheDirectory {
     pub(super) fn new(root: &Path) -> Result<Arc<Self>, Error> {
         fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;
-        let _ = cleanup_stale_history(&root);
+        if background::enabled() {
+            queue_stale_history_cleanup(&root);
+        } else {
+            let _ = cleanup_stale_history(&root);
+        }
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path = root.join(format!(
             "session-{stamp}-{}-{}",
@@ -227,9 +240,35 @@ impl CacheDirectory {
 
 impl Drop for CacheDirectory {
     fn drop(&mut self) {
+        let files = self.files.get_mut().ok().map(std::mem::take);
+        let owned = OwnedCleanup {
+            path: std::mem::take(&mut self.path),
+            files,
+            lease: self.lease.take(),
+            guard: self.guard.take(),
+        };
+        if background::enabled() {
+            background::dispose(owned);
+        } else {
+            owned.run();
+        }
+    }
+}
+
+// Keeps the ownership lease until the worker has finished. Dropping this value
+// without running it deliberately leaves a marked, recoverable session behind.
+struct OwnedCleanup {
+    path: PathBuf,
+    files: Option<BTreeSet<PathBuf>>,
+    lease: Option<File>,
+    guard: Option<File>,
+}
+
+impl OwnedCleanup {
+    fn run(mut self) {
         let mut removed = true;
-        if let Ok(files) = self.files.lock() {
-            for path in files.iter() {
+        if let Some(files) = &self.files {
+            for path in files {
                 if path.parent() == Some(self.path.as_path()) && plain_metadata(path).is_ok() {
                     removed &= fs::remove_file(path).is_ok();
                 } else if path.exists() {
@@ -252,7 +291,7 @@ impl Drop for CacheDirectory {
 mod tests {
     use super::*;
 
-    fn root() -> PathBuf {
+    pub(super) fn root() -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "pvd-cache-cleanup-test-{}-{}",
             std::process::id(),

@@ -40,7 +40,7 @@ impl Fixture {
     fn load(&self, progress: &AtomicU64) -> LoadResult {
         read_recording(
             &self.path,
-            &AtomicBool::new(false),
+            &Arc::new(AtomicBool::new(false)),
             progress,
             self.history.clone(),
         )
@@ -275,7 +275,7 @@ fn fallback_does_not_hide_incomplete_protocol_or_bypass_history_limits() {
     assert!(
         read_recording(
             &fixture.path,
-            &AtomicBool::new(true),
+            &Arc::new(AtomicBool::new(true)),
             &AtomicU64::new(0),
             fixture.history.clone()
         )

@@ -22,8 +22,8 @@
 | 范围 | 文档 |
 | --- | --- |
 | 协议与对象 | [协议](protocol.md)、[对象层级](object-hierarchy.md)、[坐标](coordinates.md)、[多 Scene](multiscene-sdk.md) |
-| 接收与历史 | [持续接收](continuous-live.md)、[接收策略](receive-backpressure.md)、[共享历史](shared-history.md)、[回放](tcp-playback.md)、[帧来源](frame-sources.md)、[保留捕获](retained-capture.md) |
-| 显示 | [查询形状](query-shapes.md)、[地形](heightfield.md)、[关节限位](joint-limits.md)、[Cloth](cloth.md)、[粒子](particles.md)、[相机](source-cameras.md) |
+| 接收与历史 | [持续接收](continuous-live.md)、[接收策略](receive-backpressure.md)、[完整临时录制](temporary-recordings.md)、[共享历史](shared-history.md)、[回放](tcp-playback.md)、[帧来源](frame-sources.md)、[保留捕获](retained-capture.md) |
+| 显示 | [查询形状](query-shapes.md)、[地形](heightfield.md)、[关节限位](joint-limits.md)、[Cloth](cloth.md)、[粒子](particles.md)、[相机](source-cameras.md)、[多房间调试](rooms.md)、[NavMesh 叠加](navmesh.md) |
 | 分析 | [性能](profile.md)、[内存](memory-history.md)、[曲线](curves.md)、[完整文件分析](full-file-profile.md)、[线程时间线](full-file-thread-timeline.md)、[CSV](analysis-export.md) |
 | 交换格式 | [录制包](pvd-archive.md)、[原版容器](original-file-format.md)、[原版保存](native-export.md)、[原版绘制](native-debug-draw.md)、[原版错误](native-errors.md)、[OriginShift](origin-shift.md)、[SDK 片段](clips.md)、[RepX](repx.md) |
 | 桌面与资源 | [界面](ui.md)、[相机操作](camera-controls.md)、[显示帧一致性](display-frame-consistency.md)、[原版显示属性](native-settings.md)、[生命周期检查](lifecycle-validation.md)、[退出收尾](background-shutdown.md)、[接收清理](receive-cache-cleanup.md) |

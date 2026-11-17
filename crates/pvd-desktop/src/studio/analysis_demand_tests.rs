@@ -352,6 +352,7 @@ fn preparation_app(studio: Studio, context: &egui::Context) -> bevy::prelude::Ap
 
     let mut app = App::new();
     app.insert_resource(studio)
+        .init_resource::<crate::navmesh::NavMeshOverlay>()
         .init_resource::<crate::scene::Viewport>()
         .init_resource::<Assets<Mesh>>()
         .init_resource::<Assets<StandardMaterial>>()

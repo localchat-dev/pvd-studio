@@ -1,6 +1,10 @@
 use super::*;
 
-pub(super) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
+pub(super) fn show(
+    ui: &mut egui::Ui,
+    studio: &mut Studio,
+    navmesh: &mut crate::navmesh::NavMeshOverlay,
+) {
     let language = studio.prefs.language;
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -28,9 +32,22 @@ pub(super) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
         }
         if ui
             .add_enabled(
-                studio.recording.is_some() || studio.bytes.is_some(),
+                studio.recording.is_some() || studio.bytes.is_some() || studio.live_connected,
                 egui::Button::new(language.text("Close", "关闭")),
             )
+            .on_hover_text(if studio.temporary_recordings.selected.is_some() {
+                language.text(
+                    "Close this view; keep the temporary recording and any active reception.",
+                    "关闭当前查看；保留临时录制，正在进行的接收继续。",
+                )
+            } else if studio.live_connected {
+                language.text(
+                    "Stop this connection and retain its completed frames as a temporary recording.",
+                    "停止当前连接，将已有完整帧保留为临时录制。",
+                )
+            } else {
+                language.text("Close the current recording view.", "关闭当前录制视图。")
+            })
             .clicked()
         {
             studio.request_ui_action(ui.ctx(), "toolbar-close", UiAction::Close);
@@ -73,6 +90,9 @@ pub(super) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
         playback(ui, studio);
         frame_sources::show(ui, studio);
         ui.separator();
+        if ui.button("NavMesh").clicked() {
+            navmesh.open = !navmesh.open;
+        }
         let source = studio.source_text(language);
         let name = std::path::Path::new(source)
             .file_name()
@@ -158,19 +178,38 @@ fn settings(ui: &mut egui::Ui, studio: &mut Studio) {
             ui.add(egui::DragValue::new(&mut studio.prefs.listener.port).range(1..=65535));
         });
         ui.separator();
-        ui.strong(language.text("Playback history", "回放历史"));
+        ui.strong(language.text("Recording and playback", "录制与回放"));
         ui.add(egui::TextEdit::singleline(&mut studio.prefs.history_directory).desired_width(340.0))
-            .on_hover_text(language.text("History directory", "历史缓存目录"));
+            .on_hover_text(language.text("Temporary recording and playback directory", "临时录制与回放目录"));
         ui.horizontal(|ui| {
-            ui.label(language.text("Capacity", "容量"));
+            ui.label(language.text("Playback cache", "回放缓存预算"));
             ui.add(egui::DragValue::new(&mut studio.prefs.history_budget_gib).range(1..=1024).suffix(" GiB"))
                 .on_hover_text(language.text(
-                    "The oldest history is removed when capacity is reached. Live reception continues.",
-                    "达到容量后淘汰最早的历史，实时接收继续。",
+                    "Limits each replay cache. Earlier recording data remains on disk and is loaded when needed; reaching this limit does not discard the start of an active recording.",
+                    "限制回放缓存大小。更早的录制数据保留在磁盘，查看时按需读取；达到此预算不会删除活动录制的开头。",
                 ));
             ui.label(language.text("Refresh", "刷新"));
             ui.add(egui::DragValue::new(&mut studio.prefs.live_refresh_hz).range(15..=120).suffix(" Hz"));
         });
+        ui.horizontal(|ui| {
+            ui.label(language.text("Ended recordings", "已结束录制预算"));
+            ui.add(egui::DragValue::new(&mut studio.prefs.temporary_budget_gib).range(1..=1024).suffix(" GiB"))
+                .on_hover_text(language.text("Default: 8 GiB for ended temporary recordings only.", "默认 8 GiB，仅用于已结束的临时录制。"));
+            ui.label(language.text("Count", "数量"));
+            ui.add(egui::DragValue::new(&mut studio.prefs.temporary_max_count).range(1..=256))
+                .on_hover_text(language.text("Default: 16 ended temporary recordings.", "默认保留 16 条已结束的临时录制。"));
+        });
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(language.text(
+                    "Active recordings retain their first frame while disk space allows. Cleanup removes the oldest ended temporary recordings; the newest recording and recordings being viewed or saved are protected, even above the cleanup target. Temporary files are cleared on normal exit. Save recordings to keep them; saved files are not cleaned up.",
+                    "磁盘空间允许时，活动录制始终保留首帧。超预算时清理最早结束的临时录制；最新一条及查看或保存中的内容继续保留，因此总量可能超出预算。正常退出会清理临时文件；需要保留的录制请保存，已保存文件不参与清理。",
+                ))
+                .small()
+                .color(MUTED),
+            )
+            .wrap(),
+        );
         receive_storage_settings(ui, &mut studio.prefs);
         ui.separator();
         ui.checkbox(&mut studio.prefs.auto_capture, language.text("Save incoming recordings", "自动保存录制"));

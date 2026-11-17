@@ -715,7 +715,7 @@ pub(crate) mod tests {
             }
             assert!(studio.curve_job.is_none());
             assert!(studio.recording.is_none());
-            assert_eq!(jobs.active_count(), 1);
+            assert_eq!(jobs.active_work_count(), 1);
             release.send(()).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while jobs.active_count() != 0 {

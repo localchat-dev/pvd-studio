@@ -178,7 +178,16 @@ fn expired_cross_source_disk_seek_restores_the_displayed_source() {
     studio.set_recording(recording.clone());
     studio.state = displayed.clone();
     studio.remember_display_frame(2);
+    studio.commit_room_display();
     let identity = studio.displayed_frame_source;
+    let displayed_room = studio.displayed_room();
+    assert_eq!(
+        displayed_room,
+        Some(pvd_core::frame_sources::FrameObject {
+            id: SOURCE_A,
+            generation: 0
+        })
+    );
     for index in 4..1024 {
         if !recording.is_frame_retained(1) {
             break;
@@ -188,8 +197,15 @@ fn expired_cross_source_disk_seek_restores_the_displayed_source() {
     }
     assert!(!recording.is_frame_retained(1));
     assert!(recording.frame_info(1).is_some());
+    assert!(
+        recording.is_frame_retained(3),
+        "a later frame must not replace the paused alignment target"
+    );
     studio.select_frame_source(source(SOURCE_B));
     assert_eq!(studio.seeking, Some(1));
+    assert_eq!(studio.displayed_room(), displayed_room);
+    assert_eq!(studio.frame, 2);
+    assert_eq!(studio.room_scope.room(), displayed_room);
     let context = egui::Context::default();
     let deadline = Instant::now() + Duration::from_secs(5);
     while studio.seeking.is_some() {
@@ -201,6 +217,9 @@ fn expired_cross_source_disk_seek_restores_the_displayed_source() {
     assert_eq!(studio.displayed_frame_source, identity);
     assert_eq!(studio.frame, 2);
     assert_eq!(studio.state, displayed);
+    assert_eq!(studio.room_view.requested, displayed_room);
+    assert_eq!(studio.displayed_room(), displayed_room);
+    assert_eq!(studio.room_scope.room(), displayed_room);
     assert_eq!(studio.display_reason, Some(DisplayReason::SeekFailed));
     assert_eq!(studio.playing, 0);
     assert!(
@@ -219,4 +238,21 @@ fn expired_cross_source_disk_seek_restores_the_displayed_source() {
     drop(live);
     assert!(fs::read_dir(&cache).unwrap().next().is_none());
     fs::remove_dir(cache).unwrap();
+}
+
+#[test]
+fn paused_room_switch_uses_first_frame_only_when_the_room_has_no_earlier_boundary() {
+    let recording = recording_for_sources(&[SOURCE_A, SOURCE_A, SOURCE_B, SOURCE_A, SOURCE_B]);
+    let mut studio = Studio::default();
+    studio.set_recording(recording);
+    studio.seek(1);
+    assert!(!studio.follow_live);
+    assert_eq!(studio.displayed_room().unwrap().id, SOURCE_A);
+    studio.select_frame_source(source(SOURCE_B));
+    assert_eq!(studio.frame, 2);
+    assert_eq!(studio.displayed_room().unwrap().id, SOURCE_B);
+    studio.select_frame_source(source(SOURCE_A));
+    assert_eq!(studio.frame, 1);
+    assert_eq!(studio.displayed_room().unwrap().id, SOURCE_A);
+    assert!(!studio.follow_live);
 }

@@ -11,16 +11,55 @@ use std::{
 const MAX_JOBS: usize = 128;
 type Cancel = Arc<dyn Fn() + Send + Sync>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Work,
+    Retirement,
+}
+
+struct Job {
+    name: String,
+    cancel: Cancel,
+    kind: JobKind,
+}
+
 #[derive(Default)]
 struct State {
     closing: bool,
     next_id: u64,
-    jobs: BTreeMap<u64, Cancel>,
+    jobs: BTreeMap<u64, Job>,
     wake: Option<Cancel>,
 }
 
 #[derive(Clone, Default)]
 pub struct BackgroundJobs(Arc<Mutex<State>>);
+
+pub struct JobControl {
+    owner: BackgroundJobs,
+    id: u64,
+}
+
+impl JobControl {
+    /// Mark only after work, permanent writes and input reception have stopped.
+    /// The remainder may release ephemeral owners and temporary files only.
+    pub fn begin_cleanup(self, name: &str) {
+        let wake = {
+            let mut state = self
+                .owner
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(job) = state.jobs.get_mut(&self.id) {
+                job.kind = JobKind::Retirement;
+                job.name = name.into();
+            }
+            state.wake.clone()
+        };
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+}
 
 struct Completion {
     owner: BackgroundJobs,
@@ -53,6 +92,26 @@ impl BackgroundJobs {
             .len()
     }
 
+    pub fn active_names(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .jobs
+            .values()
+            .map(|job| job.name.clone())
+            .collect()
+    }
+
+    pub fn active_work_count(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .jobs
+            .values()
+            .filter(|job| job.kind == JobKind::Work)
+            .count()
+    }
+
     pub fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if state.wake.is_none() {
@@ -74,6 +133,15 @@ impl BackgroundJobs {
         name: &str,
         cancel: impl Fn() + Send + Sync + 'static,
         work: impl FnOnce() + Send + 'static,
+    ) -> io::Result<JoinHandle<()>> {
+        self.spawn_with_cancel_and_control(name, cancel, move |_| work())
+    }
+
+    pub fn spawn_with_cancel_and_control(
+        &self,
+        name: &str,
+        cancel: impl Fn() + Send + Sync + 'static,
+        work: impl FnOnce(JobControl) + Send + 'static,
     ) -> io::Result<JoinHandle<()>> {
         let cancel: Cancel = Arc::new(cancel);
         let completion = {
@@ -100,24 +168,96 @@ impl BackgroundJobs {
                 .next_id
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("background job identifier overflow"))?;
-            state.jobs.insert(id, cancel);
+            state.jobs.insert(
+                id,
+                Job {
+                    name: name.into(),
+                    cancel,
+                    kind: JobKind::Work,
+                },
+            );
             Completion {
                 owner: self.clone(),
                 id,
             }
         };
+        let control = JobControl {
+            owner: self.clone(),
+            id: completion.id,
+        };
         thread::Builder::new().name(name.into()).spawn(move || {
             // FnOnce drops its captured resource owners before completion becomes observable.
-            work();
+            work(control);
             drop(completion);
         })
+    }
+
+    /// Retire an owner without running its destructor on the caller, including
+    /// when thread creation fails. Shutdown may retry the returned owner.
+    pub fn retire<T: Send + 'static>(&self, value: T) -> Result<(), (io::Error, T)> {
+        let completion = {
+            let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            // Reserve one extra slot for releasing the application's owners;
+            // ordinary work remains rejected after shutdown starts.
+            if state.jobs.len() > MAX_JOBS {
+                return Err((
+                    io::Error::new(io::ErrorKind::WouldBlock, "resource retirement is pending"),
+                    value,
+                ));
+            }
+            let id = state.next_id;
+            let Some(next_id) = id.checked_add(1) else {
+                return Err((
+                    io::Error::other("background job identifier overflow"),
+                    value,
+                ));
+            };
+            state.next_id = next_id;
+            state.jobs.insert(
+                id,
+                Job {
+                    name: "pvd-studio-release".into(),
+                    cancel: Arc::new(|| {}),
+                    kind: JobKind::Retirement,
+                },
+            );
+            Completion {
+                owner: self.clone(),
+                id,
+            }
+        };
+        let owned = Arc::new(Mutex::new(Some(value)));
+        let worker_owned = owned.clone();
+        match thread::Builder::new()
+            .name("pvd-studio-release".into())
+            .spawn(move || {
+                let value = worker_owned
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                drop(value);
+                drop(completion);
+            }) {
+            Ok(worker) => {
+                drop(worker);
+                Ok(())
+            }
+            Err(error) => {
+                let value = owned
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                    .expect("failed retirement thread did not consume its owner");
+                Err((error, value))
+            }
+        }
     }
 
     pub fn cancel_all_and_check_finished(&self) -> bool {
         let cancellations: Vec<_> = {
             let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
             state.closing = true;
-            state.jobs.values().cloned().collect()
+            state.jobs.values().map(|job| job.cancel.clone()).collect()
         };
         for cancel in cancellations {
             cancel();
@@ -204,5 +344,56 @@ mod tests {
         b.join().unwrap();
         assert!(first.cancel_all_and_check_finished());
         assert!(second.cancel_all_and_check_finished());
+    }
+
+    #[test]
+    fn failed_retirement_returns_owner_without_running_its_destructor() {
+        struct Resource(Arc<AtomicBool>);
+        impl Drop for Resource {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let jobs = BackgroundJobs::default();
+        jobs.0.lock().unwrap().next_id = u64::MAX;
+        let released = Arc::new(AtomicBool::new(false));
+        let Err((error, owned)) = jobs.retire(Resource(released.clone())) else {
+            panic!("exhausted registry accepted retirement");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!released.load(Ordering::Acquire));
+        assert_eq!(jobs.active_count(), 0);
+        drop(owned);
+        assert!(released.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn explicit_cleanup_transition_keeps_completion_tracked() {
+        let jobs = BackgroundJobs::default();
+        let (finish_work, working) = mpsc::channel();
+        let (cleaning, cleanup) = mpsc::channel();
+        let (finish_cleanup, releasing) = mpsc::channel();
+        let worker = jobs
+            .spawn_with_cancel_and_control(
+                "input",
+                || {},
+                move |control| {
+                    working.recv_timeout(Duration::from_secs(3)).unwrap();
+                    control.begin_cleanup("temporary-files");
+                    cleaning.send(()).unwrap();
+                    releasing.recv_timeout(Duration::from_secs(3)).unwrap();
+                },
+            )
+            .unwrap();
+        assert_eq!(jobs.active_work_count(), 1);
+        finish_work.send(()).unwrap();
+        cleanup.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(jobs.active_work_count(), 0);
+        assert_eq!(jobs.active_count(), 1);
+        assert_eq!(jobs.active_names(), vec!["temporary-files"]);
+        assert!(!jobs.cancel_all_and_check_finished());
+        finish_cleanup.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(jobs.active_count(), 0);
     }
 }

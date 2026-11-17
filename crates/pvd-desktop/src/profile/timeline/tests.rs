@@ -411,7 +411,7 @@ fn actual_thread_catalog_and_window_readers_cancel_on_close_shutdown_and_source_
                 state.sync(2);
             }
             assert!(cancelled.load(Ordering::Relaxed));
-            assert_eq!(jobs.active_count(), 1);
+            assert_eq!(jobs.active_work_count(), 1);
             release.send(()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while jobs.active_count() != 0 {

@@ -21,17 +21,23 @@ mod display_probe;
 mod egui_output;
 mod file_picker;
 mod full_profile;
+mod grid_probe;
 mod i18n;
+mod infinite_grid;
 mod lifecycle_probe;
 mod line_render;
 mod listen_settings;
 mod memory;
+mod navmesh;
+mod navmesh_probe;
+mod navmesh_render;
 mod network;
 mod point_clouds;
 mod profile;
 mod profile_cache;
 mod property_copy;
 mod recording_export;
+mod room_scope;
 mod scene;
 mod studio;
 mod tree;
@@ -44,6 +50,7 @@ use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
 fn main() -> AppExit {
     crash_report::install();
+    pvd_core::live::enable_background_stale_history_cleanup();
     let mut args: Vec<String> = std::env::args().collect();
     let language = match take_language_option(&mut args) {
         Ok(language) => language,
@@ -54,6 +61,20 @@ fn main() -> AppExit {
     };
     let live_profile = take_flag_option(&mut args, "--live-profile");
     let smooth_lines = !take_flag_option(&mut args, "--no-line-aa");
+    let navmesh_path = match take_path_option(&mut args, "--navmesh") {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{error}");
+            return AppExit::error();
+        }
+    };
+    let navmesh_second_path = match take_path_option(&mut args, "--navmesh-second") {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("{error}");
+            return AppExit::error();
+        }
+    };
     let lifecycle_check = if args
         .get(1)
         .is_some_and(|arg| arg == "--render-lifecycle-check")
@@ -84,10 +105,25 @@ fn main() -> AppExit {
     } else {
         None
     };
+    let grid_check = args.get(1).is_some_and(|arg| arg == "--render-check")
+        && args.get(5).is_some_and(|arg| arg == "grid-motion");
+    let navmesh_scene_check = args.get(1).is_some_and(|arg| arg == "--render-check")
+        && args.get(5).is_some_and(|arg| arg == "navmesh-scenes");
+    if navmesh_scene_check && (navmesh_path.is_none() || navmesh_second_path.is_none()) {
+        eprintln!("navmesh-scenes requires --navmesh and --navmesh-second file paths");
+        return AppExit::error();
+    }
+    if !navmesh_scene_check && navmesh_second_path.is_some() {
+        eprintln!("--navmesh-second is only supported by the navmesh-scenes render check");
+        return AppExit::error();
+    }
     let render_check = lifecycle_check.is_some()
         || playback_check.is_some()
         || args.get(1).is_some_and(|arg| arg == "--render-check");
     let mut studio = studio::Studio::default();
+    pvd_core::live::queue_stale_history_cleanup(std::path::Path::new(
+        &studio.prefs.history_directory,
+    ));
     studio.live_profile_enabled = live_profile;
     if let Some(language) = language {
         studio.prefs.language = language;
@@ -168,7 +204,11 @@ fn main() -> AppExit {
             .add_plugins(ScheduleRunnerPlugin::run_loop(
                 std::time::Duration::from_millis(16),
             ));
-        if playback_check.is_none() && lifecycle_check.is_none() {
+        if playback_check.is_none()
+            && lifecycle_check.is_none()
+            && !grid_check
+            && !navmesh_scene_check
+        {
             app.add_systems(Update, scene::render_check);
         }
     } else {
@@ -180,6 +220,8 @@ fn main() -> AppExit {
         EguiPlugin::default(),
         egui_output::Plugin,
         line_render::Plugin { smooth_lines },
+        infinite_grid::Plugin { smooth_lines },
+        navmesh_render::Plugin,
     ))
     .add_systems(Startup, scene::setup)
     .add_systems(EguiPrimaryContextPass, ui::draw)
@@ -196,7 +238,40 @@ fn main() -> AppExit {
     if let Some(config) = lifecycle_check {
         app.add_plugins(lifecycle_probe::Plugin(config));
     }
+    if grid_check {
+        app.add_plugins(grid_probe::Plugin);
+    }
+    if navmesh_scene_check {
+        app.add_plugins(navmesh_probe::Plugin {
+            paths: [navmesh_path.unwrap(), navmesh_second_path.unwrap()],
+        });
+    } else if let Some(path) = navmesh_path {
+        app.world_mut()
+            .resource_mut::<navmesh::NavMeshOverlay>()
+            .queue_import(path);
+    }
     app.run()
+}
+
+fn take_path_option(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let mut path = None;
+    while let Some(index) = args.iter().position(|arg| arg == flag) {
+        let value = args
+            .get(index + 1)
+            .filter(|value| !value.is_empty() && !value.starts_with("--"))
+            .ok_or_else(|| format!("{flag} requires a file path / {flag} 需要指定文件路径"))?;
+        if path.is_some() {
+            return Err(format!(
+                "{flag} may only be specified once / {flag} 只能指定一次"
+            ));
+        }
+        path = Some(std::path::PathBuf::from(value));
+        args.drain(index..=index + 1);
+    }
+    Ok(path)
 }
 
 fn take_flag_option(args: &mut Vec<String>, flag: &str) -> bool {
@@ -246,6 +321,50 @@ fn sync_window_title(studio: Res<studio::Studio>, mut windows: Query<&mut Window
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navmesh_option_preserves_render_arguments_and_rejects_missing_or_duplicate_paths() {
+        let mut args = [
+            "pvd-desktop",
+            "--render-check",
+            "capture.pvdstream",
+            "out.png",
+            "0",
+            "navmesh",
+            "--navmesh",
+            "地图.bin",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(
+            take_path_option(&mut args, "--navmesh").unwrap(),
+            Some("地图.bin".into())
+        );
+        assert_eq!(
+            args,
+            [
+                "pvd-desktop",
+                "--render-check",
+                "capture.pvdstream",
+                "out.png",
+                "0",
+                "navmesh"
+            ]
+        );
+        for values in [
+            vec!["pvd-desktop", "--navmesh"],
+            vec!["pvd-desktop", "--navmesh", "--render-check"],
+            vec!["pvd-desktop", "--navmesh", "a.bin", "--navmesh", "b.bin"],
+        ] {
+            assert!(
+                take_path_option(
+                    &mut values.into_iter().map(str::to_owned).collect(),
+                    "--navmesh"
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn diagnostic_flags_preserve_capture_and_render_arguments() {

@@ -7,6 +7,9 @@ use std::{
 
 const MAX_ITEMS: usize = 1024;
 #[cfg(test)]
+#[path = "spool/finish_tests.rs"]
+mod finish_tests;
+#[cfg(test)]
 static DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub type SpaceCheck = Arc<dyn Fn(u64) -> io::Result<()> + Send + Sync>;
 
@@ -433,6 +436,8 @@ struct ReceiveContext<'a> {
     owner: &'a Arc<Directory>,
     queue: &'a Queue,
     cancel: &'a AtomicBool,
+    finish: &'a AtomicBool,
+    intake_quiesced: &'a AtomicBool,
 }
 
 impl ReceiveContext<'_> {
@@ -443,6 +448,8 @@ impl ReceiveContext<'_> {
             owner,
             queue,
             cancel,
+            finish,
+            intake_quiesced,
         } = *self;
         stream.set_read_timeout(Some(POLL))?;
         let mut capture = config
@@ -457,51 +464,75 @@ impl ReceiveContext<'_> {
             }))?;
         }
         let mut writer = Writer::new(owner, queue, options.segment_bytes, session)?;
+        // Keep deletion ownership separate from the writer. On cancellation,
+        // closing both writers must precede publishing quiescence, while the
+        // potentially long segment deletion must follow it.
+        let retiring_spool = writer.spool.clone();
         let mut buffer = vec![0; options.segment_bytes.min(CHUNK_SIZE as u64) as usize];
         let mut total = 0u64;
         let mut last_wake = std::time::Instant::now();
-        while !cancel.load(Ordering::Acquire) && !queue.abort.load(Ordering::Acquire) {
-            let length = match stream.read(&mut buffer) {
-                Ok(0) => {
-                    drop(writer);
-                    return Ok((total, capture.map(CaptureFile::finish).transpose()?));
+        let result = (|| {
+            while !cancel.load(Ordering::Acquire) && !queue.abort.load(Ordering::Acquire) {
+                let received = if finish.load(Ordering::Acquire) {
+                    Ok(0)
+                } else {
+                    stream.read(&mut buffer)
+                };
+                let received = match received {
+                    Err(_) if finish.load(Ordering::Acquire) => Ok(0),
+                    value => value,
+                };
+                let length = match received {
+                    Ok(0) => {
+                        return Ok((total, capture.take().map(CaptureFile::finish).transpose()?));
+                    }
+                    Ok(length) => length,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                total = total
+                    .checked_add(length as u64)
+                    .ok_or_else(|| io::Error::other("receive byte count overflow"))?;
+                owner.stats.received.store(total, Ordering::Release);
+                if last_wake.elapsed() >= Duration::from_millis(100) {
+                    (owner.stats.wake)();
+                    last_wake = std::time::Instant::now();
                 }
-                Ok(length) => length,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue;
+                if total > config.max_session_bytes {
+                    return Err(io::Error::other(format!(
+                        "session {session} exceeds capture limit of {} bytes; partial capture retained",
+                        config.max_session_bytes
+                    )));
                 }
-                Err(error) => return Err(error),
-            };
-            total = total
-                .checked_add(length as u64)
-                .ok_or_else(|| io::Error::other("receive byte count overflow"))?;
-            owner.stats.received.store(total, Ordering::Release);
-            if last_wake.elapsed() >= Duration::from_millis(100) {
-                (owner.stats.wake)();
-                last_wake = std::time::Instant::now();
+                if let Some(capture) = capture.as_mut() {
+                    capture.writer.write_all(&buffer[..length])?;
+                }
+                writer.append(&buffer[..length])?;
             }
-            if total > config.max_session_bytes {
-                return Err(io::Error::other(format!(
-                    "session {session} exceeds capture limit of {} bytes; partial capture retained",
-                    config.max_session_bytes
-                )));
-            }
-            if let Some(capture) = capture.as_mut() {
-                capture.writer.write_all(&buffer[..length])?;
-            }
-            writer.append(&buffer[..length])?;
-        }
-        Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "receive cancelled",
-        ))
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "receive cancelled",
+            ))
+        })();
+        drop(writer);
+        // BufWriter may flush on drop, so even a cancelled partial raw capture
+        // must be closed before an observer is allowed to leave cleanup behind.
+        drop(capture);
+        // Publish idle even on ordinary EOF: cancellation may arrive while the
+        // following last-owner drop is deleting a large backlog. A new session
+        // clears this flag under the socket gate before checking stop or writing.
+        intake_quiesced.store(true, Ordering::Release);
+        drop(retiring_spool);
+        result
     }
 }
 
@@ -541,6 +572,10 @@ impl CaptureServer {
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let cancel = Arc::new(AtomicBool::new(false));
+        let finish = Arc::new(AtomicBool::new(false));
+        let intake_quiesced = Arc::new(AtomicBool::new(false));
+        let intake_completion = IntakeCompletion(intake_quiesced.clone());
+        let finish_intake = finish.clone();
         let output_wake = wake.clone();
         let (output, receiver) =
             Output::channel(config.queue_capacity, cancel.clone(), move || output_wake());
@@ -558,20 +593,38 @@ impl CaptureServer {
         let worker_result = thread::Builder::new()
             .name("pvd-spool-receiver".into())
             .spawn(move || {
+                let intake_completion = intake_completion;
                 let mut session = 0u64;
-                while !stop.load(Ordering::Acquire) && !queue.abort.load(Ordering::Acquire) {
+                while !stop.load(Ordering::Acquire)
+                    && !finish_intake.load(Ordering::Acquire)
+                    && !queue.abort.load(Ordering::Acquire)
+                {
                     match listener.accept() {
                         Ok((mut stream, peer)) => {
+                            let mut active_socket = queue.socket.lock().unwrap();
+                            // request_stop sets cancellation before taking this
+                            // same gate. Once it returns, idle cannot race a new
+                            // writer that has already passed the stop check.
+                            intake_completion.0.store(false, Ordering::Release);
+                            if finish_intake.load(Ordering::Acquire)
+                                || stop.load(Ordering::Acquire)
+                                || queue.abort.load(Ordering::Acquire)
+                            {
+                                let _ = stream.shutdown(Shutdown::Both);
+                                break;
+                            }
                             session += 1;
                             receive_stats.connected.store(true, Ordering::Release);
                             *receive_stats.failure.lock().unwrap() = None;
                             receive_stats.session.store(session, Ordering::Release);
                             receive_stats.received.store(0, Ordering::Release);
                             (receive_stats.wake)();
-                            let result = stream
-                                .try_clone()
-                                .and_then(|socket| {
-                                    *queue.socket.lock().unwrap() = Some(socket);
+                            let registered = stream.try_clone().map(|socket| {
+                                *active_socket = Some(socket);
+                            });
+                            drop(active_socket);
+                            let result = registered
+                                .and_then(|()| {
                                     queue.push(Item::Event(ReceiverEvent::Connected {
                                         session,
                                         peer,
@@ -584,6 +637,8 @@ impl CaptureServer {
                                         owner: &owner,
                                         queue: &queue,
                                         cancel: &stop,
+                                        finish: &finish_intake,
+                                        intake_quiesced: &intake_completion.0,
                                     }
                                     .receive(&mut stream, session)
                                 });
@@ -628,6 +683,9 @@ impl CaptureServer {
                         }
                     }
                 }
+                // Draining a bounded consumer can take arbitrarily long; do not accept new clients meanwhile.
+                drop(listener);
+                drop(intake_completion);
                 queue.state.lock().unwrap().done = true;
                 queue.signal.notify_all();
                 let _ = relay_worker.join();
@@ -645,6 +703,8 @@ impl CaptureServer {
             receiver,
             address,
             cancel,
+            finish,
+            intake_quiesced,
             worker: Some(worker),
             spool_stats: Some(stats),
             socket,

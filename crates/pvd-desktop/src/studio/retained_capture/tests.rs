@@ -296,7 +296,14 @@ fn stale_epoch_and_cancel_do_not_publish_and_shutdown_waits_for_export() {
     assert!(!case.studio.poll_shutdown());
     assert!(cancel.load(Ordering::Relaxed));
     drop(permit);
-    assert!(case.studio.poll_shutdown());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !case.studio.poll_shutdown() || case.studio.background_jobs.active_count() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "shutdown did not finish after export cancellation"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[test]

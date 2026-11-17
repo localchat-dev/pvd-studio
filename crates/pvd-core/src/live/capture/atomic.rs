@@ -73,13 +73,18 @@ pub fn write_retained_new(
         write_retained(source, &mut checked, range, limits, &mut callback)?
     };
     temporary.file.as_ref().unwrap().sync_all()?;
+    temporary.file.take();
+    // Opening also budgets the resident resource directory and restoration
+    // state, beyond the wire directory checked by write_retained. Close both
+    // handles before publication so Windows can rename the validated file.
+    let admitted = read::open_with_progress(&temporary.path, limits, &mut callback)?;
+    drop(admitted);
     progress(
         &mut callback,
         CapturePhase::Validate,
         report.bytes,
         report.bytes,
     )?;
-    temporary.file.take();
     publish_new(&temporary.path, &destination)?;
     Ok(report)
 }

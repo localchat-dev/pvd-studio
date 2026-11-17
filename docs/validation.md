@@ -15,6 +15,53 @@ cargo clippy --locked -p pvd-desktop --all-targets -- -D warnings
 
 依赖已缓存时可加 `--offline`。桌面测试使用单线程，减少并行执行对时序断言的影响。默认测试中的 ignored 项需要额外输入，不能计为已执行或已通过。
 
+Windows 默认回归已通过，范围包含本地 TCP、硬链接、目录联接及捕获发布后的读取校验。受限沙箱可能以 Windows 错误 5 拒绝文件系统测试；遇到权限失败，应在具备相应权限的环境复验，并分别记录受限环境结果，不能仅跳过失败项就报告全套通过。逐次执行的数量、耗时和日志保留在被忽略的生成目录中。
+
+CLI 的取消测试使用进程共享的取消标志，并行执行时可能相互影响；遇到取消相关失败时需保留并行结果，并使用 `--test-threads=1` 串行复验四个核心 crate。串行通过不表示并行路径已经通过。
+
+## 完整临时录制
+
+退出回归包含封存写入、读回校验、等待发布锁和发布后回收的取消；还覆盖积压排空与程序退出的区别、界面隐藏资源的后台释放、两秒清理宽限不放弃永久导出、清理队列满时遗留文件恢复，以及超过一次扫描容量的接收分段分批回收。
+
+真实 SDK TCP 专项使用 13,020 帧流触发第 12,000 帧封存，核对取消后后台任务停止、不再提交帧且不报告解码失败。五种隐藏子进程退出场景均通过，退出时后台任务和临时文件均为零。这些固定输入不提供任意磁盘状态或大场景的耗时保证；原生窗口及 GPU 退出交互未在该探针中执行。
+
+真实退出测试需要显式提供输入：`PVD_EXIT_SEAL_CAPTURE` 指向足以触发封存的 SDK 流；`PVD_EXIT_PROBE_CAPTURE` 指向超过 1 MiB 的 SDK 流，`PVD_EXIT_PROBE_OUTPUT` 指定新的结果目录。对应 ignored 测试为 `network::tests::shutdown::real_tcp_exit_interrupts_an_in_flight_history_seal` 和 `studio::shutdown_tests::real_tcp_process_exit_releases_history_and_receive_files`。后者使用隐藏子进程与正式关闭系统，覆盖空监听、TCP 积压、历史定位、关闭后待打开文件及加载中退出，启用正式后台清理；它不代替原生窗口/GPU/DPI 交互验收。
+
+[完整临时录制](temporary-recordings.md)的核心回归覆盖低热预算下多次封存、首帧保留、跨冷块正倒回放、旧快照、读写并发迁移、分析失败时保留场景历史、磁盘保留空间和导航容量边界。项目捕获的发布检查另覆盖写入索引可容纳但实际打开预算不足，以及读取校验期间取消。
+
+桌面回归覆盖断开与重连、查看旧录制时继续接收、关闭和切换文件前排空接收缓冲、最新超预算录制保护、导出期间保护和实际文件回收。可聚焦执行：
+
+```powershell
+cargo test --locked -p pvd-core --lib live::persistent
+cargo test --locked -p pvd-core --lib live::capture::tests::admission_tests
+cargo test --locked -p pvd-core --test persistent_history
+cargo test --locked -p pvd-transport finish_tests -- --test-threads=1
+cargo test --locked -p pvd-desktop temporary_recordings -- --test-threads=1
+```
+
+真实 SDK 基线输入使用 `captures/physx-3.4.pvdstream`，多场景输入通过环境变量指定；显式执行两个 ignored 检查，不能把它们算作默认测试通过：
+
+```powershell
+$env:PVD_PERSISTENT_ROOM_CAPTURE = (Resolve-Path 'captures/multiscene.pvdstream').Path
+cargo test --locked -p pvd-core --test persistent_history -- --include-ignored --nocapture --test-threads=1
+```
+
+4 项完整历史集成测试包括 120 帧 SDK 基线和 144 帧多场景文件；12 项内部持久历史测试和 2 项保存读取检查包含在上述核心单元回归中。3 项停止接收测试包含真实 TCP、积压排空与结束事件顺序，均通过。桌面的 11 项临时录制回归包含实际磁盘保存/重开/回收和真实 TCP 关闭后保留全部 100 帧；独立的 PhysX 3.4 多场景生命周期专项检查零帧销毁、无后续帧的销毁通知、销毁场景回放、同连接其他场景继续录制和断开，需按输入要求显式运行。
+
+这些专项故意缩小分段和热预算以频繁跨块，并与相同 SDK 字节的完整内存解码结果逐帧对照；不是长期空间效率或原版性能对比。原生交互、长时录制和被其他进程锁定后的磁盘清理重试需要另行验收。
+
+封存频率的回归另覆盖分析写入器固定预留、大于一半热磁盘预算的静态场景，以及无法靠封存释放的高元数据预留。真实 SDK 的 120 帧规模输入、6000 帧长输入及 13020 帧持续运动输入已核对；默认配置下前两者没有封存，后者封存一次并保留第 0 帧。首、中、末帧的完整状态、来源目录和正倒游标均与独立内存解码一致。测试方法见[实时吞吐](realtime-throughput.md#分层测量)。
+
+单次封存仍同步写入和校验，因此频率修复不能视为异步历史写入完成，也不能保证封存期间时间轴持续刷新。长段封存耗时需要单独记录，不能用整段平均吞吐掩盖停顿。
+
+## NavMesh 叠加
+
+格式、操作和可重复命令见 [NavMesh](navmesh.md#验证)。默认专项使用固定版本上游实际生成的数据及手工多 Tile/detail/off-mesh 输入，分别检查几何提取和损坏/预算边界。`tools/navmesh/create-fixture.py` 的构造输入已由 `@recast-navigation/core` 0.43.1 交叉读取，全部表面坐标与预期相符；这不代表真实游戏导出的 ABI 与坐标已经验收。
+
+核心与桌面 NavMesh 专项已通过，覆盖项集中记录在 [NavMesh 验证](navmesh.md#验证)。双语多场景离屏专项通过实际异步导入检查两个独立图层及设置，在两个单场景视图与全部场景间切换，并输出窗口、纯几何图片和状态报告；已检查居中布局、导入统计及可见范围。该专项不依赖 TCP 监听。
+
+真实配对需提供同地图导航 `.bin` 与 PhysX 捕获，核对 Tile/多边形计数、detail 高度、坐标单位/手性、物理场景切换及 Scene ID 复用。原生文件对话框、取消操作和持续回放资源趋势另行记录，不用构造输入或离屏图替代。
+
 ## 真实输入
 
 PhysX SDK 由独立生产器构建，详见[PhysX 3.4 生产器](../tools/physx-sample/README.md)。完整检查入口为：
@@ -116,11 +163,47 @@ cargo test --locked -p pvd-desktop studio::analysis_file_tests::profile::apex_al
 
 性能查询成功不表示全部 ALL 分析完整，不补造内存字典。异步末尾绘制没有后续 End 时保留为未提交尾部。来源与编号规则见[帧来源](frame-sources.md)，原版容器互通仍按独立专项验收。
 
+## 多房间
+
+[房间列表与显示范围](rooms.md)的构造回归、PhysX 3.4.2 文件/受控 TCP 和四组双语无窗口检查已通过。对应任务为 `ROOM-01`；这些结果不扩大其他 SDK、原版格式互通或原生交互的验收范围。
+
+构造检查覆盖编号与代际、共享依赖、房间切换、零帧和末帧后销毁、销毁后的倒放、历史边界及元数据保存/截取；Legacy 另核对共享帧轴、生命周期边界和切换失败保留显示。定向入口：
+
+```powershell
+cargo test --locked -p pvd-core --lib rooms
+cargo test --locked -p pvd-core --lib frame_sources
+cargo test --locked -p pvd-desktop room -- --test-threads=1
+```
+
+[多 Scene 生产器](../tools/physx-multiscene/README.md#room-lifecycle)的 `--lifecycle` 模式提供同次 SDK Scene 身份、字节边界、存活列表和位姿真值。按生产器说明生成输入后运行：
+
+```powershell
+$env:PVD_ROOM_LIFECYCLE_CAPTURE = (Resolve-Path output/room-validation/file/lifecycle.pvdstream).Path
+cargo test --locked -p pvd-core --test room_lifecycle -- --ignored --nocapture --test-threads=1
+$env:PVD_ROOMS_PRODUCER = (Resolve-Path .deps/physx-multiscene-build/Debug/pvd-physx-multiscene.exe).Path
+cargo test --locked -p pvd-desktop studio::rooms::tests::tcp -- --ignored --nocapture --test-threads=1
+```
+
+真实双 Scene 输入已核对显示范围与对象树。四 Scene 生命周期文件专项按独立字节边界核对零帧销毁、末帧后销毁和未确认销毁的断开；八个完成边界经过完整、前缀、中段、尾段保存/重开及再次裁剪，逐帧正倒恢复与源状态和来源目录一致。房间目录的期望位置来自同次 SDK 检查点，较早区间不带入后续创建或销毁，释放后检查缓存及输出清理。
+
+受控 TCP 专项覆盖无后续物理帧时的生命周期发布、房间切换、正倒放、返回实时、断开和原始流镜像一致性。实际生命周期样例未发生 Scene 地址复用；该边界由构造输入另验，不能将分配器未复用地址的结果作为真实复用验证。
+
+无窗口渲染使用 `rooms` 和 `room-destroyed` 面板，沿用[验收方法](acceptance-plan.md#桌面与-gpu)的参数；实际图片和输出的房间身份、选择、显示范围均已核对：
+
+| 场景 | 中文尺寸 | 英文尺寸 | 核对内容 |
+| --- | --- | --- | --- |
+| 双 Scene，帧 99 | 1440×960 | 1024×720 | 房间 2，仅显示其 2 个 Actor |
+| 四 Scene 生命周期，帧 3 | 1024×720 | 1440×960 | 已销毁房间 2，仅显示其 1 个 Actor；列表保留零帧销毁房间 3 和未确认销毁房间 4 |
+
+跨机器持续吞吐、长时间频繁创建销毁、全部绘制类别及原生输入仍需独立检查。
+
 ## 录制包
 
 [PVD 录制包](pvd-archive.md)的默认回归覆盖 ZIP 目录、解压、CRC、资源上限、取消及三端接入。构造 stored/deflate 包装的真实原版和 SDK 输入另核对回放、CSV、区间导出与整份保存，输出与未包装源逐字节比较；原版生成 ZIP 的互通保持独立验收。
 
 ## 界面与分发包
+
+[坐标与网格](coordinates.md)的无限参考网格按视图射线与地面求交，数值检查与 GPU 图片分别核对世界单位、地面交点、近远裁剪和恒定资源。固定捕获帧的相机序列覆盖大范围平移、远距离缩放、转向、地平线、地下、向上观察、倾斜录制相机及共面深度；缩小时允许显示更粗的五倍网格。自动输入与无窗口图片不代替原生鼠标操作验收。
 
 多选默认回归覆盖 Shift 增减、当前对象、数量上限、回放/TCP 中的代际检查，以及批量 RepX 的选择身份和共同依赖；视口拾取与对象树使用同一选择状态。Box 与 Sphere 双 Actor 批量导出已通过官方 SDK 导入/重存，核对 ID、名称、位姿、重复 ID 的 XML 字节一致性及无效第二 ID 不发布，方法见[SDK 生产器](../tools/physx-sample/README.md)。原生组合手势、全对象显示和其他批量组合仍分别验收。
 
@@ -133,6 +216,7 @@ cargo test --locked -p pvd-desktop studio::analysis_file_tests::profile::apex_al
 ## 已知问题与未验范围
 
 - `network::tests::live_refresh_publishes_without_a_half_second_gate` 在并行测试中出现过时序失败；隔离及完整单线程测试通过，完整并行测试仍需复核。
+- pvd-cli `atomic_output::tests::cancellation_after_the_writer_returns_prevents_publication` 在并行测试中因进程级取消状态竞争失败；隔离及单线程运行通过，完整并行路径仍需复核。
 - 工具栏文字或路径缺失报告在双语、录制相机和最小窗口离屏复核中未复现，原生环境仍需对应复现步骤。
 - 原生保存对话框、完整停靠、动态 DPI、其他 IME、跨机器负载、长期边接收边保存及资源趋势未全部验收。
 - 原版多页、非空起点、更多绘制、错误生命周期及保存/裁剪互验的范围分别维护在兼容矩阵中。

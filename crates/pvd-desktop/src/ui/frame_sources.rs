@@ -13,6 +13,19 @@ pub(super) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
     if sources.len() < 2 {
         return;
     }
+    if !recording.rooms.is_empty()
+        && sources.iter().all(|source| {
+            matches!(
+                source,
+                FrameSourceKey::Captured {
+                    section: FrameSection::PhysX,
+                    ..
+                }
+            )
+        })
+    {
+        return;
+    }
     let Some(current) = studio.frame_source() else {
         return;
     };

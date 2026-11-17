@@ -133,6 +133,7 @@ fn fixture(environment: &TestEnvironment) -> (NetworkSession, WorkerOutput, Live
         raw_attempted: false,
         received_bytes: 0,
         published_frames: 0,
+        published_rooms_revision: 0,
         selection_revision: 0,
         last_publish: Instant::now(),
         profile: None,

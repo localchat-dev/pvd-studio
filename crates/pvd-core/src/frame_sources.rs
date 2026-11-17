@@ -1,6 +1,6 @@
 //! Captured section clocks and their retained replay boundaries.
 
-use std::{collections::BTreeMap, mem::size_of};
+use std::{collections::BTreeMap, mem::size_of, sync::Arc};
 
 use crate::{Error, FrameIndex, SceneState, error, history::SharedIndex};
 
@@ -45,7 +45,7 @@ pub enum FrameSourceKey {
     Legacy,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FrameObject {
     pub id: u64,
     pub generation: u32,
@@ -98,6 +98,7 @@ pub struct FrameSourceTimeline {
     source: FrameSourceKey,
     first_index: usize,
     frames: SharedIndex<SourceFrame>,
+    scene_bounds: Arc<BTreeMap<FrameObject, (usize, usize)>>,
     next_ordinal: usize,
     peak_blocks: usize,
 }
@@ -108,6 +109,7 @@ impl FrameSourceTimeline {
             source,
             first_index,
             frames: SharedIndex::default(),
+            scene_bounds: Arc::default(),
             next_ordinal,
             peak_blocks: 0,
         }
@@ -190,6 +192,87 @@ impl FrameSourceTimeline {
 
     pub fn frames(&self) -> impl DoubleEndedIterator<Item = &SourceFrame> {
         self.frames.iter()
+    }
+
+    pub fn scene_frames(
+        &self,
+        scene: FrameObject,
+    ) -> impl DoubleEndedIterator<Item = &SourceFrame> {
+        let range = self.scene_positions(scene).unwrap_or(0..0);
+        range.map(|position| &self.frames[position])
+    }
+
+    pub fn first_for_scene(&self, scene: FrameObject) -> Option<&SourceFrame> {
+        self.scene_frames(scene).next()
+    }
+
+    pub fn last_for_scene(&self, scene: FrameObject) -> Option<&SourceFrame> {
+        self.scene_frames(scene).next_back()
+    }
+
+    pub fn at_or_before_for_scene(&self, index: usize, scene: FrameObject) -> Option<&SourceFrame> {
+        let range = self.scene_positions(scene)?;
+        let end = self
+            .frames
+            .partition_point(|frame| frame.index <= index)
+            .min(range.end);
+        (end > range.start).then(|| &self.frames[end - 1])
+    }
+
+    pub fn at_or_after_for_scene(&self, index: usize, scene: FrameObject) -> Option<&SourceFrame> {
+        let range = self.scene_positions(scene)?;
+        let start = self
+            .frames
+            .partition_point(|frame| frame.index < index)
+            .max(range.start);
+        (start < range.end).then(|| &self.frames[start])
+    }
+
+    pub fn next_for_scene(&self, index: usize, scene: FrameObject) -> Option<&SourceFrame> {
+        self.at_or_after_for_scene(index.checked_add(1)?, scene)
+    }
+
+    pub fn previous_for_scene(&self, index: usize, scene: FrameObject) -> Option<&SourceFrame> {
+        self.at_or_before_for_scene(index.checked_sub(1)?, scene)
+    }
+
+    pub fn nearest_ordinal_for_scene(
+        &self,
+        ordinal: usize,
+        scene: FrameObject,
+    ) -> Option<&SourceFrame> {
+        let first = self.first_for_scene(scene)?.ordinal;
+        let last = self.last_for_scene(scene)?.ordinal;
+        self.nearest_ordinal(ordinal.clamp(first, last))
+    }
+
+    fn scene_positions(&self, scene: FrameObject) -> Option<std::ops::Range<usize>> {
+        let &(first, last) = self.scene_bounds.get(&scene)?;
+        let start = self.frames.partition_point(|frame| frame.ordinal < first);
+        let end = self.frames.partition_point(|frame| frame.ordinal <= last);
+        (start != end).then_some(start..end)
+    }
+
+    fn check_scene_continuity(&self, scene: Option<FrameObject>) -> Result<(), Error> {
+        if let Some(scene) = scene
+            && self.scene_bounds.contains_key(&scene)
+            && self.last().is_some_and(|frame| frame.scene != Some(scene))
+        {
+            return Err(error(
+                "scene generation is not contiguous within its frame source",
+            ));
+        }
+        Ok(())
+    }
+
+    fn push_frame(&mut self, frame: SourceFrame) {
+        if let Some(scene) = frame.scene {
+            Arc::make_mut(&mut self.scene_bounds)
+                .entry(scene)
+                .and_modify(|bounds| bounds.1 = frame.ordinal)
+                .or_insert((frame.ordinal, frame.ordinal));
+        }
+        self.frames.push(frame);
     }
 }
 
@@ -303,7 +386,7 @@ impl FrameDirectory {
             .entry(binding.source)
             .or_insert_with(|| FrameSourceTimeline::empty(binding.source, 0, index));
         if retained {
-            source.frames.push(SourceFrame {
+            source.push_frame(SourceFrame {
                 index,
                 ordinal: source.next_ordinal,
                 source_object: binding.source_object,
@@ -334,6 +417,9 @@ impl FrameDirectory {
         }
         self.check_source_kind(binding.source)?;
         let existing = self.sources.get(&binding.source);
+        if retained && let Some(source) = existing {
+            source.check_scene_continuity(binding.scene)?;
+        }
         if existing.is_none() && self.sources.len() >= self.limits.sources {
             return Err(error("frame source count limit exceeded"));
         }
@@ -342,17 +428,24 @@ impl FrameDirectory {
             .checked_add(1)
             .ok_or_else(|| error("frame source ordinal overflow"))?;
         let old_bytes = existing
-            .map(|source| source_bytes(source.len(), source.peak_blocks))
+            .map(|source| source_bytes(source.len(), source.peak_blocks, source.scene_bounds.len()))
             .transpose()?
             .unwrap_or(0);
         let len = existing.map_or(0, FrameSourceTimeline::len) + usize::from(retained);
         let peak_blocks = existing
             .map_or(0, |source| source.peak_blocks)
             .max(blocks_for(len)?);
+        let scenes = existing.map_or(0, |source| source.scene_bounds.len())
+            + usize::from(
+                retained
+                    && binding.scene.is_some_and(|scene| {
+                        existing.is_none_or(|source| !source.scene_bounds.contains_key(&scene))
+                    }),
+            );
         let index_bytes = self
             .index_bytes
             .checked_sub(old_bytes)
-            .and_then(|bytes| bytes.checked_add(source_bytes(len, peak_blocks).ok()?))
+            .and_then(|bytes| bytes.checked_add(source_bytes(len, peak_blocks, scenes).ok()?))
             .filter(|bytes| *bytes <= self.limits.index_bytes)
             .ok_or_else(|| error("frame source index byte limit exceeded"))?;
 
@@ -370,14 +463,24 @@ impl FrameDirectory {
             if count == 0 {
                 continue;
             }
-            let old_bytes = source_bytes(source.len(), source.peak_blocks)
-                .expect("retained frame source size was checked on append");
+            let old_bytes =
+                source_bytes(source.len(), source.peak_blocks, source.scene_bounds.len())
+                    .expect("retained frame source size was checked on append");
             source.frames.discard_front(count);
+            if let Some(first) = source.frames.first() {
+                Arc::make_mut(&mut source.scene_bounds).retain(|_, bounds| {
+                    bounds.0 = bounds.0.max(first.ordinal);
+                    bounds.1 >= first.ordinal
+                });
+            } else {
+                source.scene_bounds = Arc::default();
+            }
             if source.is_empty() {
                 source.peak_blocks = 0;
             }
-            let new_bytes = source_bytes(source.len(), source.peak_blocks)
-                .expect("discarding frames cannot increase the frame source size");
+            let new_bytes =
+                source_bytes(source.len(), source.peak_blocks, source.scene_bounds.len())
+                    .expect("discarding frames cannot increase the frame source size");
             self.retained_frames -= count;
             self.index_bytes -= old_bytes - new_bytes;
         }
@@ -396,8 +499,15 @@ impl FrameDirectory {
             let start = source.frames.partition_point(|frame| frame.index < first);
             let end = source.frames.partition_point(|frame| frame.index <= last);
             if start != end {
+                let first = source.frames[start].ordinal;
+                let last = source.frames[end - 1].ordinal;
+                let scenes = source
+                    .scene_bounds
+                    .values()
+                    .filter(|&&(lower, upper)| upper >= first && lower <= last)
+                    .count();
                 bytes = bytes
-                    .checked_add(source_bytes(end - start, blocks_for(end - start)?)?)
+                    .checked_add(source_bytes(end - start, blocks_for(end - start)?, scenes)?)
                     .ok_or_else(|| error("frame source clipped index size overflow"))?;
             }
         }
@@ -528,7 +638,7 @@ impl FrameDirectory {
         }
         let index_bytes = self
             .index_bytes
-            .checked_add(source_bytes(0, 0)?)
+            .checked_add(source_bytes(0, 0, 0)?)
             .filter(|bytes| *bytes <= self.limits.index_bytes)
             .ok_or_else(|| error("frame source index byte limit exceeded"))?;
         self.sources.insert(
@@ -544,6 +654,7 @@ impl FrameDirectory {
             .sources
             .get(&key)
             .ok_or_else(|| error("frame references an undefined source"))?;
+        source.check_scene_continuity(frame.scene)?;
         if self.retained_frames >= self.limits.frames {
             return Err(error("frame source frame limit exceeded"));
         }
@@ -557,20 +668,26 @@ impl FrameDirectory {
                 "retained source frames must have increasing indices and ordinals",
             ));
         }
-        let old_bytes = source_bytes(source.len(), source.peak_blocks)?;
+        let old_bytes = source_bytes(source.len(), source.peak_blocks, source.scene_bounds.len())?;
         let len = source.len() + 1;
         let peak_blocks = source.peak_blocks.max(blocks_for(len)?);
+        let scenes = source.scene_bounds.len()
+            + usize::from(
+                frame
+                    .scene
+                    .is_some_and(|scene| !source.scene_bounds.contains_key(&scene)),
+            );
         let index_bytes = self
             .index_bytes
             .checked_sub(old_bytes)
-            .and_then(|bytes| bytes.checked_add(source_bytes(len, peak_blocks).ok()?))
+            .and_then(|bytes| bytes.checked_add(source_bytes(len, peak_blocks, scenes).ok()?))
             .filter(|bytes| *bytes <= self.limits.index_bytes)
             .ok_or_else(|| error("frame source index byte limit exceeded"))?;
         let source = self
             .sources
             .get_mut(&key)
             .expect("retained source was validated");
-        source.frames.push(frame);
+        source.push_frame(frame);
         source.peak_blocks = peak_blocks;
         self.index_bytes = index_bytes;
         self.retained_frames += 1;
@@ -592,9 +709,16 @@ fn blocks_for(len: usize) -> Result<usize, Error> {
         .ok_or_else(|| error("frame source block count overflow"))
 }
 
-fn source_bytes(len: usize, peak_blocks: usize) -> Result<usize, Error> {
-    let base =
-        size_of::<FrameSourceTimeline>() + size_of::<FrameSourceKey>() + SOURCE_ALLOCATION_OVERHEAD;
+fn source_bytes(len: usize, peak_blocks: usize, scenes: usize) -> Result<usize, Error> {
+    let base = (size_of::<FrameSourceTimeline>()
+        + size_of::<FrameSourceKey>()
+        + SOURCE_ALLOCATION_OVERHEAD)
+        .checked_add(
+            scenes
+                .checked_mul(256)
+                .ok_or_else(|| error("scene index size overflow"))?,
+        )
+        .ok_or_else(|| error("scene index size overflow"))?;
     if len == 0 {
         return Ok(base);
     }

@@ -11,10 +11,12 @@ use bevy::{
 #[derive(Resource, Default)]
 pub(crate) struct Output {
     vertices: Vec<[u32; 3]>,
+    pub(super) line_positions: Vec<Vec3>,
     pub(super) colors: Vec<LinearRgba>,
 }
 impl Output {
-    pub fn capture(&mut self, gizmos: &Gizmos) {
+    pub fn capture<T: bevy::gizmos::config::GizmoConfigGroup>(&mut self, gizmos: &Gizmos<T>) {
+        self.line_positions.clone_from(&gizmos.list_positions);
         self.colors.clone_from(&gizmos.list_colors);
         self.vertices = gizmos
             .list_positions
@@ -81,6 +83,81 @@ fn draw_debug(state: pvd_core::SceneState, wireframe: bool, visible: bool) -> Ou
     world.run_system_once(draw_grid).unwrap();
     assert_eq!(world.resource::<Studio>().state, captured);
     world.remove_resource::<Output>().unwrap()
+}
+
+#[test]
+fn room_contacts_draw_only_the_selected_scene_and_reject_reused_identity() {
+    let mut state = pvd_core::SceneState::default();
+    for (id, x) in [(100, 10.0), (200, 20.0)] {
+        state.objects.insert(
+            id,
+            pvd_core::Object {
+                id,
+                generation: 0,
+                type_name: "physx3::PxScene".into(),
+                properties: Default::default(),
+            },
+        );
+        state.contacts.insert(
+            id,
+            vec![pvd_core::contacts::Contact {
+                position: [x, 0.0, 0.0],
+                normal: [0.0, 1.0, 0.0],
+                shapes: [0, 0],
+                separation: 0.0,
+                normal_force: 0.0,
+                faces: [0, 0],
+                normal_force_available: false,
+            }]
+            .into(),
+        );
+    }
+    for (room, expected_x) in [
+        (None, vec![10.0, 20.0]),
+        (
+            Some(pvd_core::frame_sources::FrameObject {
+                id: 100,
+                generation: 0,
+            }),
+            vec![10.0],
+        ),
+        (
+            Some(pvd_core::frame_sources::FrameObject {
+                id: 200,
+                generation: 0,
+            }),
+            vec![20.0],
+        ),
+        (
+            Some(pvd_core::frame_sources::FrameObject {
+                id: 100,
+                generation: 1,
+            }),
+            vec![],
+        ),
+    ] {
+        let mut studio = Studio::default();
+        studio.state = state.clone();
+        studio.room_scope.update(&studio.state, room, 1);
+        studio.prefs.show_grid = false;
+        studio.prefs.show_axes = false;
+        studio.prefs.show_contacts = true;
+        let mut config = GizmoConfigStore::default();
+        config.insert(default(), DefaultGizmoConfigGroup);
+        let mut world = World::new();
+        world.insert_resource(studio);
+        world.insert_resource(Viewport::default());
+        world.insert_resource(config);
+        world.insert_resource(GizmoStorage::<DefaultGizmoConfigGroup, ()>::default());
+        world.insert_resource(Output::default());
+        world.run_system_once(draw_grid).unwrap();
+        let output = world.remove_resource::<Output>().unwrap();
+        assert_eq!(output.vertices.len(), 8 * expected_x.len());
+        for vertex in output.vertices {
+            let x = f32::from_bits(vertex[0]);
+            assert!(expected_x.iter().any(|expected| (x - expected).abs() < 0.1));
+        }
+    }
 }
 
 #[test]

@@ -115,14 +115,14 @@ fn vertex(vertex: VertexInput) -> VertexOutput {
     }
 
     let half_width = line_width * 0.5;
-    let edge_distance = (line_width + 2.0) * position.x;
+    let edge_distance = select(line_width, line_width + 2.0, SMOOTH_EDGES) * position.x;
     let x_offset = edge_distance * x_basis;
     let screen = mix(screen_a, screen_b, position.y) + x_offset;
 
     var depth: f32;
     if line_gizmo.depth_bias >= 0. {
         depth = clip.z * (1. - line_gizmo.depth_bias);
-    } else {
+    } else if clip.z > 0. && clip.z <= clip.w {
         // depth * (clip.w / depth)^-depth_bias. So that when -depth_bias is 1.0, this is equal to clip.w
         // and when equal to 0.0, it is exactly equal to depth.
         // the epsilon is here to prevent the depth from exceeding clip.w when -depth_bias = 1.0
@@ -131,6 +131,9 @@ fn vertex(vertex: VertexInput) -> VertexOutput {
         // The reason this uses an exponential function is that it makes it much easier for the
         // user to chose a value that is convenient for them
         depth = clip.z * exp2(-line_gizmo.depth_bias * log2(clip.w / clip.z - EPSILON));
+    } else {
+        // 近远裁剪范围外保留原深度，避免对无效深度求对数。
+        depth = clip.z;
     }
 
     var clip_position = vec4(clip.w * ((2. * screen) / resolution - 1.), depth, clip.w);
@@ -166,8 +169,11 @@ struct FragmentOutput {
 };
 
 fn line_color(in: FragmentInput, pattern_alpha: f32) -> FragmentOutput {
-    let transition = max(fwidth(in.edge_distance), 0.0001);
-    let coverage = clamp((in.half_width - abs(in.edge_distance)) / transition + 0.5, 0.0, 1.0);
+    var coverage = 1.0;
+    if SMOOTH_EDGES {
+        let transition = max(fwidth(in.edge_distance), 0.0001);
+        coverage = clamp((in.half_width - abs(in.edge_distance)) / transition + 0.5, 0.0, 1.0);
+    }
     let alpha = in.color.a * coverage * pattern_alpha;
     // Invisible fringe fragments must not hide lines behind them in the depth buffer.
     if alpha <= 0.0 {

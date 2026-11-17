@@ -313,11 +313,14 @@ impl IndexSlot {
         let cleanup_gate = self.cleanup_gate.lock().map_err(|_| lock_error())?.take();
         drop(
             self.jobs
-                .spawn_with_cancel(
+                .spawn_with_cancel_and_control(
                     "cpu-index-cleanup",
                     move || stop.request(),
-                    move || {
+                    move |job| {
                         retirement.wait(&owner);
+                        // No index reader or builder owns this completed index
+                        // now. Only its temporary files and lease remain.
+                        job.begin_cleanup("cpu-index-cleanup");
                         #[cfg(test)]
                         if let Some(gate) = cleanup_gate {
                             gate();

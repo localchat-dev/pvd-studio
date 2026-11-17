@@ -84,12 +84,7 @@ impl Studio {
             return;
         }
         let source = crate::recording_export::Source::Retained {
-            recording: self
-                .live_recording
-                .as_ref()
-                .or(self.recording.as_ref())
-                .unwrap()
-                .clone(),
+            recording: self.timeline_recording_arc().unwrap(),
             epoch: self.capture_epoch.clone(),
             expected_epoch: self.capture_epoch.load(Ordering::Relaxed),
         };

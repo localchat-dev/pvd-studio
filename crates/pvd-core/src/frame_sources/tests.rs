@@ -130,6 +130,114 @@ fn source_object_lifetimes_are_per_boundary() {
 }
 
 #[test]
+fn room_navigation_stays_in_generation_across_gaps_clips_and_retention() {
+    let mut directory = FrameDirectory::default();
+    let old = FrameObject {
+        id: 50,
+        generation: 0,
+    };
+    let new = FrameObject {
+        id: 50,
+        generation: 1,
+    };
+    let key = binding(FrameSection::PhysX, 50).source;
+    for index in 0..12 {
+        let scene = if index < 6 { old } else { new };
+        directory
+            .observe(
+                index,
+                FrameBinding {
+                    source: key,
+                    source_object: Some(scene),
+                    scene: Some(scene),
+                },
+                index % 2 == 0,
+            )
+            .unwrap();
+    }
+    let source = directory.source(key).unwrap();
+    assert_eq!(source.first_for_scene(old).unwrap().index, 0);
+    assert_eq!(source.last_for_scene(old).unwrap().index, 4);
+    assert_eq!(source.first_for_scene(new).unwrap().index, 6);
+    assert_eq!(source.last_for_scene(new).unwrap().index, 10);
+    assert!(source.next_for_scene(4, old).is_none());
+    assert!(source.previous_for_scene(6, new).is_none());
+    assert_eq!(source.at_or_before_for_scene(11, old).unwrap().index, 4);
+    assert_eq!(source.at_or_after_for_scene(0, new).unwrap().index, 6);
+    assert_eq!(
+        source.nearest_ordinal_for_scene(99, old).unwrap().ordinal,
+        4
+    );
+    assert_eq!(source.nearest_ordinal_for_scene(1, new).unwrap().ordinal, 6);
+    let clipped = directory.clipped(4, 8).unwrap();
+    assert_eq!(
+        clipped
+            .source(key)
+            .unwrap()
+            .first_for_scene(old)
+            .unwrap()
+            .index,
+        4
+    );
+    assert_eq!(
+        clipped
+            .source(key)
+            .unwrap()
+            .last_for_scene(new)
+            .unwrap()
+            .index,
+        8
+    );
+    let bytes = wire::encode(&clipped, 4096).unwrap();
+    let reopened =
+        wire::decode(&bytes, &frames(&[4, 6, 8]), FrameDirectoryLimits::default()).unwrap();
+    assert_eq!(
+        reopened
+            .source(key)
+            .unwrap()
+            .next_for_scene(6, new)
+            .unwrap()
+            .index,
+        8
+    );
+    directory.discard_before(8);
+    assert!(
+        directory
+            .source(key)
+            .unwrap()
+            .first_for_scene(old)
+            .is_none()
+    );
+    assert_eq!(
+        directory
+            .source(key)
+            .unwrap()
+            .first_for_scene(new)
+            .unwrap()
+            .ordinal,
+        8
+    );
+}
+
+#[test]
+fn room_source_rejects_a_generation_reappearing_after_another_identity() {
+    let mut directory = FrameDirectory::default();
+    for (index, generation) in [0, 1, 0].into_iter().enumerate() {
+        let scene = FrameObject { id: 20, generation };
+        let result = directory.append(
+            index,
+            FrameBinding {
+                source: binding(FrameSection::PhysX, 20).source,
+                source_object: Some(scene),
+                scene: Some(scene),
+            },
+        );
+        assert_eq!(result.is_err(), index == 2);
+    }
+    assert_eq!(directory.retained_frames(), 2);
+}
+
+#[test]
 fn default_uses_first_physx_clock_by_capture_order() {
     let mut directory = FrameDirectory::default();
     directory.append(0, binding(FrameSection::Apex, 1)).unwrap();

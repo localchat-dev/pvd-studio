@@ -16,6 +16,14 @@
 
 诊断探针会应用 `SceneUpdate` 并比较位姿，未执行 Bevy/GPU 渲染；这部分开销应与桌面区分。入口及参数见[诊断工具](../tools/README-live-probe.md)。
 
+`throughput` 示例的 `--persistent` 选择桌面使用的完整临时录制路径；省略时仍测量滚动历史。两条路径需要分别测量，不能用滚动历史的结果代表完整录制：
+
+```powershell
+cargo run --release --locked -p pvd-core --example throughput -- captures/physx-3.4-scale.pvdstream output/throughput-persistent --persistent --profile
+```
+
+输出包含保留帧范围、完整与热历史磁盘占用、单次解析和快照的最大耗时。`history_seal` 单独记录封存次数、耗时及正在执行的次数，桌面 `--live-profile` 也使用同一阶段；它用于区分接收积压、封存阻塞和显示发布延迟，不将单项计时视为端到端延迟。
+
 ## 代表性负载
 
 使用[独立 SDK 生产器](../tools/physx-sample/README.md)生成小、中、大活动集合，组合静态共享几何、持续动态位姿、运动学体/CCT、常驻分配和分析事件。记录 SDK 活动统计，不能只用 `IsSleeping=false` 证明整个负载持续活动。

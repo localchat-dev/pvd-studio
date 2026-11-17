@@ -159,6 +159,32 @@ impl ActivityCache {
         counts
     }
 
+    pub fn summary_scoped(&self, scope: &crate::room_scope::RoomScope) -> ActivityCounts {
+        if scope.room().is_none() {
+            return self.summary();
+        }
+        let mut counts = ActivityCounts::default();
+        for actor in scope.actors().iter().filter_map(|id| self.actors.get(id)) {
+            counts.total_actors += 1;
+            counts.articulation_links += usize::from(actor.articulation_link);
+            match actor.category {
+                Category::Awake => counts.awake_dynamic += 1,
+                Category::Sleeping => counts.sleeping_dynamic += 1,
+                Category::Kinematic => counts.kinematic += 1,
+                Category::Static => counts.static_actors += 1,
+                Category::Unknown => counts.unknown += 1,
+            }
+        }
+        for statistics in scope.scenes().iter().filter_map(|id| self.scenes.get(id)) {
+            counts.sdk_scene_count += 1;
+            counts.sdk_reporting_scenes +=
+                usize::from(statistics.dynamic.is_some() && statistics.kinematic.is_some());
+            counts.sdk_active_dynamic = statistics.dynamic;
+            counts.sdk_active_kinematic = statistics.kinematic;
+        }
+        counts
+    }
+
     fn category_count(&mut self, category: Category) -> &mut usize {
         match category {
             Category::Awake => &mut self.counts.awake_dynamic,

@@ -19,7 +19,7 @@ fn open_on_disk(studio: &mut Studio, path: &Path, context: &egui::Context) {
     let loaded = read_recording_on_disk(
         path,
         File::open(path).unwrap(),
-        &AtomicBool::new(false),
+        &Arc::new(AtomicBool::new(false)),
         &AtomicU64::new(0),
         pvd_core::live::HistoryConfig {
             segment_frames: 15,

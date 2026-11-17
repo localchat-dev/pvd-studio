@@ -20,3 +20,25 @@ Choose new capture/truth paths: the SDK file transport and JSON writer overwrite
 The tests compare all 288 Actor poses, frame Scene IDs and clocks, fragmented loading, disk history, 288 continuous forward/reverse seeks, per-Scene frame intervals, 432 complete phase spans, 144 open starts, and six complete-file streaming curves. A small history segment size exercises multiple segments. The test requires zero temporary history files after releasing the disk recording and cursor.
 
 This does not validate original PVD3 containers, renderer-event ownership, synchronized physical-time resampling, Scene destruction/reuse, another SDK, native UI input or GPU performance. See [the evidence and limitations](../../docs/multiscene-sdk.md).
+
+## Room lifecycle
+
+The independent `--lifecycle` scenario uses DEBUG instrumentation and four observed Scenes. A and B have actors, C is destroyed without completing a frame, and D is created after B is destroyed. Eight interleaved boundaries are followed by A's destruction without another End. The transport then disconnects while D remains alive. The final JSON records D as not destroyed; cleanup after disconnect cannot be observed in the capture.
+
+```powershell
+New-Item -ItemType Directory -Path output/room-validation/file
+& ./.deps/physx-multiscene-build/Debug/pvd-physx-multiscene.exe --lifecycle `
+  output/room-validation/file/lifecycle.pvdstream output/room-validation/file/lifecycle.json
+```
+
+Each checkpoint reports the cumulative transport byte offset, completed boundary count and independently observed living room numbers. Frame poses come from SDK getters, with the same End-before-update convention as the default producer. Scene address reuse is measured by `replacement_reused_address`; it is not forced or guaranteed by the allocator. The default 144-frame producer and truth schema are unchanged.
+
+For a controlled loopback capture with no desktop input:
+
+```powershell
+python tools/physx-multiscene/verify-lifecycle.py --output output/room-validation/tcp
+```
+
+The output directory must be new. This starts the producer in the background, holds each checkpoint, verifies the expected frame count and room lifetimes, and compares all received TCP bytes with the same-run file mirror. It writes `lifecycle.pvdstream`, `lifecycle.json`, `received.pvdstream` and `transport-check.json`. This verifies the producer and transport; decoder, room directory and desktop behavior need their own checks using these inputs.
+
+Integration tests can start the producer with `--host 127.0.0.1 --port PORT --step-control`. It prints `PVD_ROOMS ready BYTES 0`, then accepts one stdin command at a time: `destroy-zero`, `step`, `destroy-b`, `replace`, `destroy-a`, `disconnect`, `finish`. Each command except `finish` reports a checkpoint after refreshing the truth JSON. The socket and file mirror receive identical bytes; the file is complete after the producer exits. These commands make zero-frame destruction, final-tail destruction and an unconfirmed disconnect observable separately without relying on sleeps or another physics frame.

@@ -277,11 +277,25 @@ pub fn show_pending_action(context: &egui::Context, studio: &mut Studio) -> bool
         studio.playing = 0;
         context.request_repaint_after(std::time::Duration::from_millis(50));
         egui::Modal::new(egui::Id::new("stopping-recording-exports")).show(context, |ui| {
-            ui.spinner();
-            ui.label(studio.prefs.language.text(
-                "Stopping background tasks and cleaning up temporary files…",
-                "正在停止后台任务并清理临时文件…",
-            ));
+            let language = studio.prefs.language;
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!(
+                    "{} · {:.1} {}",
+                    language.text("Closing", "正在退出"),
+                    studio.shutdown_elapsed().as_secs_f64(),
+                    language.text("s", "秒"),
+                ));
+            });
+            for phase in studio.shutdown_phases() {
+                ui.label(phase);
+            }
+            if studio.shutdown_cleanup_pending() {
+                ui.weak(language.text(
+                    "Remaining temporary files will be cleaned up on the next startup or recording.",
+                    "剩余临时文件将在下次启动或开始录制时继续清理。",
+                ));
+            }
         });
         return true;
     }
@@ -746,6 +760,12 @@ mod tests {
                 .write_message(WindowCloseRequested { window: primary });
         }
         app.update();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.world().resource::<Messages<AppExit>>().is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            app.update();
+            std::thread::yield_now();
+        }
         assert_eq!(
             app.world_mut()
                 .resource_mut::<Messages<AppExit>>()

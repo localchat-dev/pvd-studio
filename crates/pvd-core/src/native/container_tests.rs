@@ -163,6 +163,19 @@ fn constructed_snapshot_restores_inherited_scalars_strings_and_mutual_references
     );
     let recording = builder.finish().unwrap();
     assert_eq!(recording.frame_count(), 0);
+    assert_eq!(
+        recording
+            .rooms
+            .iter()
+            .map(|room| (
+                room.scene.id,
+                room.number,
+                room.first_observed_frame,
+                room.destroyed_at_frame
+            ))
+            .collect::<Vec<_>>(),
+        [(1, 1, 0, None), (2, 2, 0, None)]
+    );
     let state = recording.initial_state();
     assert_eq!(state.objects[&1].properties["Value"], Value::U64(7));
     assert_eq!(state.objects[&2].properties["Value"], Value::U64(11));
@@ -580,6 +593,14 @@ fn constructed_nonempty_snapshot_and_two_pages_replay_across_boundaries() {
         (2, 8, 3)
     );
     assert_eq!(recording.source, RecordingSource::Pvd3Database);
+    assert_eq!(
+        recording
+            .rooms
+            .iter()
+            .map(|room| (room.scene.id, room.number, room.destroyed_at_frame))
+            .collect::<Vec<_>>(),
+        [(1, 1, None), (2, 2, Some(2))]
+    );
     for frame in [0, 2, 1, 0, 2] {
         let state = recording.state_at(frame).unwrap();
         assert_eq!(
@@ -693,6 +714,10 @@ fn constructed_random_access_file_above_512_mib_reads_only_declared_blocks() {
     assert!(source.largest_read <= 64 << 10);
     assert!(disk.is_disk_backed());
     assert_eq!(disk.frame_count(), 3);
+    assert_eq!(
+        disk.rooms.iter().collect::<Vec<_>>(),
+        memory.rooms.iter().collect::<Vec<_>>()
+    );
     for frame in [0, 1, 2, 2, 1, 0] {
         assert_eq!(
             disk.state_at(frame).unwrap(),

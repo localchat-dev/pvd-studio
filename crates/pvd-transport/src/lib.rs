@@ -67,6 +67,8 @@ pub struct CaptureServer {
     pub receiver: EventReceiver,
     address: SocketAddr,
     cancel: Arc<AtomicBool>,
+    finish: Arc<AtomicBool>,
+    intake_quiesced: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     spool_stats: Option<Arc<SpoolStats>>,
     socket: Arc<Mutex<Option<TcpStream>>>,
@@ -76,12 +78,31 @@ pub struct CaptureServer {
 #[derive(Clone)]
 pub struct CaptureControl {
     cancel: Arc<AtomicBool>,
+    finish: Arc<AtomicBool>,
+    intake_quiesced: Arc<AtomicBool>,
     socket: Arc<Mutex<Option<TcpStream>>>,
     stats: Option<Arc<SpoolStats>>,
     delivery_signal: Arc<DeliverySignal>,
 }
 
 impl CaptureControl {
+    /// After requesting stop/finish, true once socket intake and raw/spool
+    /// writes have ended. Temporary-file deletion may still be running.
+    pub fn intake_quiesced(&self) -> bool {
+        self.intake_quiesced.load(Ordering::Acquire)
+    }
+
+    /// Stop intake while allowing already committed bytes to reach the consumer.
+    pub fn request_finish(&self) {
+        self.finish.store(true, Ordering::Release);
+        if let Some(socket) = self.socket.lock().unwrap().take() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        if let Some(stats) = &self.stats {
+            stats.disconnected();
+        }
+    }
+
     pub fn request_stop(&self) {
         self.delivery_signal.stop(&self.cancel);
         if let Some(socket) = self.socket.lock().unwrap().take() {
@@ -90,6 +111,14 @@ impl CaptureControl {
         if let Some(stats) = &self.stats {
             stats.disconnected();
         }
+    }
+}
+
+struct IntakeCompletion(Arc<AtomicBool>);
+
+impl Drop for IntakeCompletion {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -108,6 +137,10 @@ impl CaptureServer {
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let cancel = Arc::new(AtomicBool::new(false));
+        let finish = Arc::new(AtomicBool::new(false));
+        let intake_quiesced = Arc::new(AtomicBool::new(false));
+        let intake_completion = IntakeCompletion(intake_quiesced.clone());
+        let finish_intake = finish.clone();
         let (output, receiver) = Output::channel(config.queue_capacity, cancel.clone(), wake);
         let delivery_signal = output.signal.clone();
         let socket = Arc::new(Mutex::new(None));
@@ -115,19 +148,28 @@ impl CaptureServer {
         let worker = thread::Builder::new()
             .name("pvd-receiver".into())
             .spawn(move || {
+                let _intake_completion = intake_completion;
                 if !output.send(ReceiverEvent::Listening(address)) {
                     return;
                 }
                 let mut session = 0;
-                while !output.stopped() {
+                while !output.stopped() && !finish_intake.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, peer)) => {
-                            *active_socket.lock().unwrap() = stream.try_clone().ok();
+                            {
+                                let mut socket = active_socket.lock().unwrap();
+                                if finish_intake.load(Ordering::Acquire) || output.stopped() {
+                                    let _ = stream.shutdown(Shutdown::Both);
+                                    break;
+                                }
+                                *socket = stream.try_clone().ok();
+                            }
                             session += 1;
                             if !output.send(ReceiverEvent::Connected { session, peer }) {
                                 break;
                             }
-                            let result = receive_session(stream, &config, session, &output);
+                            let result =
+                                receive_session(stream, &config, session, &output, &finish_intake);
                             if let Some(socket) = active_socket.lock().unwrap().take() {
                                 let _ = socket.shutdown(Shutdown::Both);
                             }
@@ -160,6 +202,8 @@ impl CaptureServer {
             receiver,
             address,
             cancel,
+            finish,
+            intake_quiesced,
             worker: Some(worker),
             spool_stats: None,
             socket,
@@ -174,6 +218,8 @@ impl CaptureServer {
     pub fn control(&self) -> CaptureControl {
         CaptureControl {
             cancel: self.cancel.clone(),
+            finish: self.finish.clone(),
+            intake_quiesced: self.intake_quiesced.clone(),
             socket: self.socket.clone(),
             stats: self.spool_stats.clone(),
             delivery_signal: self.delivery_signal.clone(),
@@ -239,6 +285,7 @@ fn receive_session(
     config: &ListenConfig,
     session: u64,
     output: &Output,
+    finish: &AtomicBool,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(POLL))?;
     let mut capture = config
@@ -257,7 +304,16 @@ fn receive_session(
     let mut total = 0u64;
     let mut buffer = vec![0u8; CHUNK_SIZE];
     while !output.stopped() {
-        match stream.read(&mut buffer) {
+        let received = if finish.load(Ordering::Acquire) {
+            Ok(0)
+        } else {
+            stream.read(&mut buffer)
+        };
+        let received = match received {
+            Err(_) if finish.load(Ordering::Acquire) => Ok(0),
+            value => value,
+        };
+        match received {
             Ok(0) => {
                 let path = capture.map(CaptureFile::finish).transpose()?;
                 output.send(ReceiverEvent::Disconnected {

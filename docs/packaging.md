@@ -17,17 +17,22 @@
 | `-IncludeSource` | 附带源码；省略时仍收集文档、许可证和存在的精选样例 |
 | `-ArchiveFormat zip` | 生成 ZIP，也是脚本默认格式 |
 | `-SevenZipPath` | 指定已有 `7z.exe` 的路径 |
+| `-VCRedistPath` | 附带本机已有的微软 VC++ x64 运行库安装器，原样复制到 `prerequisites/`，不执行安装或联网下载 |
 | `-TargetDirectory` | 构建目录，复制其中 `release/` 下的两项 EXE |
 | `-SkipBuild` | 复用已有程序，须先核对同源构建记录 |
 | `-BuildStamp yyyyMMdd-HHmmss` | 指定输出标识，已有目录或压缩包不覆盖 |
 
 7z 使用 `-t7z -mx=9 -mmt=2`，ZIP 使用 `-tzip -mm=Deflate -mx=9 -mmt=2`，完成后执行 `7z t`。没有 7-Zip 时，ZIP 使用 PowerShell `Optimal`；选择 7z 则报错。脚本不安装工具或上传产物。
 
+应用图标源图为 `crates/pvd-desktop/assets/pvd-studio.png`。在 Windows 从仓库根目录运行 `./tools/build-icon.ps1` 可生成同目录的 ICO，包含 16、20、24、32、40、48、64、128、256 像素版本。构建时嵌入 EXE，窗口与任务栏使用同一图标资源。
+
 ## 内容
 
 运行包包含两项 EXE、诊断启动脚本、说明、项目文档、补丁许可证、文件清单和空历史目录。`samples/` 仅包含脚本列明且实际存在的输入：SDK 样例位于 `captures/`，具名相机位于 `captures/cameras/`，原版配对文件位于 `captures/native/`。准备方法见[SDK 生产器](../tools/physx-sample/README.md)、[相机生产器](../tools/physx-cameras/README.md)和[原版验证](native-validation.md)。
 
 源码包收集 `crates/`、`vendor/`、`test-support/`、`tools/`、公共文档与根配置。编译目录、捕获、日志、符号、缓存、`docs/local/` 和 `docs/CONTINUE-PVD-STUDIO.md` 不进入源码包。过滤规则由脚本统一维护。
+
+`samples/navmesh/` 另收集仓库内固定上游版本及手工多 Tile 的两份导航验证文件，供离线导入检查使用；两者均为构造数据，不与物理样例地图配对。
 
 `manifest.json` 记录文件相对路径、字节数和 SHA-256，不含清单自身。脚本不冻结编译输入；使用 `-SkipBuild` 不能仅凭文件时间判断源码对应关系。
 

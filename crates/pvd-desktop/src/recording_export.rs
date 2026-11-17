@@ -391,11 +391,17 @@ fn export_retained(
         ));
     };
     crate::atomic_output::create_parent_directory(destination)?;
+    // The byte limit is not an in-memory allocation budget. Complete captures
+    // can exceed the hot-history budget; index/resource limits remain bounded.
+    let limits = pvd_core::capture::CaptureLimits {
+        output_bytes: (1 << 63) - 1,
+        ..Default::default()
+    };
     let report = pvd_core::capture::write_retained_new(
         recording,
         destination,
         pvd_core::capture::CaptureRange { first, last },
-        &Default::default(),
+        &limits,
         512 << 20,
         |value| {
             progress(Progress {

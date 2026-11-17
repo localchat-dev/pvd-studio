@@ -33,6 +33,7 @@ fn source_controls_from_a_previous_session_do_not_affect_the_replacement() {
         raw_attempted: false,
         received_bytes: 0,
         published_frames: 0,
+        published_rooms_revision: 0,
         selection_revision: 0,
         last_publish: Instant::now(),
         profile: None,

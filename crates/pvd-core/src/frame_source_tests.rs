@@ -13,6 +13,57 @@ use std::{
 
 static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn live_abort_token_can_be_attached_before_or_after_stream_initialization() {
+    for before_header in [true, false] {
+        let directory = TestDirectory::new();
+        let mut live = LiveRecording::with_persistent_history(directory.config()).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if before_header {
+            live.set_cancellation(cancelled.clone());
+        }
+        live.feed(&wire(&mixed_events())).unwrap();
+        if !before_header {
+            live.set_cancellation(cancelled.clone());
+        }
+        let old = live.snapshot().unwrap();
+        let count = live.frame_count();
+        cancelled.store(true, Ordering::Release);
+        let failure = live.feed(&[0xff]).unwrap_err();
+        assert_eq!(
+            failure
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::Interrupted),
+            "{failure}"
+        );
+        assert_eq!(live.frame_count(), count);
+        let retained = live.snapshot().unwrap();
+        for frame in 0..count {
+            assert_eq!(
+                retained.state_at(frame).unwrap().objects,
+                old.state_at(frame).unwrap().objects
+            );
+        }
+    }
+}
+
+#[test]
+fn live_abort_before_the_header_returns_typed_interruption() {
+    let mut live = LiveRecording::default();
+    live.set_cancellation(Arc::new(AtomicBool::new(true)));
+    let failure = live.feed(&wire_header()).unwrap_err();
+    assert_eq!(
+        failure
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::Interrupted),
+        "{failure}"
+    );
+    assert_eq!(live.frame_count(), 0);
+    assert!(live.builder.is_none());
+}
+
 pub(crate) struct TestDirectory(PathBuf);
 impl TestDirectory {
     pub(crate) fn new() -> Self {

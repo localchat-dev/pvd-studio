@@ -21,6 +21,7 @@ mod source_debug_tests;
 pub use mesh::MeshCache;
 pub mod metrics;
 pub mod native;
+pub mod navmesh;
 pub use native::memory_totals::{MemoryHistoryScope, NativeMemoryTotal, NativeMemoryTotals};
 mod origin_shift;
 pub mod particles;
@@ -33,6 +34,7 @@ mod property_message_tests;
 pub mod pvd_archive;
 pub mod queries;
 pub mod repx;
+pub mod rooms;
 use frame_sources::{FrameBinding, FrameDirectory, FrameSourceKey, SourceFrame};
 use metrics::{Metrics, Stage};
 use pvd_protocol::{Decoder, Endian, Event, EventGroup, Header, MessageArg, Name};
@@ -41,13 +43,38 @@ use std::{
     fmt, fs,
     io::Read,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type FrameIndex = history::SharedIndex<FrameInfo>;
 fn error(text: impl Into<String>) -> Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, text.into()).into()
+}
+
+#[derive(Clone, Default)]
+struct IngestCancellation(Option<Arc<AtomicBool>>);
+
+impl IngestCancellation {
+    fn requested(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+    }
+
+    fn check(&self) -> Result<(), Error> {
+        if self.requested() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "recording ingestion cancelled",
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 fn check_replay_cancelled(cancelled: &mut impl FnMut() -> bool) -> Result<(), Error> {
@@ -494,6 +521,7 @@ pub struct Recording {
     pub analysis: analysis::SharedAnalysis,
     pub frames: FrameIndex,
     pub frame_sources: FrameDirectory,
+    pub rooms: rooms::RoomDirectory,
     pub classes: BTreeMap<String, ClassDefinition>,
     pub diagnostics: Vec<String>,
     native_scene_contexts: Option<Arc<native::SceneContexts>>,
@@ -592,11 +620,13 @@ impl Recording {
             }
             if capture::Format::from_magic(&prefix)?.is_some() {
                 drop(file);
-                return capture::open_with_progress(
-                    path,
-                    &capture::CaptureLimits::default(),
-                    |state| progress(state.completed, state.total),
-                );
+                let limits = capture::CaptureLimits {
+                    output_bytes: total.max(capture::CaptureLimits::default().output_bytes),
+                    ..Default::default()
+                };
+                return capture::open_with_progress(path, &limits, |state| {
+                    progress(state.completed, state.total)
+                });
             }
             if prefix.starts_with(&native::MAGIC.to_le_bytes()) {
                 drop(file);
@@ -867,6 +897,7 @@ pub struct RecordingBuilder {
     validation: Option<clip::ValidationState>,
     metrics: Metrics,
     message_cache_bytes: usize,
+    cancellation: IngestCancellation,
 }
 impl RecordingBuilder {
     pub fn new(header: Header) -> Self {
@@ -877,6 +908,7 @@ impl RecordingBuilder {
                 analysis: analysis::SharedAnalysis::default(),
                 frames: FrameIndex::default(),
                 frame_sources: FrameDirectory::default(),
+                rooms: rooms::RoomDirectory::default(),
                 classes: BTreeMap::new(),
                 diagnostics: Vec::new(),
                 native_scene_contexts: None,
@@ -911,6 +943,7 @@ impl RecordingBuilder {
             validation: None,
             metrics: Metrics::default(),
             message_cache_bytes: 0,
+            cancellation: IngestCancellation::default(),
         }
     }
     fn set_metrics(&mut self, metrics: Metrics) {
@@ -918,6 +951,12 @@ impl RecordingBuilder {
             live.history.set_metrics(metrics.clone());
         }
         self.metrics = metrics;
+    }
+    fn set_cancellation(&mut self, cancellation: IngestCancellation) {
+        if let Some(live) = &mut self.streaming {
+            live.history.set_cancellation(cancellation.clone());
+        }
+        self.cancellation = cancellation;
     }
     pub fn with_memory_limit(header: Header, bytes: usize) -> Self {
         let mut builder = Self::new(header);
@@ -1130,6 +1169,18 @@ impl RecordingBuilder {
         self.apply_action(Action::Set(id, key.to_owned(), value))
     }
     fn apply_action(&mut self, action: Action) -> Result<(), Error> {
+        let change = rooms::Change::from_action(&action, &self.state);
+        self.apply_action_inner(action)?;
+        if let Some(change) = change {
+            let frame = self.streaming.as_ref().map_or_else(
+                || self.recording.frames.len(),
+                |streaming| streaming.frames_seen,
+            );
+            change.apply(&mut self.recording.rooms, frame);
+        }
+        Ok(())
+    }
+    fn apply_action_inner(&mut self, action: Action) -> Result<(), Error> {
         self.release_message_cache_for_action(&action);
         let retain_complete = self.retains_actions();
         match &action {
@@ -1468,9 +1519,11 @@ impl RecordingBuilder {
         Ok(())
     }
     pub fn push(&mut self, group: EventGroup) -> Result<(), Error> {
+        self.cancellation.check()?;
         let _timer = self.metrics.measure(Stage::BuilderPush);
         let stream = group.stream_id;
         for event in group.events {
+            self.cancellation.check()?;
             match event {
                 Event::StringHandle { handle, value } => {
                     self.clear_message_cache();
@@ -1601,11 +1654,12 @@ impl RecordingBuilder {
                     }
                     let type_name = self.name(class)?;
                     self.object_classes.insert(id, type_name.clone());
-                    let generation = *self
-                        .generations
-                        .entry(id)
-                        .and_modify(|v| *v += 1)
-                        .or_insert(0);
+                    let generation = self.generations.get(&id).map_or(Ok(0), |generation| {
+                        generation
+                            .checked_add(1)
+                            .ok_or_else(|| error("instance generation overflow"))
+                    })?;
+                    self.generations.insert(id, generation);
                     self.action(Action::Create(Object {
                         id,
                         generation,
@@ -1751,10 +1805,15 @@ impl RecordingBuilder {
                             let _maintenance = self.metrics.measure(Stage::AnalysisMaintenance);
                             self.maintain_analysis(index)?;
                         }
-                        let directory_bytes = self
-                            .recording
-                            .frame_sources
-                            .index_bytes_after_observe(index, binding, true)?;
+                        self.streaming
+                            .as_mut()
+                            .unwrap()
+                            .prepare_persistent(&self.recording)?;
+                        let directory_bytes = self.streaming.as_mut().unwrap().directory_bytes(
+                            index,
+                            binding,
+                            &self.recording.frame_sources,
+                        )?;
                         self.reserve_frame_budget(0, directory_bytes)?;
                         self.streaming.as_mut().unwrap().complete(
                             FrameInfo {
@@ -2005,8 +2064,27 @@ pub struct LiveRecording {
     published_frame: Option<usize>,
     requested_frame_source: Option<FrameSourceKey>,
     metrics: Metrics,
+    cancellation: IngestCancellation,
 }
 impl LiveRecording {
+    /// Interrupts ingestion and temporary bank sealing when the shared token is set.
+    /// Use an abort token; a graceful disconnect must still drain received data.
+    pub fn set_cancellation(&mut self, cancelled: Arc<AtomicBool>) {
+        self.cancellation = IngestCancellation(Some(cancelled));
+        if let Some(history) = &mut self.history {
+            history.set_cancellation(self.cancellation.clone());
+        }
+        if let Some(builder) = &mut self.builder {
+            builder.set_cancellation(self.cancellation.clone());
+        }
+    }
+
+    pub fn rooms(&self) -> Option<&rooms::RoomDirectory> {
+        self.builder
+            .as_ref()
+            .map(|builder| &builder.recording.rooms)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_paged_history(config: live::HistoryConfig) -> Result<Self, Error> {
         Self::with_history(config)
@@ -2049,6 +2127,16 @@ impl LiveRecording {
     pub fn with_history(config: live::HistoryConfig) -> Result<Self, Error> {
         Ok(Self {
             history: Some(live::HistoryWriter::new_paged(config)?),
+            continuous: true,
+            ..Self::default()
+        })
+    }
+    /// Keeps the complete session on disk, sealing bounded hot banks for lazy replay.
+    /// `disk_budget_bytes` limits the hot writer; total history grows until the disk
+    /// reserve or the bounded one-million-frame navigation directory is exhausted.
+    pub fn with_persistent_history(config: live::HistoryConfig) -> Result<Self, Error> {
+        Ok(Self {
+            history: Some(live::HistoryWriter::new_persistent(config)?),
             continuous: true,
             ..Self::default()
         })
@@ -2110,6 +2198,7 @@ impl LiveRecording {
         result
     }
     fn feed_inner(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.cancellation.check()?;
         self.received_bytes = self
             .received_bytes
             .checked_add(bytes.len() as u64)
@@ -2123,6 +2212,7 @@ impl LiveRecording {
             let _timer = self.metrics.measure(Stage::ProtocolParse);
             self.decoder.feed(bytes)?
         };
+        self.cancellation.check()?;
         if self.builder.is_none()
             && let Some(header) = self.decoder.header()
         {
@@ -2139,6 +2229,7 @@ impl LiveRecording {
                     .set_frame_source(self.requested_frame_source);
             }
             builder.set_metrics(self.metrics.clone());
+            builder.set_cancellation(self.cancellation.clone());
             self.builder = Some(builder);
         }
         if let Some(builder) = self.builder.as_mut() {
@@ -2175,6 +2266,7 @@ impl LiveRecording {
         Ok(recording)
     }
     pub fn finish(self) -> Result<Recording, Error> {
+        self.cancellation.check()?;
         if self.failed {
             return Err(error("live recording failed"));
         }

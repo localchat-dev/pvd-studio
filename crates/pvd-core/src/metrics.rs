@@ -43,10 +43,11 @@ pub enum Stage {
     SnapshotPublish,
     AnalysisMaintenance,
     AnalysisIngest,
+    HistorySeal,
 }
 
 impl Stage {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::ProtocolParse,
         Self::BuilderPush,
         Self::PropertyMessage,
@@ -69,6 +70,7 @@ impl Stage {
         Self::SnapshotPublish,
         Self::AnalysisMaintenance,
         Self::AnalysisIngest,
+        Self::HistorySeal,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -95,6 +97,7 @@ impl Stage {
             Self::SnapshotPublish => "snapshot_publish",
             Self::AnalysisMaintenance => "analysis_maintenance",
             Self::AnalysisIngest => "analysis_ingest",
+            Self::HistorySeal => "history_seal",
         }
     }
 
@@ -111,6 +114,7 @@ impl Stage {
                 | Self::HistoryAnalysisPrepare
                 | Self::HistorySceneCheckpoint
                 | Self::HistoryAnalysisReclaim
+                | Self::HistorySeal
                 | Self::SnapshotPublish
         )
     }
@@ -500,7 +504,7 @@ mod tests {
         let (started, entered) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let _guard = worker.measure(Stage::HistoryReservation);
+            let _guard = worker.measure(Stage::HistorySeal);
             assert_untimed(&worker.snapshot());
             started.send(()).unwrap();
             released.recv().unwrap();
@@ -508,13 +512,18 @@ mod tests {
         entered.recv().unwrap();
         metrics.enable();
         let snapshot = metrics.snapshot();
-        let entry = stage(&snapshot, Stage::HistoryReservation);
+        let entry = stage(&snapshot, Stage::HistorySeal);
         assert_eq!((entry.started, entry.completed, entry.in_flight), (1, 0, 1));
+        assert_eq!(entry.stage.as_str(), "history_seal");
+        assert_eq!(
+            serde_json::to_string(&entry.stage).unwrap(),
+            "\"history_seal\""
+        );
         release.send(()).unwrap();
         thread.join().unwrap();
         let snapshot = metrics.snapshot();
         assert_untimed(&snapshot);
-        let entry = stage(&snapshot, Stage::HistoryReservation);
+        let entry = stage(&snapshot, Stage::HistorySeal);
         assert_eq!((entry.started, entry.completed, entry.in_flight), (1, 1, 0));
         let mut timed = Metrics::default();
         timed.enable();

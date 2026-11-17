@@ -214,6 +214,7 @@ fn keyed_capture_rejects_damage_version_mismatch_and_budget_and_cancellation() {
         file: File::open(&path).unwrap(),
         path: path.clone(),
         bytes: bytes.len() as u64,
+        owner: std::sync::Mutex::new(None),
     }));
     assert!(reader.decode(&record, &mut || false).is_err());
     reader.capture = None;

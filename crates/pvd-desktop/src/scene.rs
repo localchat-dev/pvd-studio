@@ -26,6 +26,7 @@ mod captured_display;
 mod debug_bounds;
 mod display_validation;
 mod incremental;
+mod room_camera;
 #[cfg(test)]
 mod selected_overlay_tests;
 mod source_index;
@@ -122,6 +123,9 @@ pub struct Viewport {
     palette: crate::studio::DisplayColors,
     incremental: incremental::SceneIndex,
     source_index: source_index::SourceIndex,
+    room: Option<pvd_core::frame_sources::FrameObject>,
+    room_scope_version: u64,
+    room_cameras: room_camera::Cameras,
 }
 
 impl Default for Viewport {
@@ -164,11 +168,18 @@ impl Default for Viewport {
             palette: crate::studio::DisplayColors::default(),
             incremental: incremental::SceneIndex::default(),
             source_index: source_index::SourceIndex::default(),
+            room: None,
+            room_scope_version: 0,
+            room_cameras: room_camera::Cameras::default(),
         }
     }
 }
 
 impl Viewport {
+    pub(crate) fn displayed_revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn project(&self, position: Vec3, rect: egui::Rect) -> Option<(egui::Pos2, f32)> {
         let position = self.coordinates.point(position);
         let eye = self.position();
@@ -520,6 +531,26 @@ fn prepare_multi_selection(studio: &mut Studio) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn render_room_target(
+    studio: &Studio,
+    destroyed: bool,
+) -> Option<pvd_core::frame_sources::FrameObject> {
+    let rooms = studio.room_directory()?;
+    if destroyed {
+        rooms
+            .iter()
+            .rev()
+            .find(|room| room.destroyed_at_frame.is_some() && studio.room_has_history(room.scene))
+            .map(|room| room.scene)
+    } else {
+        rooms
+            .iter()
+            .filter(|room| studio.room_has_history(room.scene))
+            .nth(1)
+            .map(|room| room.scene)
+    }
+}
+
 pub fn render_check(
     mut commands: Commands,
     mut check: ResMut<RenderCheck>,
@@ -527,7 +558,9 @@ pub fn render_check(
     viewport: Res<Viewport>,
     mut contexts: bevy_egui::EguiContexts,
     mut exit: MessageWriter<bevy::app::AppExit>,
+    navmesh_state: (Res<crate::navmesh::NavMeshOverlay>, Local<u32>),
 ) {
+    let (navmesh, mut navmesh_ready_frames) = navmesh_state;
     if let Some(completion) = check.completion.clone() {
         if !check.exit_sent && studio.poll_shutdown() {
             check.exit_sent = true;
@@ -536,6 +569,11 @@ pub fn render_check(
         return;
     }
     check.frames += 1;
+    if navmesh.is_busy() {
+        *navmesh_ready_frames = 0;
+    } else {
+        *navmesh_ready_frames = navmesh_ready_frames.saturating_add(1);
+    }
     let language = studio.prefs.language;
     if check.frames > 18_000 {
         eprintln!(
@@ -588,6 +626,20 @@ pub fn render_check(
             eprintln!("Multi-selection render preparation failed: {error}");
             check.completion = Some(bevy::app::AppExit::error());
             return;
+        }
+        if matches!(check.panel.as_deref(), Some("rooms" | "room-destroyed")) {
+            let Some(room) =
+                render_room_target(&studio, check.panel.as_deref() == Some("room-destroyed"))
+            else {
+                eprintln!(
+                    "Room render check requires the requested room with complete retained frames"
+                );
+                check.completion = Some(bevy::app::AppExit::error());
+                return;
+            };
+            studio.room_view.expanded = true;
+            studio.room_view.show_destroyed = true;
+            studio.select_room(Some(room));
         }
         if matches!(
             check.panel.as_deref(),
@@ -675,7 +727,7 @@ pub fn render_check(
             studio.focus_selected = true;
         }
         let panel = match check.panel.as_deref() {
-            Some("timeline") => Some(crate::studio::Panel::Timeline),
+            Some("timeline" | "rooms" | "room-destroyed") => Some(crate::studio::Panel::Timeline),
             Some("performance" | "profile-events" | "profile-first-start" | "thread-window") => {
                 Some(crate::studio::Panel::Performance)
             }
@@ -863,8 +915,56 @@ pub fn render_check(
         }
     }
     if check.frames > 90 && studio.job.is_none() && studio.curve_job.is_none() && !check.requested {
+        if navmesh.is_busy() || *navmesh_ready_frames < 30 {
+            return;
+        }
+        if check
+            .panel
+            .as_deref()
+            .is_some_and(|panel| panel.starts_with("navmesh"))
+        {
+            let Some(entry) = navmesh.selected() else {
+                eprintln!("NavMesh render check requires a successfully imported --navmesh file");
+                check.completion = Some(bevy::app::AppExit::error());
+                return;
+            };
+            println!(
+                "NavMesh overlay: {} tiles, {} polygons, {} triangles",
+                entry.loaded.mesh.tile_count,
+                entry.loaded.mesh.polygon_count,
+                entry.loaded.mesh.indices.len() / 3
+            );
+        }
         if studio.seeking.is_some() {
             return;
+        }
+        if matches!(check.panel.as_deref(), Some("rooms" | "room-destroyed")) {
+            let expected =
+                render_room_target(&studio, check.panel.as_deref() == Some("room-destroyed"));
+            if expected.is_none()
+                || studio.displayed_room() != expected
+                || studio.room_selection_pending()
+                || viewport.revision != studio.revision
+                || viewport.room != expected
+                || viewport
+                    .objects
+                    .iter()
+                    .any(|object| !studio.room_scope.contains(object.id))
+            {
+                eprintln!("Room render state does not match the requested displayed room");
+                check.completion = Some(bevy::app::AppExit::error());
+                return;
+            }
+            println!(
+                "Room render state: {}",
+                serde_json::json!({
+                    "frame": studio.frame,
+                    "scene": expected.map(|room| room.id),
+                    "generation": expected.map(|room| room.generation),
+                    "actors": viewport.objects.iter().map(|object| object.id).collect::<BTreeSet<_>>(),
+                    "rooms": studio.room_directory().map(|rooms| rooms.len()),
+                })
+            );
         }
         if check.panel.as_deref() == Some("multi-selection") {
             let selected = studio.selected_ids();
@@ -1052,6 +1152,7 @@ pub fn sync_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let camera_changed = viewport.prepare_room_camera(&mut studio);
     let mut palette = studio.prefs.display_colors;
     palette.sanitize();
     if studio.prefs.display_colors != palette {
@@ -1059,6 +1160,8 @@ pub fn sync_scene(
     }
     let coordinates = studio.display_coordinates();
     let coordinates_changed = coordinates != viewport.coordinates;
+    let room_changed = viewport.room != studio.room_scope.room()
+        || viewport.room_scope_version != studio.room_scope.version();
     let settings = [
         studio.prefs.show_static as u32,
         studio.prefs.show_dynamic as u32,
@@ -1083,6 +1186,8 @@ pub fn sync_scene(
         && viewport.settings == settings
         && viewport.palette == palette
         && !coordinates_changed
+        && !room_changed
+        && !camera_changed
     {
         return;
     }
@@ -1110,27 +1215,36 @@ pub fn sync_scene(
             .update(&studio.state, changed.as_ref());
     }
     let incremental = !coordinates_changed
+        && !room_changed
         && viewport.settings == settings
         && viewport.palette == palette
         && viewport.selected == studio.selected
         && viewport.selection_revision == studio.selection_revision();
     let actors = if incremental {
-        changed.and_then(|changed| viewport.incremental.affected(&studio.state, changed))
+        changed
+            .and_then(|changed| viewport.incremental.affected(&studio.state, changed))
+            .map(|actors| {
+                actors
+                    .into_iter()
+                    .filter(|id| studio.room_scope.contains(*id))
+                    .collect::<HashSet<_>>()
+            })
     } else {
         None
     };
     let (mut scene, was_subset) = if let Some(actors) = &actors {
         (
-            studio
-                .state
-                .render_actors_cached(actors.iter().copied(), &mut viewport.mesh_cache),
+            studio.state.render_actors_cached(
+                actors
+                    .iter()
+                    .copied()
+                    .filter(|id| studio.room_scope.contains(*id)),
+                &mut viewport.mesh_cache,
+            ),
             true,
         )
     } else {
-        (
-            studio.state.render_scene_cached(&mut viewport.mesh_cache),
-            false,
-        )
+        (render_room(&studio, &mut viewport.mesh_cache), false)
     };
     let actors = actors.filter(|actors| {
         viewport
@@ -1138,10 +1252,18 @@ pub fn sync_scene(
             .accepts(actors, &scene, &viewport.shared_geometry)
     });
     if actors.is_none() && was_subset {
-        scene = studio.state.render_scene_cached(&mut viewport.mesh_cache);
+        scene = render_room(&studio, &mut viewport.mesh_cache);
     }
     let full_diagnostics = scene.diagnostics.is_empty();
-    viewport.point_clouds = if viewport.source_index.complete {
+    viewport.room = studio.room_scope.room();
+    viewport.room_scope_version = studio.room_scope.version();
+    viewport.point_clouds = if viewport.room.is_some() {
+        crate::point_clouds::PointClouds::collect_from_ids(
+            &studio.state,
+            studio.room_scope.cloths(),
+            studio.room_scope.particles(),
+        )
+    } else if viewport.source_index.complete {
         crate::point_clouds::PointClouds::collect_from_ids(
             &studio.state,
             &viewport.source_index.cloths,
@@ -1184,12 +1306,16 @@ pub fn sync_scene(
     let mut limited_lines = false;
     viewport.limit_lines.clear();
     viewport.debug_bounds.clear();
-    let debug_count: usize = studio
-        .state
-        .debug_draw
-        .values()
-        .map(|batch| batch.len())
-        .sum();
+    let debug_count: usize = if viewport.room.is_none() {
+        studio
+            .state
+            .debug_draw
+            .values()
+            .map(|batch| batch.len())
+            .sum()
+    } else {
+        0
+    };
     if !studio.prefs.show_debug_draw || debug_count == 0 {
         viewport.debug_bounds = debug_bounds::DebugBounds::default();
     }
@@ -1199,7 +1325,7 @@ pub fn sync_scene(
             format!("本帧包含 {debug_count} 个调试图元，仅显示前 {MAX_DEBUG_PRIMITIVES} 个；捕获数据仍完整保留。"),
         ));
     }
-    for (owner, primitive) in debug_primitives_with_owner(&studio.state) {
+    for (owner, primitive) in display_debug_primitives_with_owner(&studio) {
         if is_joint_limit(primitive) {
             match pvd_core::joint_geometry::tessellate(primitive) {
                 Ok(lines)
@@ -1240,7 +1366,9 @@ pub fn sync_scene(
             format!("{invalid_debug} 个调试图元的坐标、旋转或文字大小无效，无法绘制。"),
         ));
     }
-    let mut queries = if viewport.source_index.complete {
+    let mut queries = if viewport.room.is_some() {
+        pvd_core::queries::collect_from_ids(&studio.state, studio.room_scope.scenes())
+    } else if viewport.source_index.complete {
         pvd_core::queries::collect_from_ids(&studio.state, &viewport.source_index.scenes)
     } else {
         pvd_core::queries::collect(&studio.state)
@@ -1273,6 +1401,7 @@ pub fn sync_scene(
             scene.objects,
         );
         viewport.revision = studio.revision;
+        viewport.finish_room_camera();
         return;
     }
     let all_objects = scene.objects;
@@ -1363,6 +1492,7 @@ pub fn sync_scene(
     viewport.objects = objects;
     viewport.incremental = incremental::SceneIndex::rebuild(
         &studio.state,
+        &studio.room_scope,
         &viewport.objects,
         asset_uses,
         source,
@@ -1373,6 +1503,7 @@ pub fn sync_scene(
     viewport.selection_revision = studio.selection_revision();
     viewport.settings = settings;
     viewport.palette = palette;
+    viewport.finish_room_camera();
 }
 
 fn sync_object(
@@ -2004,7 +2135,10 @@ pub fn draw_grid(
         }
     }
     if studio.prefs.show_contacts {
-        for contacts in studio.state.contacts.values() {
+        for (scene, contacts) in &studio.state.contacts {
+            if !studio.room_scope.contains(*scene) {
+                continue;
+            }
             for contact in contacts.iter() {
                 let position = Vec3::from(contact.position);
                 let normal = Vec3::from(contact.normal);
@@ -2032,7 +2166,7 @@ pub fn draw_grid(
             );
         }
         use pvd_core::debug_draw::Primitive;
-        for primitive in debug_primitives(&studio.state) {
+        for primitive in display_debug_primitives(&studio) {
             if !drawable_debug(primitive) {
                 continue;
             }
@@ -2083,28 +2217,6 @@ pub fn draw_grid(
             }
         }
     }
-    if studio.prefs.show_grid {
-        gizmos.coordinates = Coordinates::default();
-        let step = 10_f32
-            .powf((viewport.view_distance() / 10.0).log10().floor())
-            .max(0.1 * viewport.coordinates.scale);
-        let center = (viewport.view_target() / step).round() * step;
-        for line in -20..=20 {
-            let p = line as f32 * step;
-            let color = Color::srgba(0.28, 0.35, 0.43, if line % 5 == 0 { 0.45 } else { 0.2 });
-            gizmos.line(
-                Vec3::new(center.x + p, 0.0, center.z - step * 20.0),
-                Vec3::new(center.x + p, 0.0, center.z + step * 20.0),
-                color,
-            );
-            gizmos.line(
-                Vec3::new(center.x - step * 20.0, 0.0, center.z + p),
-                Vec3::new(center.x + step * 20.0, 0.0, center.z + p),
-                color,
-            );
-        }
-    }
-    gizmos.coordinates = viewport.coordinates;
     if studio.prefs.show_axes {
         gizmos.line(Vec3::ZERO, Vec3::X * 2.0, Color::srgb(0.9, 0.3, 0.35));
         gizmos.line(Vec3::ZERO, Vec3::Y * 2.0, Color::srgb(0.38, 0.8, 0.5));
@@ -2291,6 +2403,36 @@ fn query_lines(queries: &pvd_core::queries::QueryScene) -> (Vec<QueryLine>, bool
     (lines, limited)
 }
 
+fn render_room(studio: &Studio, cache: &mut pvd_core::MeshCache) -> pvd_core::RenderScene {
+    if studio.room_scope.room().is_some() {
+        studio
+            .state
+            .render_actors_cached(studio.room_scope.actors().iter().copied(), cache)
+    } else {
+        studio.state.render_scene_cached(cache)
+    }
+}
+
+pub(crate) fn display_debug_primitives(
+    studio: &Studio,
+) -> impl Iterator<Item = &pvd_core::debug_draw::Primitive> {
+    display_debug_primitives_with_owner(studio).map(|(_, primitive)| primitive)
+}
+
+fn display_debug_primitives_with_owner(
+    studio: &Studio,
+) -> impl Iterator<Item = (u64, &pvd_core::debug_draw::Primitive)> {
+    // Bare instance IDs do not prove which lifetime produced a captured primitive.
+    studio
+        .room_scope
+        .room()
+        .is_none()
+        .then_some(&studio.state)
+        .into_iter()
+        .flat_map(debug_primitives_with_owner)
+}
+
+#[cfg(test)]
 pub(crate) fn debug_primitives(
     state: &pvd_core::SceneState,
 ) -> impl Iterator<Item = &pvd_core::debug_draw::Primitive> {

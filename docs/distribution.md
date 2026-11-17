@@ -4,13 +4,17 @@ pvd-studio 参考 NVIDIA PhysX Visual Debugger 3（PVD3）的功能与工作流�
 
 ## 启动与连接
 
-1. 将发行包解压到可写目录，运行 `pvd-desktop.exe`。运行查看器不需要 Rust 或 PhysX SDK。
+1. 将发行包解压到可写目录，运行 `pvd-desktop.exe`。需要 Windows x64 和 Microsoft Visual C++ x64 运行库，不需要 Rust 或 PhysX SDK。
 2. 在右上角“设置 → TCP 连接”配置地址和端口，再点击“开始监听”。默认 `0.0.0.0:5425`，也可使用指定 IPv4/IPv6 地址。停止监听后才能修改。
 3. 远端 SDK 填写调试机可达的实际 IP 与相同端口；`0.0.0.0` 是绑定地址，不是远端目标。
 4. 需要完整原始录制时，先在“设置”勾选“自动保存录制”并选择目录，再开始监听。收到数据后保存独立录制，正常完整结束生成 `.pvdstream`，中断录制保留 `.partial`；零字节连接不生成文件。
 5. 在“设置 → 语言”切换简体中文/英文，同一菜单也可重置布局；偏好位于 `%LOCALAPPDATA%\pvd-studio\layout.json`。
 
 应用启动时不自动载入样例。路径栏、文件选择器或启动参数均可打开捕获，帧号从 0 开始；项目捕获保留源会话的帧号。端口冲突或远端无法连接时，检查匹配端口、网卡地址、路由及入站规则。工具不会修改系统防火墙。
+
+内网机器若提示缺少 `VCRUNTIME140.dll`，可运行包内 `prerequisites/vc_redist.x64.exe` 安装 x64 运行库后再启动；此安装器仅在打包时显式附带。程序及 NavMesh 导入无需访问互联网。
+
+缺少中文字体的 Windows 环境可使用 `pvd-desktop.exe --language en` 启动英文界面。
 
 顶部“TCP · 等待数据”表示连接已接通但尚未收到数据，悬浮可查看完整连接状态及接收详情。“未收到数据便已断开”表示该连接为零字节，尚未形成 PVD 录制；监听器会继续等待下一条连接。单凭此提示无法判断发送端为何没有发送数据。收到部分协议头后断开仍会报告解码截断。
 
@@ -28,6 +32,8 @@ SDK 应使用包含 PVD 支持的 debug、checked 或 profile 配置。查看器
 
 | 操作 | 入口 |
 | --- | --- |
+| 区分多个房间 | 左侧对象树上方的[房间列表](rooms.md)，自动编号、切换及查看销毁状态；接收与保存覆盖全部房间 |
+| 叠加导航网格 | 工具栏 **NavMesh** 导入服务端 `.bin`；支持透明度、边线、坐标调整与房间绑定，格式范围见 [NavMesh](navmesh.md) |
 | 查看对象、属性和引用 | 对象树选择，输入完整 ID 后 Enter 选择；属性链接跳转，数组展开，复制或绘制数值元素 |
 | 控制镜头与逐帧 | 场景左下角操作提示；完整按键见[界面说明](ui.md) |
 | 慢放 | 暂停实时，关闭“录制时序”，降低帧率后正放或倒放；左右键逐帧 |
@@ -38,19 +44,21 @@ SDK 应使用包含 PVD 支持的 debug、checked 或 profile 配置。查看器
 
 图表缺失值保持空缺；接收刷新帧不是事件精确发生时刻。原版手册的配色、手势和图页方式与项目存在差异，见[手册对照](manual-checklist.md#手册对照)。
 
+内网测试 NavMesh 时，先打开对应地图的 PhysX 捕获，再从工具栏 **NavMesh** 导入该地图的导航文件。包内 `samples/navmesh/` 提供两个小型验证文件，可检查导入及显示；它们是构造数据，与包内物理场景没有地图对应关系。此功能离线运行，无需安装 Node、Unity 或 Recast。当前支持小端、32 位引用的 `MSET v1 / DNAV v7`，`TSET` 压缩 TileCache 暂不支持。
+
 ## 接收、历史与保存
 
 | 存储 | 默认位置/策略 | 生命周期 |
 | --- | --- | --- |
 | 接收缓存 | 历史目录下 `receive`，无固定容量配额，受可用空间保护 | 已交付数据逐步回收 |
-| 回放历史 | 当前工作目录 `pvd-cache/history`，可配置，默认滚动 8 GiB | 会话释放后清理自有临时数据 |
+| 回放历史 | 当前工作目录 `pvd-cache/history`，完整录制加有界热缓存 | 已结束录制保留在临时列表，按清理策略或用户操作回收 |
 | 原始录制 | 自动录制默认 `captures/`，监听前启用；手动另存默认 `captures/capture.pvdstream` | 永久 `.pvdstream`，与临时缓存独立 |
 | 项目捕获 | 默认 `captures/capture.pvdcapture`；时间轴“保存录制”，或“片段 → 保存保留历史”指定范围 | 独立 `.pvdcapture`，可重开和再次裁剪 |
 | 完整文件分析索引 | 当前工作目录 `pvd-cache/profile` | 派生缓存，关闭/换源后释放数据，根控制锁可保留 |
 
-接收积压 256 MiB 会告警，正数接收配额、至少 512 MiB 的可用空间保护或写入失败会结束连接。历史容量不保证固定时长；帧、元数据和当前场景预算也可能提前限制保留范围。
+接收积压 256 MiB 会告警，正数接收配额、至少 512 MiB 的可用空间保护或写入失败会结束连接。完整临时录制保留起点，磁盘和导航资源不足时明确停止追加；热缓存预算不代表整份录制的磁盘上限。默认清理已结束临时录制的策略与范围见[完整临时录制](temporary-recordings.md)。
 
-暂停或查看历史时接收继续。暂停帧被淘汰后可保留画面，但无法重新加载该帧；使用恢复入口或返回实时。临时历史不能补回已淘汰的完整原始流。首次/随机冷定位仍有基线恢复成本。
+暂停或查看历史时接收继续。默认完整录制在回收热缓存前封存数据，可重新读取早期帧；显式滚动模式已淘汰的帧仍无法补回。首次/随机冷定位仍有基线恢复成本。
 
 磁盘历史的“保存录制”保存全部仍可读取的帧，不要求开启自动原始录制，接收中或断开后只有 `.partial` 时均可使用。完整原始数据在“原始流 → 另存原始流”中保存，需要已有完整录制；内存 SDK 文件的保存按钮直接复制 `.pvdstream`。
 
@@ -62,7 +70,7 @@ SDK 应使用包含 PVD 支持的 debug、checked 或 profile 配置。查看器
 | --- | --- | --- |
 | 完整 SDK 原始流 | 检查、回放、保存、片段定义/流式裁剪、完整分析 CSV | 分析按实际源数据和预算处理 |
 | PVD3 数据库 v1 `.pxd2` | 部分对象/帧/分析/绘制读取和回放；时间轴或片段页的“PVD3 录制”整份保存及受限帧区间裁剪 | 读入使用磁盘历史；写出各限 512 MiB，更广布局及原版应用互验未完成 |
-| 项目 `.pvdcapture` | 读取 01/02，保存 02，独立重开与再次裁剪 | 无完整原始字节；全源 CSV/目录和 SDK 裁剪拒绝 |
+| 项目 `.pvdcapture` | 读取 01/02/03，保存 03，独立重开与再次裁剪 | 无完整原始字节；全源 CSV/目录和 SDK 裁剪拒绝 |
 
 完整 SDK 文件的片段定义保存在旁边的 `.pvdstudio-clips.json`，最多 64 个范围，以完整源摘要绑定；定义不修改录制本体。导出有进度、取消与无覆盖发布。项目捕获不使用 SDK 片段 sidecar。
 
@@ -109,7 +117,7 @@ cargo fetch --locked
 
 Extract to a writable directory and run `pvd-desktop.exe`. The viewer does not require Rust or the PhysX SDK. Set **Bind** and **Port**, then choose **Listen**. Defaults are `0.0.0.0:5425`; the remote SDK must use the debugger's reachable IP and the same port.
 
-Enable permanent raw recording before listening when a complete `.pvdstream` is required. Receive storage and the rolling 8 GiB history are separate temporary stores. Pausing does not stop reception. A `.pvdcapture` preserves only the selected retained interval and its original frame numbers.
+Enable permanent raw recording before listening when a complete `.pvdstream` is required. Receive storage, persistent temporary history, and its bounded hot cache are separate. Pausing does not stop reception. Finished recordings remain available for viewing, saving, and managed cleanup. A `.pvdcapture` preserves the selected available interval and its original frame numbers.
 
 For disk history, **Save capture** saves all available frames as `.pvdcapture`, including while receiving or after an incomplete raw recording. Use **Raw stream → Save raw stream as** for a complete original SDK stream.
 

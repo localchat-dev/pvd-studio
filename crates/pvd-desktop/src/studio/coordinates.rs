@@ -11,7 +11,7 @@ impl Studio {
             &self.state,
             self.revision,
             changed,
-            self.selected,
+            self.room_scope.room().map(|room| room.id).or(self.selected),
             UpSettings {
                 mode: self.prefs.up_mode,
                 preset: self.prefs.up_axis,

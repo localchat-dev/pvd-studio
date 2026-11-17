@@ -29,6 +29,137 @@ fn exited(app: &App) -> bool {
     !app.world().resource::<Messages<AppExit>>().is_empty()
 }
 
+pub(super) struct DropProbe {
+    pub started: mpsc::Sender<std::thread::ThreadId>,
+    pub release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.started.send(std::thread::current().id()).unwrap();
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+    }
+}
+
+#[test]
+fn shutdown_retires_studio_off_ui_and_bounds_cleanup_only_wait() {
+    let mut studio = Studio::default();
+    let (started, dropping) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    studio.shutdown.drop_probe = Some(DropProbe {
+        started,
+        release: Mutex::new(released),
+    });
+    let now = Instant::now();
+    assert!(!studio.poll_shutdown_at(now));
+    let dropping_thread = dropping.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_ne!(dropping_thread, std::thread::current().id());
+    assert!(studio.recording.is_none());
+    assert!(studio.server.is_none());
+    assert!(studio.job.is_none());
+    assert!(!studio.poll_shutdown_at(now + Duration::from_secs(1)));
+    assert!(studio.shutdown_cleanup_pending());
+    assert!(studio.poll_shutdown_at(now + Duration::from_secs(2)));
+    assert_eq!(studio.background_jobs.active_count(), 1);
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while studio.background_jobs.active_count() != 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn shutdown_retires_hidden_egui_owners_on_the_cleanup_thread() {
+    let context = egui::Context::default();
+    let mut studio = Studio::default();
+    studio.initialized = true;
+    studio.profile_view_epoch = 7;
+    let _ = context.run(egui::RawInput::default(), |context| studio.poll(context));
+    let (started, dropping) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let id = egui::Id::new("hidden-shutdown-resource");
+    context.data_mut(|data| {
+        data.insert_temp(
+            id,
+            Arc::new(DropProbe {
+                started,
+                release: Mutex::new(released),
+            }),
+        );
+    });
+    assert!(!studio.poll_shutdown());
+    assert_eq!(studio.profile_view_epoch, 8);
+    assert!(
+        context
+            .data(|data| data.get_temp::<Arc<DropProbe>>(id))
+            .is_none()
+    );
+    let dropping_thread = dropping.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_ne!(dropping_thread, std::thread::current().id());
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while studio.background_jobs.active_count() != 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn cleanup_grace_never_abandons_active_work_even_with_cleanup_name() {
+    let mut studio = Studio::default();
+    let (release, wait) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker = studio
+        .background_jobs
+        .spawn("pvd-studio-release", cancelled.clone(), move || {
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        })
+        .unwrap();
+    let now = Instant::now();
+    assert!(!studio.poll_shutdown_at(now));
+    assert!(!studio.poll_shutdown_at(now + Duration::from_secs(60)));
+    assert!(cancelled.load(Ordering::Acquire));
+    assert!(!studio.shutdown_cleanup_pending());
+    release.send(()).unwrap();
+    worker.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !studio.poll_shutdown() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn cleanup_grace_waits_for_permanent_export_completion() {
+    let mut studio = Studio::default();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let permit = studio.export_workers.acquire(cancelled.clone()).unwrap();
+    let now = Instant::now();
+    assert!(!studio.poll_shutdown_at(now));
+    assert!(!studio.poll_shutdown_at(now + Duration::from_secs(60)));
+    assert!(cancelled.load(Ordering::Acquire));
+    assert!(!studio.shutdown_cleanup_pending());
+    assert!(
+        studio
+            .shutdown_phases()
+            .contains(&studio.prefs.language.text(
+                "Finishing recording export cancellation",
+                "正在完成录制导出的取消",
+            ))
+    );
+    drop(permit);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !studio.poll_shutdown() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}
+
 #[test]
 fn window_exit_waits_for_retired_background_resources_and_rejects_new_work() {
     struct Released(Arc<AtomicBool>);
@@ -151,15 +282,20 @@ fn real_tcp_process_exit_releases_history_and_receive_files() {
             "exit probe {scenario} failed; inspect {}",
             directory.display()
         );
-        let remaining = file_totals(&directory.join("cache"));
+        let cache = directory.join("cache");
+        let deferred = file_totals(&cache);
+        if deferred != (0, 0) {
+            pvd_core::live::cleanup_stale_history(&cache).unwrap();
+        }
+        let remaining = file_totals(&cache);
         assert_eq!(
             remaining,
             (0, 0),
-            "{scenario} left cache files after process exit"
+            "{scenario} left cache files after next-start cleanup"
         );
         let child: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join("child.json")).unwrap()).unwrap();
-        cases.push(serde_json::json!({ "scenario": scenario, "remaining_files": remaining.0, "remaining_bytes": remaining.1, "child": child }));
+        cases.push(serde_json::json!({ "scenario": scenario, "deferred_files": deferred.0, "deferred_bytes": deferred.1, "remaining_files": remaining.0, "remaining_bytes": remaining.1, "child": child }));
     }
     std::fs::write(output.join("summary.json"), serde_json::to_vec_pretty(&serde_json::json!({ "passed": true, "cases": cases, "scope": "Natural hidden process exit through the production window-close system; SDK raw bytes are replayed over localhost TCP, without a GPU or native window." })).unwrap()).unwrap();
 }
@@ -167,6 +303,7 @@ fn real_tcp_process_exit_releases_history_and_receive_files() {
 #[test]
 #[ignore = "Internal child entry point for the process-exit probe"]
 fn process_exit_child() {
+    pvd_core::live::enable_background_stale_history_cleanup();
     let scenario = std::env::var("PVD_EXIT_CHILD_SCENARIO").expect("child scenario is required");
     let output = PathBuf::from(std::env::var_os("PVD_EXIT_CHILD_OUTPUT").unwrap());
     let input = PathBuf::from(std::env::var_os("PVD_EXIT_PROBE_CAPTURE").unwrap());
@@ -176,6 +313,7 @@ fn process_exit_child() {
     studio.persist_layout = false;
     studio.initialized = true;
     studio.prefs.history_directory = cache.to_string_lossy().into_owned();
+    pvd_core::live::queue_stale_history_cleanup(&cache);
     let started = Instant::now();
     let deadline = started + Duration::from_secs(60);
     if scenario == "load" {
@@ -225,7 +363,10 @@ fn process_exit_child() {
         let _ = context.run(egui::RawInput::default(), |context| studio.poll(context));
         let ready = match scenario.as_str() {
             "listener" => true,
-            "load" => file_totals(&cache).1 > 4096 && studio.job.is_some(),
+            "load" => studio
+                .job
+                .as_ref()
+                .is_some_and(|job| job.progress.load(Ordering::Relaxed) > 4096),
             "seek" => studio.count() > studio.first_frame() + 30,
             "backlog" | "retired" => {
                 file_totals(&cache).1 > 4096
@@ -241,7 +382,19 @@ fn process_exit_child() {
         }
         assert!(
             Instant::now() < deadline,
-            "scenario {scenario} did not become ready"
+            "scenario {scenario} did not become ready: loaded_bytes={:?}, frames={}, cache={:?}, jobs={:?}, notices={:?}",
+            studio
+                .job
+                .as_ref()
+                .map(|job| job.progress.load(Ordering::Relaxed)),
+            studio.count(),
+            file_totals(&cache),
+            studio.background_jobs.active_names(),
+            studio
+                .notices
+                .iter()
+                .map(|notice| notice.text(Language::English))
+                .collect::<Vec<_>>()
         );
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -257,10 +410,16 @@ fn process_exit_child() {
         assert!(studio.seeking.is_some());
     } else if scenario == "retired" {
         studio.open(input, context.clone());
-        assert!(studio.server.is_none());
-        assert!(studio.job.is_some());
+        assert!(studio.server.is_some());
+        assert!(studio.pending_open_after_capture.is_some());
+        assert!(studio.close_after_capture);
+        assert!(studio.job.is_none());
     }
     let active_jobs = studio.background_jobs.active_count();
+    let loaded_bytes = studio
+        .job
+        .as_ref()
+        .map_or(0, |job| job.progress.load(Ordering::Relaxed));
     let closing = Instant::now();
     let mut app = close_app(studio);
     let mut pending_updates = 0;
@@ -277,12 +436,21 @@ fn process_exit_child() {
         std::thread::sleep(Duration::from_millis(1));
     }
     let shutdown_seconds = closing.elapsed().as_secs_f64();
+    let pending_history_cleanups = pvd_core::live::pending_history_cleanups();
+    let pending_background_jobs = app
+        .world()
+        .resource::<Studio>()
+        .background_jobs
+        .active_count();
     drop(app);
     std::fs::write(output.join("child.json"), serde_json::to_vec_pretty(&serde_json::json!({
         "decoded_before_close": decoded, "queued_bytes_before_close": queued,
+        "loaded_bytes_before_close": loaded_bytes,
         "cache_files_before_close": before.0, "cache_bytes_before_close": before.1,
         "active_jobs_before_close": active_jobs, "pending_shutdown_updates": pending_updates,
         "shutdown_seconds": shutdown_seconds, "elapsed_seconds": started.elapsed().as_secs_f64(),
+        "pending_history_cleanups_at_exit": pending_history_cleanups,
+        "pending_background_jobs_at_exit": pending_background_jobs,
         "exit_path": "production handle_window_close -> poll_shutdown -> AppExit -> drop App -> immediate test return"
     })).unwrap()).unwrap();
 }

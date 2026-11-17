@@ -276,6 +276,7 @@ fn source_with_replaced_backing(
         file: File::open(path).unwrap(),
         path: path.to_owned(),
         bytes: original.len() as u64,
+        owner: std::sync::Mutex::new(None),
     });
     let resources = Resources::from_capture(
         backing,

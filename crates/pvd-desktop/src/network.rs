@@ -305,6 +305,7 @@ struct LiveClient {
     raw_attempted: bool,
     received_bytes: u64,
     published_frames: usize,
+    published_rooms_revision: u64,
     selection_revision: u64,
     last_publish: Instant,
     profile: Option<Arc<LiveProfile>>,
@@ -347,10 +348,16 @@ impl WorkerOutput {
         }
     }
     fn publish(&self, client: &mut LiveClient) {
+        if self.cancel.load(Ordering::Acquire) {
+            return;
+        }
         let Some(live) = client.live.as_mut() else {
             return;
         };
-        if live.frame_count() == 0 || live.frame_count() == client.published_frames {
+        let rooms_revision = live.rooms().map_or(0, |rooms| rooms.revision());
+        if live.frame_count() == client.published_frames
+            && rooms_revision == client.published_rooms_revision
+        {
             return;
         }
         let selection = self.frame_source.lock().unwrap();
@@ -374,6 +381,7 @@ impl WorkerOutput {
             )
         });
         client.published_frames = live.frame_count();
+        client.published_rooms_revision = rooms_revision;
         client.last_publish = Instant::now();
         let mut slot = self.snapshot.lock().unwrap();
         if let Some(previous) = slot
@@ -409,6 +417,7 @@ impl WorkerOutput {
                 live.set_frame_source(selection.source);
                 live.refresh_frame_source();
                 client.selection_revision = selection.revision;
+                client.published_frames = usize::MAX;
             }
         }
     }
@@ -419,6 +428,9 @@ impl WorkerOutput {
         )));
     }
     fn complete(&self, mut client: LiveClient, clean_disconnect: bool) {
+        if self.cancel.load(Ordering::Acquire) {
+            return;
+        }
         if client.received_bytes == 0 && client.failure.is_none() {
             if let Some(profile) = &client.profile {
                 profile.finish(false);
@@ -436,6 +448,9 @@ impl WorkerOutput {
                 .ok_or_else(|| "live decoder unavailable".to_string())
                 .and_then(|live| live.finish().map_err(|e| e.to_string())),
         };
+        if self.cancel.load(Ordering::Acquire) {
+            return;
+        }
         let capture = client.raw.take().map(|raw| {
             let (path, error) = raw.finish(clean_disconnect && result.is_ok());
             if let Some(error) = error {
@@ -573,7 +588,7 @@ impl NetworkSession {
         };
         let shutdown = cancel.clone();
         let stop_receiver = receive_control.clone();
-        let worker = jobs.spawn_with_cancel(
+        let worker = jobs.spawn_with_cancel_and_control(
             "pvd-live-indexer",
             move || {
                 shutdown.store(true, Ordering::Release);
@@ -581,9 +596,9 @@ impl NetworkSession {
                     control.request_stop();
                 }
             },
-            move || {
+            move |job| {
                 let _permit = permit;
-                let mut server = server;
+                let server = server;
                 let output = output;
                 let interval =
                     Duration::from_secs_f64(1.0 / f64::from(options.refresh_hz.clamp(1, 120)));
@@ -592,7 +607,7 @@ impl NetworkSession {
                 while !output.cancel.load(Ordering::Relaxed) {
                     if output.stop.load(Ordering::Relaxed) && !stopping {
                         stopping = true;
-                        server.stop();
+                        server.control().request_finish();
                     }
                     if let Some(client) = active.as_mut()
                         && client.last_publish.elapsed() >= interval
@@ -604,6 +619,9 @@ impl NetworkSession {
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(_) => break,
                     };
+                    if output.cancel.load(Ordering::Acquire) {
+                        break;
+                    }
                     match event {
                         ReceiverEvent::Listening(address) => {
                             output.emit(LiveEvent::Status(Message::new(
@@ -613,8 +631,13 @@ impl NetworkSession {
                         }
                         ReceiverEvent::Connected { session, peer } => {
                             let (mut live, failure) =
-                                match LiveRecording::with_history(options.history.clone()) {
-                                    Ok(live) => (Some(live), None),
+                                match LiveRecording::with_persistent_history(options.history.clone()) {
+                                    Ok(mut live) => {
+                                        // Closing a recording drains committed input; only app exit
+                                        // or dropping the session interrupts an active feed/seal.
+                                        live.set_cancellation(output.cancel.clone());
+                                        (Some(live), None)
+                                    }
                                     Err(error) => (None, Some(error.to_string())),
                                 };
                             let profile = options.live_profile.then(|| {
@@ -671,6 +694,7 @@ impl NetworkSession {
                                 raw_attempted: false,
                                 received_bytes: 0,
                                 published_frames: 0,
+                                published_rooms_revision: 0,
                                 selection_revision: 0,
                                 last_publish: Instant::now() - interval,
                                 profile,
@@ -724,6 +748,9 @@ impl NetworkSession {
                             if let Some(live) = client.live.as_mut()
                                 && let Err(error) = live.feed(&bytes)
                             {
+                                if output.cancel.load(Ordering::Acquire) {
+                                    break;
+                                }
                                 client.failure = Some(error.to_string());
                                 if let Some(profile) = &client.profile {
                                     profile.capture_failed.store(true, Ordering::Relaxed);
@@ -789,11 +816,23 @@ impl NetworkSession {
                         }
                     }
                 }
-                if let Some(client) = active.take()
-                    && !output.cancel.load(Ordering::Relaxed)
+                if !output.cancel.load(Ordering::Acquire)
+                    && let Some(client) = active.take()
                 {
                     output.complete(client, false);
                 }
+                let control = server.control();
+                control.request_stop();
+                while !control.intake_quiesced() {
+                    std::thread::park_timeout(Duration::from_millis(1));
+                }
+                if let Some(client) = active.as_mut() {
+                    // Raw captures are user-visible files: finish their buffered
+                    // writes before classifying the remaining owners as cleanup.
+                    drop(client.raw.take());
+                }
+                job.begin_cleanup("pvd-live-cleanup");
+                drop(active);
                 drop(server);
                 output.emit(LiveEvent::Stopped);
             },
@@ -871,7 +910,7 @@ impl NetworkSession {
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(control) = &self.receive_control {
-            control.request_stop();
+            control.request_finish();
         }
     }
     pub fn is_stopping(&self) -> bool {
@@ -890,7 +929,7 @@ impl NetworkSession {
 }
 impl Drop for NetworkSession {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Release);
         if let Some(control) = &self.receive_control {
             control.request_stop();
         }
@@ -907,6 +946,7 @@ impl Drop for NetworkSession {
 #[cfg(test)]
 mod tests {
     mod frame_sources;
+    mod shutdown;
     use super::*;
     use std::{io::Write, net::TcpStream};
 

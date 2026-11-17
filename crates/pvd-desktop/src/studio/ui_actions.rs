@@ -8,6 +8,8 @@ const MAX_PATH_BYTES: usize = 128 * 1024;
 pub enum UiAction {
     Open(PathBuf),
     Close,
+    SelectTemporary(u64),
+    DeleteTemporary(u64),
     PauseAndSeek(usize),
     Locate(usize, DisplayReason),
     Pause,
@@ -16,6 +18,9 @@ pub enum UiAction {
     ToggleReverse,
     ReturnLive,
     FrameSource(pvd_core::frame_sources::FrameSourceKey),
+    Room(Option<pvd_core::frame_sources::FrameObject>),
+    RoomListExpanded(bool),
+    RoomListDestroyed(bool),
     StartListener,
     StopListener,
     ResolveClip { discard: bool },
@@ -91,6 +96,8 @@ impl Studio {
             match request.action {
                 UiAction::Open(path) => self.open(path, context.clone()),
                 UiAction::Close => self.close(),
+                UiAction::SelectTemporary(id) => self.select_temporary_recording(id),
+                UiAction::DeleteTemporary(id) => self.delete_temporary_recording(id),
                 UiAction::PauseAndSeek(frame) => self.seek_paused(frame, DisplayReason::Frame),
                 UiAction::Locate(frame, reason) => self.seek_paused(frame, reason),
                 UiAction::Pause => self.pause_display(),
@@ -99,6 +106,9 @@ impl Studio {
                 UiAction::ToggleReverse => self.toggle_reverse(),
                 UiAction::ReturnLive => self.return_to_live(),
                 UiAction::FrameSource(source) => self.select_frame_source(source),
+                UiAction::Room(room) => self.select_room(room),
+                UiAction::RoomListExpanded(expanded) => self.room_view.expanded = expanded,
+                UiAction::RoomListDestroyed(show) => self.room_view.show_destroyed = show,
                 UiAction::StartListener => self.start_listener(context.clone()),
                 UiAction::StopListener => self.stop_listener(),
                 UiAction::ResolveClip { discard } => {

@@ -178,6 +178,16 @@ impl ReplayCursor {
         operation: impl FnOnce(&mut Cursor, &DiskRecording, &SegmentView, &mut F) -> Result<T, Error>,
     ) -> Result<T, Error> {
         check_replay_cancelled(cancelled)?;
+        let _transition = recording
+            .disk
+            .as_ref()
+            .map(DiskRecording::history_guard)
+            .transpose()?;
+        let archived = match &recording.disk {
+            Some(disk) => disk.archived(frame, cancelled)?,
+            None => None,
+        };
+        let recording = archived.as_deref().unwrap_or(recording);
         let disk = recording
             .disk
             .as_ref()
