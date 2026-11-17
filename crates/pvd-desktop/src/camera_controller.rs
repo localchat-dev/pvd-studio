@@ -7,8 +7,8 @@ use crate::{i18n::Language, scene::Viewport};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CameraMode {
-    #[default]
     Orbit,
+    #[default]
     Fly,
 }
 
@@ -786,23 +786,25 @@ mod tests {
     }
 
     #[test]
-    fn camera_preferences_preserve_legacy_defaults_and_selected_mode() {
+    fn camera_preferences_default_to_fly_and_preserve_selected_mode() {
         let mut stored = serde_json::to_value(crate::studio::Preferences::default()).unwrap();
         stored.as_object_mut().unwrap().remove("camera_mode");
         stored.as_object_mut().unwrap().remove("fly_speed");
         stored.as_object_mut().unwrap().remove("show_viewport_help");
         let mut prefs: crate::studio::Preferences = serde_json::from_value(stored).unwrap();
-        assert_eq!(prefs.camera_mode, CameraMode::Orbit);
+        assert_eq!(prefs.camera_mode, CameraMode::Fly);
         assert_eq!(prefs.fly_speed, 10.0);
         assert!(prefs.show_viewport_help);
-        prefs.camera_mode = CameraMode::Fly;
         prefs.fly_speed = 123.5;
         prefs.show_viewport_help = false;
-        let restored: crate::studio::Preferences =
-            serde_json::from_value(serde_json::to_value(prefs).unwrap()).unwrap();
-        assert_eq!(restored.camera_mode, CameraMode::Fly);
-        assert_eq!(restored.fly_speed, 123.5);
-        assert!(!restored.show_viewport_help);
+        for mode in [CameraMode::Orbit, CameraMode::Fly] {
+            prefs.camera_mode = mode;
+            let restored: crate::studio::Preferences =
+                serde_json::from_value(serde_json::to_value(&prefs).unwrap()).unwrap();
+            assert_eq!(restored.camera_mode, mode);
+            assert_eq!(restored.fly_speed, 123.5);
+            assert!(!restored.show_viewport_help);
+        }
         assert_ne!(
             CameraMode::Fly.help(Language::Chinese),
             CameraMode::Fly.help(Language::English)
