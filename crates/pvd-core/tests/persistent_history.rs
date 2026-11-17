@@ -162,7 +162,15 @@ fn frame_bytes(frame: usize) -> Vec<u8> {
     if frame % 3 == 1 {
         memory.extend([3, 0, 88]);
     } else {
-        memory.extend([2, 0, if frame % 3 == 0 { 64 } else { 96 }, 1, 2, 20, 88]);
+        memory.extend([
+            2,
+            0,
+            if frame.is_multiple_of(3) { 64 } else { 96 },
+            1,
+            2,
+            20,
+            88,
+        ]);
     }
     events.push(set(7, 10, 11, memory.len() as u32, &memory));
     let mut end = vec![19];

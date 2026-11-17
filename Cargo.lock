@@ -3172,7 +3172,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "pvd-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "ctrlc",
@@ -3184,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "pvd-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "pvd-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bevy",
  "bevy_egui",
@@ -3218,11 +3218,11 @@ dependencies = [
 
 [[package]]
 name = "pvd-protocol"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "pvd-transport"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "pxfm"

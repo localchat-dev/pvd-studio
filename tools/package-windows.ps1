@@ -1,6 +1,7 @@
 param(
     [switch]$SkipBuild,
     [switch]$IncludeSource,
+    [switch]$SkipCaptureSamples,
     [ValidateSet('zip', '7z')]
     [string]$ArchiveFormat = 'zip',
     [string]$SevenZipPath,
@@ -116,18 +117,50 @@ try {
             Copy-Item -LiteralPath (Join-Path $dependencyPatch 'PVD-STUDIO-PATCH.md') -Destination $dependencyNotices
         }
     }
-    $sample = Join-Path $projectRoot 'captures\physx-3.4.pvdstream'
-    if (Test-Path -LiteralPath $sample) {
-        $samples = Join-Path $distribution 'samples'
-        New-Item -ItemType Directory -Path $samples | Out-Null
-        Copy-Item -LiteralPath $sample -Destination $samples
-    }
-    foreach ($extension in @('pvdstream', 'json')) {
-        $cctSample = Join-Path $projectRoot "captures\physx-3.4-cct.$extension"
-        if (Test-Path -LiteralPath $cctSample) {
+    if (-not $SkipCaptureSamples) {
+        $sample = Join-Path $projectRoot 'captures\physx-3.4.pvdstream'
+        if (Test-Path -LiteralPath $sample) {
+            $samples = Join-Path $distribution 'samples'
+            New-Item -ItemType Directory -Path $samples | Out-Null
+            Copy-Item -LiteralPath $sample -Destination $samples
+        }
+        foreach ($extension in @('pvdstream', 'json')) {
+            $cctSample = Join-Path $projectRoot "captures\physx-3.4-cct.$extension"
+            if (Test-Path -LiteralPath $cctSample) {
+                $samples = Join-Path $distribution 'samples'
+                New-Item -ItemType Directory -Path $samples -Force | Out-Null
+                Copy-Item -LiteralPath $cctSample -Destination $samples
+            }
+        }
+        foreach ($extension in @('pvdstream', 'json')) {
+            $originSample = Join-Path $projectRoot "captures\physx-3.4-origin-shift.$extension"
+            if (Test-Path -LiteralPath $originSample) {
+                $samples = Join-Path $distribution 'samples'
+                New-Item -ItemType Directory -Path $samples -Force | Out-Null
+                Copy-Item -LiteralPath $originSample -Destination $samples
+            }
+        }
+        $nativeSample = Join-Path $projectRoot 'captures\native\rich-paired-native.pxd2'
+        $cameraSamples = Join-Path $projectRoot 'captures\cameras'
+        foreach ($name in @('cameras.pvdstream', 'truth.json')) {
+            $cameraSample = Join-Path $cameraSamples $name
+            if (Test-Path -LiteralPath $cameraSample) {
+                $samples = Join-Path $distribution 'samples'
+                New-Item -ItemType Directory -Path $samples -Force | Out-Null
+                $sampleName = if ($name -eq 'truth.json') { 'physx-3.4-cameras.json' } else { 'physx-3.4-cameras.pvdstream' }
+                Copy-Item -LiteralPath $cameraSample -Destination (Join-Path $samples $sampleName)
+            }
+        }
+        if (Test-Path -LiteralPath $nativeSample) {
             $samples = Join-Path $distribution 'samples'
             New-Item -ItemType Directory -Path $samples -Force | Out-Null
-            Copy-Item -LiteralPath $cctSample -Destination $samples
+            Copy-Item -LiteralPath $nativeSample -Destination (Join-Path $samples 'physx-3.4-pvd3-rich.pxd2')
+        }
+        $nativeLimits = Join-Path $projectRoot 'captures\native\limits\joint-limits-live-native.pxd2'
+        if (Test-Path -LiteralPath $nativeLimits) {
+            $samples = Join-Path $distribution 'samples'
+            New-Item -ItemType Directory -Path $samples -Force | Out-Null
+            Copy-Item -LiteralPath $nativeLimits -Destination (Join-Path $samples 'physx-3.4-pvd3-joint-limits.pxd2')
         }
     }
     $navmeshFixtures = Join-Path $projectRoot 'crates/pvd-core/src/navmesh/fixtures'
@@ -138,36 +171,6 @@ try {
             New-Item -ItemType Directory -Path $samples -Force | Out-Null
             Copy-Item -LiteralPath $navmeshSample -Destination $samples
         }
-    }
-    foreach ($extension in @('pvdstream', 'json')) {
-        $originSample = Join-Path $projectRoot "captures\physx-3.4-origin-shift.$extension"
-        if (Test-Path -LiteralPath $originSample) {
-            $samples = Join-Path $distribution 'samples'
-            New-Item -ItemType Directory -Path $samples -Force | Out-Null
-            Copy-Item -LiteralPath $originSample -Destination $samples
-        }
-    }
-    $nativeSample = Join-Path $projectRoot 'captures\native\rich-paired-native.pxd2'
-    $cameraSamples = Join-Path $projectRoot 'captures\cameras'
-    foreach ($name in @('cameras.pvdstream', 'truth.json')) {
-        $cameraSample = Join-Path $cameraSamples $name
-        if (Test-Path -LiteralPath $cameraSample) {
-            $samples = Join-Path $distribution 'samples'
-            New-Item -ItemType Directory -Path $samples -Force | Out-Null
-            $sampleName = if ($name -eq 'truth.json') { 'physx-3.4-cameras.json' } else { 'physx-3.4-cameras.pvdstream' }
-            Copy-Item -LiteralPath $cameraSample -Destination (Join-Path $samples $sampleName)
-        }
-    }
-    if (Test-Path -LiteralPath $nativeSample) {
-        $samples = Join-Path $distribution 'samples'
-        New-Item -ItemType Directory -Path $samples -Force | Out-Null
-        Copy-Item -LiteralPath $nativeSample -Destination (Join-Path $samples 'physx-3.4-pvd3-rich.pxd2')
-    }
-    $nativeLimits = Join-Path $projectRoot 'captures\native\limits\joint-limits-live-native.pxd2'
-    if (Test-Path -LiteralPath $nativeLimits) {
-        $samples = Join-Path $distribution 'samples'
-        New-Item -ItemType Directory -Path $samples -Force | Out-Null
-        Copy-Item -LiteralPath $nativeLimits -Destination (Join-Path $samples 'physx-3.4-pvd3-joint-limits.pxd2')
     }
     if ($IncludeSource) {
         $source = Join-Path $distribution 'source'

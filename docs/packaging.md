@@ -15,6 +15,7 @@
 | 参数 | 用途 |
 | --- | --- |
 | `-IncludeSource` | 附带源码；省略时仍收集文档、许可证和存在的精选样例 |
+| `-SkipCaptureSamples` | 不附带本地 PhysX/PVD3 捕获及配对真值 JSON，保留两份构造 NavMesh 验证文件 |
 | `-ArchiveFormat zip` | 生成 ZIP，也是脚本默认格式 |
 | `-SevenZipPath` | 指定已有 `7z.exe` 的路径 |
 | `-VCRedistPath` | 附带本机已有的微软 VC++ x64 运行库安装器，原样复制到 `prerequisites/`，不执行安装或联网下载 |
@@ -29,6 +30,8 @@
 ## 内容
 
 运行包包含两项 EXE、诊断启动脚本、说明、项目文档、补丁许可证、文件清单和空历史目录。`samples/` 仅包含脚本列明且实际存在的输入：SDK 样例位于 `captures/`，具名相机位于 `captures/cameras/`，原版配对文件位于 `captures/native/`。准备方法见[SDK 生产器](../tools/physx-sample/README.md)、[相机生产器](../tools/physx-cameras/README.md)和[原版验证](native-validation.md)。
+
+发布不含本地捕获的分发包时，使用 `-IncludeSource -ArchiveFormat 7z -SkipCaptureSamples`。此选项同时排除捕获对应的真值 JSON；默认本地打包仍收集上述现存样例。
 
 源码包收集 `crates/`、`vendor/`、`test-support/`、`tools/`、公共文档与根配置。编译目录、捕获、日志、符号、缓存、`docs/local/` 和 `docs/CONTINUE-PVD-STUDIO.md` 不进入源码包。过滤规则由脚本统一维护。
 
