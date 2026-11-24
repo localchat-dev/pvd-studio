@@ -185,7 +185,7 @@ try {
                 Copy-Item -LiteralPath $file.FullName -Destination $destination
             }
         }
-        foreach ($name in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'README.md', 'AGENTS.md', '.gitignore', '.gitattributes')) {
+        foreach ($name in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'README.md', 'README.zh-CN.md', 'AGENTS.md', '.gitignore', '.gitattributes')) {
             Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $source
         }
     }

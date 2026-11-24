@@ -36,4 +36,4 @@ RepX 支持已验证的刚体、六类官方关节、Articulation、混合 Aggre
 
 开发优先级为原版文件工作流，其次是数据与分析语义对齐、完整交互和规模验收。具体任务以路线图为准。
 
-源码仓库不包含预编译程序或捕获文件。运行方式见[项目说明](../README.md#构建与运行)，测试输入按[SDK 生产器说明](../tools/physx-sample/README.md)生成。
+源码仓库不包含预编译程序或捕获文件。运行方式见[项目说明](../README.zh-CN.md#构建与运行)，测试输入按[SDK 生产器说明](../tools/physx-sample/README.md)生成。

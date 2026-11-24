@@ -1,51 +1,55 @@
 # pvd-studio
 
-用于 PhysX 数据捕获、回放和场景检查的 Windows 桌面工具，基于 Rust、Bevy 和 egui，参考 NVIDIA PhysX Visual Debugger 3（PVD3）的功能与工作流程。
+**English** | [简体中文](README.zh-CN.md)
 
-主要验证 PhysX 3.4.2，部分支持 PhysX 4.1.2。原版录制格式和功能兼容范围见[兼容矩阵](docs/compatibility.md)。
+Windows desktop tool for PhysX data capture, playback, and scene inspection, built on Rust, Bevy, and egui, following the features and workflow of NVIDIA PhysX Visual Debugger 3 (PVD3).
 
-## 功能
+Primary validation target is PhysX 3.4.2, with partial PhysX 4.1.2 support. Recording formats and the supported feature range are listed in the [compatibility matrix](docs/compatibility.md).
 
-- TCP 接收、原始录制和磁盘滚动历史。
-- 实时跟随、暂停、逐帧、随机定位、正放和倒放。
-- 对象树、属性、数组与引用检查，以及场景选择联动。
-- 刚体、网格、地形、关节、接触和场景查询显示；CPU Cloth 与粒子显示有独立范围限制。
-- 线程性能、事件曲线、内存和错误分析，支持 CSV 导出。
-- SDK 流裁剪、项目捕获保存与重开、受限的原版容器保存及 PhysX 3.4.2 RepX 导出。
+> Documents linked below are currently written in Chinese.
 
-显示状态来自捕获，查看器不重新运行物理模拟。PVD3 数据库 v1 支持部分布局的读取、整份保存与区间裁剪；更广的前史恢复与原版应用互验尚未完成，具体边界见[原版容器保存与裁剪](docs/native-export.md)。
+## Features
 
-## 构建与运行
+- TCP receive, raw recording, and rolling on-disk history.
+- Live follow, pause, frame stepping, random seek, forward and reverse playback.
+- Object tree, property, array, and reference inspection, with scene selection linkage.
+- Rigid body, mesh, heightfield, joint, contact, and scene query display; CPU cloth and particle display have separate scope limits.
+- Thread performance, event curves, memory, and error analysis, with CSV export.
+- SDK stream trimming, project capture save and reopen, limited original container saving, and PhysX 3.4.2 RepX export.
 
-需要 Rust 和 Windows MSVC C++ 工具链。Rust 版本由 `rust-toolchain.toml` 指定，依赖由 `Cargo.lock` 固定；运行查看器不需要安装 PhysX SDK。
+Display state comes from captures; the viewer does not re-run the physics simulation. PVD3 database v1 supports reading a subset of layouts, whole-file saving, and range trimming; broader reconstruction of earlier state and round-trip verification against the original application are not yet complete. Details are in [Saving and trimming original containers](docs/native-export.md).
+
+## Build and run
+
+Rust and the Windows MSVC C++ toolchain are required. The Rust version is pinned by `rust-toolchain.toml` and dependencies by `Cargo.lock`; running the viewer does not require the PhysX SDK.
 
 ```powershell
 cargo run --locked -p pvd-desktop
 cargo run --locked -p pvd-desktop -- --language en
 ```
 
-程序启动后可打开捕获文件，或点击“开始监听”。默认绑定 `0.0.0.0:5425`；SDK 端使用调试机可达的实际 IP 和相同端口。简体中文、英文及连接设置可在程序中切换。
+After startup, open a capture file or click "Listen". The default bind is `0.0.0.0:5425`; on the SDK side use the actual IP reachable from the debug machine and the same port. Simplified Chinese, English, and connection settings can be switched in the program.
 
-捕获和 SDK 不随源码提供。测试输入可按 [SDK 生产器说明](tools/physx-sample/README.md)生成；桌面操作见 [Windows 使用说明](docs/distribution.md)。
+Captures and the SDK are not distributed with the source. Test inputs can be generated following the [SDK producer instructions](tools/physx-sample/README.md); desktop operation is covered in the [Windows usage notes](docs/distribution.md).
 
-Windows Unity 编辑器的 Scene 视图也可以接收和回放会话，安装与缓存位置见 [Unity 插件](docs/unity.md)。
+The Scene view of the Windows Unity Editor can also receive and play back sessions; install and cache locations are described with the [Unity plugin](docs/unity.md).
 
-## 文件与存储
+## Files and storage
 
-| 数据 | 默认位置与用途 |
+| Data | Default location and purpose |
 | --- | --- |
-| 回放历史 | 当前工作目录下的 `pvd-cache/history/`，默认滚动上限 8 GiB，可配置 |
-| 接收缓存 | 历史目录下的 `receive/`，与回放历史独立，受可用空间保护 |
-| 永久录制 | `captures/`；完整 SDK 原始流需在监听前启用自动录制 |
-| 项目捕获 | Unity 和桌面将保留历史保存为一个 `.pvdcapture`。长录制在文件内[自动分段](docs/retained-capture.md#分段导入与导出)，可在桌面连续回放 |
+| Playback history | `pvd-cache/history/` under the current working directory; default rolling cap 8 GiB, configurable |
+| Receive cache | `receive/` under the history directory; independent of playback history and guarded by available space |
+| Permanent recording | `captures/`; a complete SDK raw stream requires enabling automatic recording before listening |
+| Project capture | Unity and the desktop app save retained history as a single `.pvdcapture`. Long recordings are [segmented automatically](docs/retained-capture.md#分段导入与导出) inside the file and play back continuously on the desktop |
 
-暂停不停止接收和历史写入。临时历史会淘汰旧帧，不能替代永久录制。保存默认位于当前工作目录的 `captures/`，也可指定其他位置；已有文件不覆盖。
+Pausing does not stop receiving or history writes. Temporary history evicts old frames and cannot replace permanent recording. Saves go to `captures/` in the current working directory by default, and another location can be chosen; existing files are not overwritten.
 
-SDK communication stream、PVD3 数据库和项目捕获是不同格式，不能通过修改扩展名互换。原版数据库按需读取事件并使用磁盘历史；保存与裁剪有独立上限，详情见兼容矩阵。
+The SDK communication stream, PVD3 databases, and project captures are distinct formats and cannot be exchanged by changing the file extension. Original databases read events on demand and use on-disk history; saving and trimming have separate limits, as detailed in the compatibility matrix.
 
-## 命令行
+## Command line
 
-生成输入后，可在仓库根目录执行：
+After generating inputs, run from the repository root:
 
 ```powershell
 cargo run --locked -p pvd-cli -- inspect captures/physx-3.4.pvdstream
@@ -53,9 +57,9 @@ cargo run --locked -p pvd-cli -- verify captures/physx-3.4.pvdstream
 cargo run --locked -p pvd-cli -- listen 0.0.0.0:5425 captures/tcp 60
 ```
 
-其他查询、裁剪和导出命令见 [Windows 使用说明](docs/distribution.md)。
+Other query, trim, and export commands are listed in the [Windows usage notes](docs/distribution.md).
 
-## 开发
+## Development
 
 ```powershell
 cargo fmt --all --check
@@ -63,14 +67,14 @@ cargo test --locked -p pvd-protocol -p pvd-core -p pvd-transport -p pvd-cli
 cargo test --locked -p pvd-desktop -- --test-threads=1
 ```
 
-真实 SDK 专项需要额外生成输入并显式执行 ignored 测试，见[验证说明](docs/validation.md)。Windows 分发包使用 `tools/package-windows.ps1`，构建和压缩选项见[打包规范](docs/packaging.md)。
+Real SDK checks require generating inputs and explicitly running the ignored tests, see the [validation notes](docs/validation.md). Windows distribution packages are produced with `tools/package-windows.ps1`; build and compression options are in the [packaging spec](docs/packaging.md).
 
-| 文档 | 内容 |
+| Document | Content |
 | --- | --- |
-| [使用说明](docs/distribution.md) | 连接、录制、回放与分析 |
-| [文档索引](docs/README.md) | 设计与实现专题 |
-| [架构](docs/architecture.md) | 模块职责、数据路径与资源边界 |
-| [功能清单](docs/manual-checklist.md) | 实现与验收状态 |
-| [路线图](docs/roadmap.md) | 未完成任务与完成条件 |
+| [Usage notes](docs/distribution.md) | Connection, recording, playback, and analysis |
+| [Documentation index](docs/README.md) | Design and implementation topics |
+| [Architecture](docs/architecture.md) | Module responsibilities, data paths, and resource boundaries |
+| [Feature checklist](docs/manual-checklist.md) | Implementation and acceptance status |
+| [Roadmap](docs/roadmap.md) | Remaining work and completion criteria |
 
-仓库保留源码、测试、工具、文档和依赖补丁许可证；构建产物、SDK、捕获及运行缓存由 `.gitignore` 排除。
+The repository keeps source, tests, tools, docs, and dependency patch licenses; build artifacts, the SDK, captures, and runtime caches are excluded by `.gitignore`.
