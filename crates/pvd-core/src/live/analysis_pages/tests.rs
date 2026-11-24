@@ -560,17 +560,20 @@ fn paged_frame_preparation_reclaims_cached_roots_and_rolls_back_failed_plans() {
         let blocked = domain.reserve(before.limit - before.logical_used).unwrap();
         let state = scene(0);
         let patch = SceneUpdate::capture(&state, &[71].into(), false);
-        history.append_shared(
-            &FrameInfo {
-                index: 0,
-                timestamp: 0,
-                scene_id: 0,
-            },
-            &state,
-            &patch,
-            &analysis,
-            vec![AnalysisInput::Zone(3, "Physics".into())],
-        );
+        history
+            .append_shared(
+                &FrameInfo {
+                    index: 0,
+                    timestamp: 0,
+                    scene_id: 0,
+                },
+                &state,
+                &patch,
+                &analysis,
+                vec![AnalysisInput::Zone(3, "Physics".into())],
+                None,
+            )
+            .unwrap();
         assert_eq!(postcard::to_stdvec(&analysis).unwrap(), old_wire);
         assert_eq!(
             history.warning.is_none(),

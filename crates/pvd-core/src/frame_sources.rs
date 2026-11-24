@@ -413,7 +413,9 @@ impl FrameDirectory {
             return Err(error("frame source boundaries must be contiguous"));
         }
         if retained && self.retained_frames >= self.limits.frames {
-            return Err(error("frame source frame limit exceeded"));
+            return Err(crate::CapacityLimit::exceeded(
+                "frame source frame limit exceeded",
+            ));
         }
         self.check_source_kind(binding.source)?;
         let existing = self.sources.get(&binding.source);
@@ -421,7 +423,9 @@ impl FrameDirectory {
             source.check_scene_continuity(binding.scene)?;
         }
         if existing.is_none() && self.sources.len() >= self.limits.sources {
-            return Err(error("frame source count limit exceeded"));
+            return Err(crate::CapacityLimit::exceeded(
+                "frame source count limit exceeded",
+            ));
         }
         existing
             .map_or(0, |source| source.next_ordinal)
@@ -447,7 +451,9 @@ impl FrameDirectory {
             .checked_sub(old_bytes)
             .and_then(|bytes| bytes.checked_add(source_bytes(len, peak_blocks, scenes).ok()?))
             .filter(|bytes| *bytes <= self.limits.index_bytes)
-            .ok_or_else(|| error("frame source index byte limit exceeded"))?;
+            .ok_or_else(|| {
+                crate::CapacityLimit::exceeded("frame source index byte limit exceeded")
+            })?;
 
         Ok(PreparedObservation {
             peak_blocks,
@@ -548,6 +554,33 @@ impl FrameDirectory {
         self.sources.get(&source)
     }
 
+    pub(crate) fn append_capture_part(
+        &mut self,
+        part: &Self,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<(), Error> {
+        if self.last_index.is_some() && self.last_index != part.last_index {
+            return Err(error("capture parts disagree on the last observed frame"));
+        }
+        for source in part.sources() {
+            if let Some(existing) = self.source(source.source) {
+                if existing.first_index != source.first_index
+                    || existing.next_ordinal != source.next_ordinal
+                {
+                    return Err(error("capture parts disagree on the frame source clock"));
+                }
+            } else {
+                self.insert_empty(source.source, source.next_ordinal, source.first_index)?;
+            }
+            for frame in source.frames() {
+                crate::check_replay_cancelled(cancelled)?;
+                self.insert_retained(source.source, *frame)?;
+            }
+        }
+        self.last_index = part.last_index;
+        Ok(())
+    }
+
     pub fn sources(&self) -> impl Iterator<Item = &FrameSourceTimeline> {
         self.sources.values()
     }
@@ -634,13 +667,17 @@ impl FrameDirectory {
             return Err(error("duplicate frame source key"));
         }
         if self.sources.len() >= self.limits.sources {
-            return Err(error("frame source count limit exceeded"));
+            return Err(crate::CapacityLimit::exceeded(
+                "frame source count limit exceeded",
+            ));
         }
         let index_bytes = self
             .index_bytes
             .checked_add(source_bytes(0, 0, 0)?)
             .filter(|bytes| *bytes <= self.limits.index_bytes)
-            .ok_or_else(|| error("frame source index byte limit exceeded"))?;
+            .ok_or_else(|| {
+                crate::CapacityLimit::exceeded("frame source index byte limit exceeded")
+            })?;
         self.sources.insert(
             source,
             FrameSourceTimeline::empty(source, ordinal, first_index),
@@ -656,7 +693,9 @@ impl FrameDirectory {
             .ok_or_else(|| error("frame references an undefined source"))?;
         source.check_scene_continuity(frame.scene)?;
         if self.retained_frames >= self.limits.frames {
-            return Err(error("frame source frame limit exceeded"));
+            return Err(crate::CapacityLimit::exceeded(
+                "frame source frame limit exceeded",
+            ));
         }
         if frame.ordinal >= source.next_ordinal
             || frame.index < source.first_index
@@ -682,7 +721,9 @@ impl FrameDirectory {
             .checked_sub(old_bytes)
             .and_then(|bytes| bytes.checked_add(source_bytes(len, peak_blocks, scenes).ok()?))
             .filter(|bytes| *bytes <= self.limits.index_bytes)
-            .ok_or_else(|| error("frame source index byte limit exceeded"))?;
+            .ok_or_else(|| {
+                crate::CapacityLimit::exceeded("frame source index byte limit exceeded")
+            })?;
         let source = self
             .sources
             .get_mut(&key)

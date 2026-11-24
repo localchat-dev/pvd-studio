@@ -14,6 +14,8 @@ mod frame_source_tests;
 pub mod frame_sources;
 mod history;
 pub mod joint_geometry;
+mod latest_scene;
+pub use latest_scene::{LatestScene, LatestSceneFrame, LatestSceneReader};
 pub mod live;
 mod mesh;
 #[cfg(test)]
@@ -28,12 +30,17 @@ pub mod particles;
 pub mod profile_curves;
 pub mod profile_disk_index;
 pub use profile_disk_index::catalog as profile_catalog_index;
+mod display_spatial;
 pub mod profile_timeline;
 #[cfg(test)]
 mod property_message_tests;
 pub mod pvd_archive;
 pub mod queries;
+pub use display_spatial::DisplaySpatialIndex;
+mod render_region;
+pub use render_region::RenderRegion;
 pub mod repx;
+pub mod room_scope;
 pub mod rooms;
 use frame_sources::{FrameBinding, FrameDirectory, FrameSourceKey, SourceFrame};
 use metrics::{Metrics, Stage};
@@ -53,6 +60,32 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type FrameIndex = history::SharedIndex<FrameInfo>;
 fn error(text: impl Into<String>) -> Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, text.into()).into()
+}
+
+/// Preserve the public I/O error kind and message while identifying failures
+/// that may fit a smaller capture part.
+#[derive(Debug)]
+struct CapacityLimit(&'static str);
+
+impl std::fmt::Display for CapacityLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for CapacityLimit {}
+
+impl CapacityLimit {
+    fn exceeded(message: &'static str) -> Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, Self(message)).into()
+    }
+
+    fn caused(failure: &Error) -> bool {
+        failure
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .is_some_and(|cause| cause.is::<Self>())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -274,14 +307,14 @@ pub struct RenderScene {
     pub diagnostics: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyDefinition {
     pub datatype: String,
     pub semantic: String,
     pub array: bool,
     pub named_values: Vec<(String, u32)>,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClassDefinition {
     pub parent: Option<String>,
     pub properties: BTreeMap<String, PropertyDefinition>,
@@ -618,13 +651,13 @@ impl Recording {
                 }
                 return Self::from_bytes_with_progress(&archive.bytes, progress);
             }
-            if capture::Format::from_magic(&prefix)?.is_some() {
+            if let Some(format) = capture::Format::from_magic(&prefix)? {
                 drop(file);
                 let limits = capture::CaptureLimits {
                     output_bytes: total.max(capture::CaptureLimits::default().output_bytes),
                     ..Default::default()
                 };
-                return capture::open_with_progress(path, &limits, |state| {
+                return format.open(path, &limits, |state| {
                     progress(state.completed, state.total)
                 });
             }
@@ -895,6 +928,7 @@ pub struct RecordingBuilder {
     memory_limit: usize,
     streaming: Option<Box<live::Streaming>>,
     validation: Option<clip::ValidationState>,
+    latest_scene: Option<latest_scene::Publisher>,
     metrics: Metrics,
     message_cache_bytes: usize,
     cancellation: IngestCancellation,
@@ -941,6 +975,7 @@ impl RecordingBuilder {
             memory_limit: 512 << 20,
             streaming: None,
             validation: None,
+            latest_scene: None,
             metrics: Metrics::default(),
             message_cache_bytes: 0,
             cancellation: IngestCancellation::default(),
@@ -1052,6 +1087,12 @@ impl RecordingBuilder {
         }
         self.retained_bytes = required;
         Ok(())
+    }
+    fn invalidate_class_caches(&mut self) {
+        self.clear_message_cache();
+        if let Some(live) = &mut self.streaming {
+            live.history.invalidate_schema_size();
+        }
     }
     fn clear_message_cache(&mut self) {
         if self.message_cache_bytes != 0 {
@@ -1172,10 +1213,14 @@ impl RecordingBuilder {
         let change = rooms::Change::from_action(&action, &self.state);
         self.apply_action_inner(action)?;
         if let Some(change) = change {
-            let frame = self.streaming.as_ref().map_or_else(
-                || self.recording.frames.len(),
-                |streaming| streaming.frames_seen,
-            );
+            let frame = if self.latest_scene.is_some() {
+                self.validation.as_ref().unwrap().frames
+            } else {
+                self.streaming.as_ref().map_or_else(
+                    || self.recording.frames.len(),
+                    |streaming| streaming.frames_seen,
+                )
+            };
             change.apply(&mut self.recording.rooms, frame);
         }
         Ok(())
@@ -1200,6 +1245,9 @@ impl RecordingBuilder {
             .saturating_sub(self.recording.frame_sources.index_bytes())
             .saturating_sub(self.draw_history_bytes());
         if let Some(validation) = &mut self.validation {
+            if let Some(publisher) = &mut self.latest_scene {
+                publisher.track(&action);
+            }
             return validation.apply(action, &mut self.state, state_limit);
         }
         if let Some(streaming) = &mut self.streaming {
@@ -1320,6 +1368,12 @@ impl RecordingBuilder {
                     self.action(Action::Debug(id, primitives.into()))?;
                 }
                 return self.set_value(id, key, Value::Bytes(Arc::from(data)));
+            }
+            if self.latest_scene.is_some()
+                && (object_type.ends_with("PxProfileZone")
+                    || object_type.ends_with("PxProfileMemoryEventBuffer"))
+            {
+                return Ok(());
             }
             if self
                 .validation
@@ -1542,13 +1596,13 @@ impl RecordingBuilder {
                     }
                 }
                 Event::CreateClass { name } => {
-                    self.clear_message_cache();
+                    self.invalidate_class_caches();
                     let n = self.name(name)?;
                     self.reserve_history(n.len() + 128)?;
                     self.recording.classes.entry(n).or_default();
                 }
                 Event::DeriveClass { parent, child } => {
-                    self.clear_message_cache();
+                    self.invalidate_class_caches();
                     let p = self.name(parent)?;
                     let c = self.name(child)?;
                     let mut ancestor = Some(p.as_str());
@@ -1577,7 +1631,7 @@ impl RecordingBuilder {
                     kind,
                     named_values,
                 } => {
-                    self.clear_message_cache();
+                    self.invalidate_class_caches();
                     if kind != 1 && kind != 2 {
                         return Err(error(format!("unknown property kind {kind}")));
                     }
@@ -1785,13 +1839,18 @@ impl RecordingBuilder {
                     };
                     self.prepare_frame_debug(binding)?;
                     if let Some(validation) = &mut self.validation {
-                        validation.frames = validation
-                            .frames
+                        let index = validation.frames;
+                        validation.frames = index
                             .checked_add(1)
                             .ok_or_else(|| error("scene frame count overflow"))?;
-                        self.recording
-                            .analysis
-                            .maintain_live_history(validation.frames)?;
+                        if let Some(publisher) = &mut self.latest_scene {
+                            publisher.publish(index, &self.state, &self.recording.rooms);
+                            validation.discard_errors(&mut self.state);
+                        } else {
+                            self.recording
+                                .analysis
+                                .maintain_live_history(validation.frames)?;
+                        }
                         self.draw_history.commit(binding.source);
                         let renderer_ids = self.state.debug_draw.keys().copied().collect();
                         self.action(Action::ClearDebug(renderer_ids))?;
@@ -1823,8 +1882,7 @@ impl RecordingBuilder {
                             },
                             binding,
                             &self.state,
-                            &self.recording.analysis,
-                            &mut self.recording.frame_sources,
+                            &mut self.recording,
                         )?;
                     } else {
                         let index = self.recording.frames.len();
@@ -1881,7 +1939,8 @@ impl RecordingBuilder {
                     Value::Bytes(Arc::from(rgba)),
                 ))?,
                 Event::OriginShift { id, shift } => {
-                    self.shift_origin(id, shift, &mut || true)?;
+                    let cancellation = self.cancellation.clone();
+                    self.shift_origin(id, shift, &mut || !cancellation.requested())?;
                 }
                 Event::AddProfileZone { id, name } => {
                     if self
@@ -2067,6 +2126,20 @@ pub struct LiveRecording {
     cancellation: IngestCancellation,
 }
 impl LiveRecording {
+    /// Directory leased by this recording, when disk history is enabled.
+    pub fn history_directory(&self) -> Option<&Path> {
+        self.history
+            .as_ref()
+            .or_else(|| {
+                self.builder
+                    .as_ref()?
+                    .streaming
+                    .as_ref()
+                    .map(|stream| &stream.history)
+            })
+            .and_then(live::HistoryWriter::directory)
+    }
+
     /// Interrupts ingestion and temporary bank sealing when the shared token is set.
     /// Use an abort token; a graceful disconnect must still drain received data.
     pub fn set_cancellation(&mut self, cancelled: Arc<AtomicBool>) {
@@ -2447,7 +2520,15 @@ impl SceneState {
         self.render_scene_with_limits(100_000, 128 * 1024 * 1024)
     }
     pub fn render_scene_cached(&self, cache: &mut MeshCache) -> RenderScene {
-        self.render_scene_with_cache(100_000, 128 * 1024 * 1024, cache)
+        self.render_scene_with_cache(100_000, 128 * 1024 * 1024, cache, None)
+    }
+    /// Extracts nearby shapes and the intersecting blocks of large captured terrain meshes.
+    pub fn render_scene_in_region(
+        &self,
+        cache: &mut MeshCache,
+        region: RenderRegion,
+    ) -> RenderScene {
+        self.render_scene_with_cache(100_000, 128 * 1024 * 1024, cache, Some(region))
     }
     /// The caller maintains the combined display budget when merging actor subsets.
     pub fn render_actors_cached(
@@ -2461,6 +2542,23 @@ impl SceneState {
             128 * 1024 * 1024,
             cache,
             Vec::new(),
+            None,
+        )
+    }
+    /// Applies a range to the caller's actor subset before counting displayed shapes.
+    pub fn render_actors_in_region(
+        &self,
+        actors: impl IntoIterator<Item = u64>,
+        cache: &mut MeshCache,
+        region: RenderRegion,
+    ) -> RenderScene {
+        self.render_actor_objects(
+            actors.into_iter().filter_map(|id| self.objects.get(&id)),
+            100_000,
+            128 * 1024 * 1024,
+            cache,
+            Vec::new(),
+            Some(region),
         )
     }
     pub fn articulation_for_link(&self, id: u64) -> Option<&Object> {
@@ -2484,13 +2582,14 @@ impl SceneState {
         None
     }
     fn render_scene_with_limits(&self, max_shapes: usize, max_mesh_bytes: usize) -> RenderScene {
-        self.render_scene_with_cache(max_shapes, max_mesh_bytes, &mut MeshCache::default())
+        self.render_scene_with_cache(max_shapes, max_mesh_bytes, &mut MeshCache::default(), None)
     }
     fn render_scene_with_cache(
         &self,
         max_shapes: usize,
         max_mesh_bytes: usize,
         cache: &mut MeshCache,
+        region: Option<RenderRegion>,
     ) -> RenderScene {
         let mut diagnostics = Vec::new();
         if self
@@ -2506,6 +2605,7 @@ impl SceneState {
             max_mesh_bytes,
             cache,
             diagnostics,
+            region,
         )
     }
     fn render_actor_objects<'a>(
@@ -2515,18 +2615,33 @@ impl SceneState {
         max_mesh_bytes: usize,
         cache: &mut MeshCache,
         mut diagnostics: Vec<String>,
+        region: Option<RenderRegion>,
     ) -> RenderScene {
         cache.retain_resources(self);
         let mut result = Vec::new();
         let mut mesh_bytes = 0usize;
+        let mut mesh_allocations = BTreeSet::new();
         let mut mesh_cache = BTreeMap::<mesh::MeshKey, Option<Geometry>>::new();
+        let mut frame_terrain = mesh::FrameTerrainSelections::new();
+        let mesh_limit = || {
+            format!(
+                "Scene display stopped at its {} MiB unique mesh allocation limit; recorded mesh data remains available.",
+                max_mesh_bytes >> 20
+            )
+        };
         let mut skipped = 0usize;
+        let mut invalid_poses = 0usize;
         for actor in actors.into_iter().filter(|o| {
             o.type_name.ends_with("::PxRigidDynamic")
                 || o.type_name.ends_with("::PxRigidStatic")
                 || o.type_name.ends_with("::PxArticulationLink")
         }) {
-            let (position, rotation) = transform(actor.properties.get("GlobalPose"));
+            let Some((position, rotation)) =
+                render_transform(actor.properties.get("GlobalPose"), region.is_some())
+            else {
+                invalid_poses += 1;
+                continue;
+            };
             let dynamic = !actor.type_name.ends_with("::PxRigidStatic");
             let sleep_owner = if actor.type_name.ends_with("::PxArticulationLink") {
                 self.articulation_for_link(actor.id)
@@ -2539,7 +2654,7 @@ impl SceneState {
             );
             let shapes = refs(actor.properties.get("Shapes"));
             for shape_id in shapes {
-                if result.len() >= max_shapes {
+                if region.is_none() && result.len() >= max_shapes {
                     diagnostics.push(format!("Scene display stopped at the {max_shapes} shape limit; recorded object data remains available."));
                     return RenderScene {
                         objects: result,
@@ -2549,13 +2664,28 @@ impl SceneState {
                 let Some(shape) = self.resolve_reference(actor.id, "Shapes", shape_id) else {
                     continue;
                 };
-                let (local_position, local_rotation) = transform(shape.properties.get("LocalPose"));
-                let geo_id = refs(shape.properties.get("Geometry")).first().copied();
+                let Some((local_position, local_rotation)) =
+                    render_transform(shape.properties.get("LocalPose"), region.is_some())
+                else {
+                    invalid_poses += 1;
+                    continue;
+                };
+                let geo_id = refs(shape.properties.get("Geometry")).next();
                 let Some(geo) =
                     geo_id.and_then(|id| self.resolve_reference(shape.id, "Geometry", id))
                 else {
                     continue;
                 };
+                let offset = rotate(rotation, local_position);
+                let shape_position = std::array::from_fn(|axis| position[axis] + offset[axis]);
+                let shape_rotation = quat_mul(rotation, local_rotation);
+                let shape_region =
+                    region.and_then(|region| region.in_shape_space(shape_position, shape_rotation));
+                if region.is_some() && shape_region.is_none() {
+                    invalid_poses += 1;
+                    continue;
+                }
+                let mut mesh_intersects = None;
                 let geometry = if geo.type_name.ends_with("::PxBoxGeometry") {
                     vec3(geo.properties.get("HalfExtents"))
                         .map(|half_extents| Geometry::Box { half_extents })
@@ -2571,39 +2701,78 @@ impl SceneState {
                 } else if geo.type_name.ends_with("::PxPlaneGeometry") {
                     Some(Geometry::Plane)
                 } else if let Some(key) = self.mesh_key(geo) {
-                    if let Some(cached) = mesh_cache.get(&key) {
-                        cached.clone()
-                    } else {
-                        let decoded = cache.decode(self, geo);
-                        if let Some(Geometry::TriangleMesh { vertices, indices }) = &decoded {
-                            let size = vertices.len() * std::mem::size_of::<[f32; 3]>()
-                                + indices.len() * std::mem::size_of::<u32>();
-                            if size > max_mesh_bytes.saturating_sub(mesh_bytes) {
-                                diagnostics.push(format!("Scene display stopped at its {} MiB unique mesh allocation limit; recorded mesh data remains available.", max_mesh_bytes >> 20));
-                                return RenderScene {
-                                    objects: result,
-                                    diagnostics,
-                                };
-                            }
-                            mesh_bytes += size;
+                    let regional = if let Some(probe) = shape_region {
+                        mesh_intersects = cache
+                            .local_bounds(self, &key)
+                            .map(|bounds| probe.intersects_bounds(bounds));
+                        if mesh_intersects == Some(false) {
+                            continue;
                         }
-                        mesh_cache.insert(key, decoded.clone());
-                        decoded
+                        cache.decode_terrain(
+                            self,
+                            geo,
+                            &key,
+                            probe,
+                            max_mesh_bytes,
+                            &mut frame_terrain,
+                        )
+                    } else {
+                        mesh::RegionMesh::Full
+                    };
+                    match regional {
+                        mesh::RegionMesh::Visible(geometry) => {
+                            mesh_intersects = Some(true);
+                            Some(geometry)
+                        }
+                        mesh::RegionMesh::Outside => continue,
+                        mesh::RegionMesh::Invalid => None,
+                        mesh::RegionMesh::BudgetExceeded => {
+                            diagnostics.push(mesh_limit());
+                            return RenderScene {
+                                objects: result,
+                                diagnostics,
+                            };
+                        }
+                        mesh::RegionMesh::Full => mesh_cache
+                            .entry(key)
+                            .or_insert_with(|| cache.decode(self, geo))
+                            .clone(),
                     }
                 } else {
                     None
                 };
                 if let Some(geometry) = geometry {
-                    let offset = rotate(rotation, local_position);
+                    if let Some(probe) = shape_region {
+                        if mesh_intersects.is_none() && !probe.intersects_geometry(&geometry) {
+                            continue;
+                        }
+                        if result.len() >= max_shapes {
+                            diagnostics.push(format!("Scene display stopped at the {max_shapes} shape limit; recorded object data remains available."));
+                            return RenderScene {
+                                objects: result,
+                                diagnostics,
+                            };
+                        }
+                    }
+                    if let Geometry::TriangleMesh { vertices, indices } = &geometry
+                        && mesh_allocations.insert((Arc::as_ptr(vertices), Arc::as_ptr(indices)))
+                    {
+                        let size = vertices.len() * size_of::<[f32; 3]>()
+                            + indices.len() * size_of::<u32>();
+                        if size > max_mesh_bytes.saturating_sub(mesh_bytes) {
+                            diagnostics.push(mesh_limit());
+                            return RenderScene {
+                                objects: result,
+                                diagnostics,
+                            };
+                        }
+                        mesh_bytes += size;
+                    }
                     result.push(RenderObject {
                         id: actor.id,
                         shape_id,
-                        position: [
-                            position[0] + offset[0],
-                            position[1] + offset[1],
-                            position[2] + offset[2],
-                        ],
-                        rotation: quat_mul(rotation, local_rotation),
+                        position: shape_position,
+                        rotation: shape_rotation,
                         geometry,
                         dynamic,
                         sleeping,
@@ -2616,27 +2785,30 @@ impl SceneState {
         if skipped > 0 {
             diagnostics.push(format!("{skipped} shapes have unsupported, malformed or oversized geometry. Per-mesh display limits are 1,000,000 vertices and 3,000,000 indices."));
         }
+        if invalid_poses > 0 {
+            diagnostics.push(format!(
+                "Spatial display omitted {invalid_poses} invalid actor or shape poses."
+            ));
+        }
         RenderScene {
             objects: result,
             diagnostics,
         }
     }
 }
-fn refs(value: Option<&Value>) -> Vec<u64> {
-    match value {
-        Some(Value::Ref(id)) => vec![*id],
-        Some(Value::Array(a)) => a
-            .iter()
-            .filter_map(|v| {
-                if let Value::Ref(id) = v {
-                    Some(*id)
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
+fn refs(value: Option<&Value>) -> impl Iterator<Item = u64> {
+    let values = match value {
+        Some(reference @ Value::Ref(_)) => std::slice::from_ref(reference),
+        Some(Value::Array(values)) => values.as_slice(),
+        _ => &[],
+    };
+    values.iter().filter_map(|value| {
+        if let Value::Ref(id) = value {
+            Some(*id)
+        } else {
+            None
+        }
+    })
 }
 fn scalar(v: Option<&Value>) -> Option<f32> {
     match v {
@@ -2655,6 +2827,18 @@ fn transform(v: Option<&Value>) -> ([f32; 3], [f32; 4]) {
         Some(Value::Transform { position, rotation }) => (*position, *rotation),
         _ => ([0.0; 3], [0.0, 0.0, 0.0, 1.0]),
     }
+}
+fn render_transform(value: Option<&Value>, scoped: bool) -> Option<([f32; 3], [f32; 4])> {
+    let (position, rotation) = transform(value);
+    if !scoped {
+        return Some((position, rotation));
+    }
+    if position.iter().any(|v| !v.is_finite())
+        || value.is_some_and(|v| !matches!(v, Value::Transform { .. }))
+    {
+        return None;
+    }
+    render_region::normalize_rotation(rotation).map(|rotation| (position, rotation))
 }
 fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [

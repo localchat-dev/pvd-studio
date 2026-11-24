@@ -27,6 +27,53 @@ pub(super) struct PreparedFrame {
 }
 
 impl PreparedFrame {
+    pub(super) fn exceeds_bank_target(
+        &self,
+        bank: &mut resources::capture::BankIndex,
+        segment: &SegmentWriter,
+        limit: usize,
+    ) -> bool {
+        if bank.first_frame_bytes.is_none() {
+            // Checkpoints contain the post-update roots. Changed objects, debug draws
+            // and contacts are already represented by the new handles below.
+            let state = &segment.state;
+            for (previous, changes) in [
+                (&state.index.objects, &self.update.objects),
+                (&state.index.debug, &self.update.debug),
+                (&state.index.contacts, &self.update.contacts),
+            ] {
+                for (id, root) in previous {
+                    // Updates follow the source maps' key order.
+                    if changes
+                        .binary_search_by_key(id, |(changed, _)| *changed)
+                        .is_err()
+                    {
+                        bank.observe(&state.roots[root]);
+                    }
+                }
+            }
+        }
+        for handle in &self.handles {
+            // Capture export writes the checkpoint inline, without a resource descriptor.
+            if Some(handle.id()) != self.checkpoint {
+                bank.observe(handle);
+            }
+        }
+        // Frame and source navigation, inline record offsets, checkpoints and segment maps.
+        bank.charge(3 * size_of::<FrameLocation>() + 2 * size_of::<FrameInfo>() + 256);
+        if self.checkpoint.is_some() {
+            bank.charge(320);
+        }
+        if segment.view.frames.is_empty() {
+            bank.charge(2048 + 2 * segment.view.path.as_os_str().len());
+        }
+        let projected = bank.bytes();
+        let first = *bank.first_frame_bytes.get_or_insert(projected);
+        // Reserve a quarter of the remaining budget for source directories and
+        // temporary allocations. A single frame cannot be divided into banks.
+        projected > first && projected > limit.saturating_sub(limit.saturating_sub(first) / 4)
+    }
+
     pub fn take_analysis(&mut self) -> Option<analysis_pages::PreparedPage> {
         self.analysis_publication.take()
     }

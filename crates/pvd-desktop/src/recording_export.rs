@@ -391,29 +391,31 @@ fn export_retained(
         ));
     };
     crate::atomic_output::create_parent_directory(destination)?;
+    let range = pvd_core::capture::CaptureRange { first, last };
+    let report_progress = |value: pvd_core::capture::CaptureProgress| {
+        progress(Progress {
+            phase: match value.phase {
+                pvd_core::capture::CapturePhase::Inspect => Phase::CaptureInspect,
+                pvd_core::capture::CapturePhase::Copy => Phase::CaptureCopy,
+                pvd_core::capture::CapturePhase::Validate => Phase::CaptureValidate,
+            },
+            completed: value.completed,
+            total: value.total,
+        })
+    };
     // The byte limit is not an in-memory allocation budget. Complete captures
     // can exceed the hot-history budget; index/resource limits remain bounded.
     let limits = pvd_core::capture::CaptureLimits {
         output_bytes: (1 << 63) - 1,
         ..Default::default()
     };
-    let report = pvd_core::capture::write_retained_new(
+    let report = pvd_core::capture::write_portable_new(
         recording,
         destination,
-        pvd_core::capture::CaptureRange { first, last },
+        range,
         &limits,
         512 << 20,
-        |value| {
-            progress(Progress {
-                phase: match value.phase {
-                    pvd_core::capture::CapturePhase::Inspect => Phase::CaptureInspect,
-                    pvd_core::capture::CapturePhase::Copy => Phase::CaptureCopy,
-                    pvd_core::capture::CapturePhase::Validate => Phase::CaptureValidate,
-                },
-                completed: value.completed,
-                total: value.total,
-            })
-        },
+        report_progress,
     )
     .map_err(export_error)?;
     Ok(Message::new(
@@ -789,9 +791,10 @@ pub fn retained_controls(ui: &mut egui::Ui, studio: &mut crate::studio::Studio) 
         .open(retained_render_requested(ui.ctx()).then_some(true))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
+            let available = studio.retained_range();
             ui.label(language.text(
-                &format!("Available frames: {}..={}", studio.first_frame(), studio.count().saturating_sub(1)),
-                &format!("可用帧：{}..={}", studio.first_frame(), studio.count().saturating_sub(1)),
+                &format!("Available frames: {}..={}", available.map_or(0, |r| r.first), available.map_or(0, |r| r.last)),
+                &format!("可用帧：{}..={}", available.map_or(0, |r| r.first), available.map_or(0, |r| r.last)),
             ));
             ui.horizontal_wrapped(|ui| {
                 ui.label(language.text("First", "首帧"));
@@ -812,8 +815,8 @@ pub fn retained_controls(ui: &mut egui::Ui, studio: &mut crate::studio::Studio) 
                 }
             });
             ui.label(egui::RichText::new(language.text(
-                "Project capture (.pvdcapture). Saves available scene and analysis history, or a smaller visible interval from an opened project capture. It is not an original PVD3 file.",
-                "本项目捕获（.pvdcapture）保存可用的场景与分析历史，也可从已打开的项目捕获另存更小的可见区间。此格式不是原版 PVD3 文件。",
+                "Save the available scene and analysis history as one .pvdcapture file. Long recordings are split into parts inside the file.",
+                "场景和分析历史保存为一个 .pvdcapture 文件。长录制会在文件内部自动分段。",
             )).small());
             if !studio.can_export_retained() && studio.recording_export.is_none() {
                 ui.label(language.text("Requires completed disk-backed SDK frames or an opened project capture, with no open/save job running.", "需要磁盘历史中已完成的 SDK 帧或已打开的项目捕获，并等待打开、保存任务结束。"));

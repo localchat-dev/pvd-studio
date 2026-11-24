@@ -15,7 +15,7 @@ fn binding(source: u64) -> FrameBinding {
         scene: None,
     }
 }
-fn streaming(directory: &TestDirectory) -> (Streaming, SceneState, FrameDirectory) {
+fn streaming(directory: &TestDirectory) -> (Streaming, SceneState, crate::Recording) {
     let history = HistoryWriter::new(directory.config()).unwrap();
     let mut live = Streaming::new(history);
     live.set_frame_source(Some(key(100)));
@@ -31,12 +31,13 @@ fn streaming(directory: &TestDirectory) -> (Streaming, SceneState, FrameDirector
         1 << 20,
     )
     .unwrap();
-    (live, state, Streaming::frame_directory())
+    let capture = recording(&live, &Streaming::frame_directory());
+    (live, state, capture)
 }
 fn complete(
     live: &mut Streaming,
     state: &mut SceneState,
-    directory: &mut FrameDirectory,
+    capture: &mut crate::Recording,
     source: u64,
     value: u64,
 ) {
@@ -51,17 +52,12 @@ fn complete(
         timestamp: 9000 - value,
         scene_id: source,
     };
-    directory
+    capture
+        .frame_sources
         .index_bytes_after_observe(info.index, binding(source), true)
         .unwrap();
-    live.complete(
-        info,
-        binding(source),
-        state,
-        &SharedAnalysis::default(),
-        directory,
-    )
-    .unwrap();
+    live.complete(info, binding(source), state, capture)
+        .unwrap();
 }
 fn recording(live: &Streaming, directory: &FrameDirectory) -> crate::Recording {
     let mut recording = RecordingBuilder::new(Header {
@@ -82,24 +78,24 @@ fn recording(live: &Streaming, directory: &FrameDirectory) -> crate::Recording {
 #[test]
 fn failed_disk_boundaries_keep_live_ordinals_without_fabricating_seekable_frames() {
     let directory = TestDirectory::new();
-    let (mut live, mut state, mut sources) = streaming(&directory);
+    let (mut live, mut state, mut capture) = streaming(&directory);
     for index in 0..5 {
         live.history.retry_after = if index % 2 == 1 {
             Instant::now() + Duration::from_secs(60)
         } else {
             Instant::now()
         };
-        complete(&mut live, &mut state, &mut sources, 100, 10 + index as u64);
+        complete(&mut live, &mut state, &mut capture, 100, 10 + index as u64);
         assert_eq!(
             live.display_source_frame.map(|(_, frame)| frame.ordinal),
             Some(index)
         );
         assert_eq!(live.frame.as_ref().unwrap().index, index);
         if index % 2 == 1 {
-            assert!(sources.frame(index).is_none());
+            assert!(capture.frame_sources.frame(index).is_none());
         }
     }
-    let timeline = sources.source(key(100)).unwrap();
+    let timeline = capture.frame_sources.source(key(100)).unwrap();
     assert_eq!(timeline.observed_frames(), 5);
     assert_eq!(
         timeline
@@ -109,8 +105,11 @@ fn failed_disk_boundaries_keep_live_ordinals_without_fabricating_seekable_frames
         [(0, 0), (2, 2), (4, 4)]
     );
     assert!(timeline.at_ordinal(1).is_none());
-    let recording = recording(&live, &sources);
-    sources.validate_frames(&recording.frames).unwrap();
+    let recording = recording(&live, &capture.frame_sources);
+    capture
+        .frame_sources
+        .validate_frames(&recording.frames)
+        .unwrap();
     for frame in [0, 2, 4] {
         assert_eq!(
             recording.state_at(frame).unwrap().objects[&7].properties["value"],
@@ -126,12 +125,12 @@ fn failed_disk_boundaries_keep_live_ordinals_without_fabricating_seekable_frames
 #[test]
 fn rolling_source_directory_tracks_physical_eviction_and_keeps_source_ordinals() {
     let directory = TestDirectory::new();
-    let (mut live, mut state, mut sources) = streaming(&directory);
+    let (mut live, mut state, mut capture) = streaming(&directory);
     for frame in 0..6 {
         complete(
             &mut live,
             &mut state,
-            &mut sources,
+            &mut capture,
             if frame % 2 == 0 { 100 } else { 200 },
             frame,
         );
@@ -140,11 +139,18 @@ fn rolling_source_directory_tracks_physical_eviction_and_keeps_source_ordinals()
     for _ in 0..5 {
         assert!(live.history.evict_one().unwrap());
     }
-    live.prune_frame_sources(&mut sources);
-    assert_eq!(sources.retained_frames(), 1);
-    assert!(sources.source(key(100)).unwrap().is_empty());
-    assert_eq!(sources.source(key(100)).unwrap().observed_frames(), 3);
-    assert_eq!(sources.default_source(), Some(key(100)));
+    live.prune_frame_sources(&mut capture.frame_sources);
+    assert_eq!(capture.frame_sources.retained_frames(), 1);
+    assert!(capture.frame_sources.source(key(100)).unwrap().is_empty());
+    assert_eq!(
+        capture
+            .frame_sources
+            .source(key(100))
+            .unwrap()
+            .observed_frames(),
+        3
+    );
+    assert_eq!(capture.frame_sources.default_source(), Some(key(100)));
     assert_eq!(live.selected_source, Some(key(100)));
     assert_eq!(
         live.display_source_frame
@@ -152,7 +158,8 @@ fn rolling_source_directory_tracks_physical_eviction_and_keeps_source_ordinals()
         Some((4, 2))
     );
     assert_eq!(
-        sources
+        capture
+            .frame_sources
             .source(key(200))
             .unwrap()
             .frames()
@@ -160,9 +167,10 @@ fn rolling_source_directory_tracks_physical_eviction_and_keeps_source_ordinals()
             .collect::<Vec<_>>(),
         [(5, 2)]
     );
-    complete(&mut live, &mut state, &mut sources, 100, 6);
+    complete(&mut live, &mut state, &mut capture, 100, 6);
     assert_eq!(
-        sources
+        capture
+            .frame_sources
             .source(key(100))
             .unwrap()
             .frames()
@@ -170,8 +178,11 @@ fn rolling_source_directory_tracks_physical_eviction_and_keeps_source_ordinals()
             .collect::<Vec<_>>(),
         [(6, 3)]
     );
-    let recording = recording(&live, &sources);
-    sources.validate_frames(&recording.frames).unwrap();
+    let recording = recording(&live, &capture.frame_sources);
+    capture
+        .frame_sources
+        .validate_frames(&recording.frames)
+        .unwrap();
     assert_eq!(
         recording
             .frames
@@ -190,8 +201,8 @@ fn rolling_source_directory_tracks_physical_eviction_and_keeps_source_ordinals()
 #[test]
 fn display_dirty_bookkeeping_yields_to_state_budget_without_losing_changes() {
     let directory = TestDirectory::new();
-    let (mut live, mut state, mut sources) = streaming(&directory);
-    complete(&mut live, &mut state, &mut sources, 100, 10);
+    let (mut live, mut state, mut capture) = streaming(&directory);
+    complete(&mut live, &mut state, &mut capture, 100, 10);
     let mut displayed = SceneState::default();
     std::mem::take(&mut live.pending).apply(&mut displayed);
     let limit = live.state_bytes + 32;
@@ -212,8 +223,7 @@ fn display_dirty_bookkeeping_yields_to_state_budget_without_losing_changes() {
         },
         binding(200),
         &state,
-        &SharedAnalysis::default(),
-        &mut sources,
+        &mut capture,
     )
     .unwrap();
     assert!(live.pending.is_empty());
@@ -225,8 +235,7 @@ fn display_dirty_bookkeeping_yields_to_state_budget_without_losing_changes() {
         },
         binding(100),
         &state,
-        &SharedAnalysis::default(),
-        &mut sources,
+        &mut capture,
     )
     .unwrap();
     assert!(live.pending.replace_all);

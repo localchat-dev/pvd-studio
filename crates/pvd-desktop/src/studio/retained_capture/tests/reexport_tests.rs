@@ -1,5 +1,48 @@
 use super::*;
 
+#[test]
+fn desktop_opens_packed_range_and_resaves_to_one_compatible_capture() {
+    let mut case = Case::new();
+    let capture = case.root.join("跨段回放.pvdcapture");
+    let limits = pvd_core::capture::CaptureLimits {
+        frames: 2,
+        ..Default::default()
+    };
+    let report = pvd_core::capture::write_portable_new(
+        case.studio.timeline_recording().unwrap(),
+        &capture,
+        CaptureRange { first: 3, last: 6 },
+        &limits,
+        0,
+        |_| true,
+    )
+    .unwrap();
+    assert!(report.parts > 1);
+    case.studio.clear_recording();
+    case.live = None;
+    case.studio.open(capture, case.context.clone());
+    case.wait(|studio| studio.job.is_none() && studio.seeking.is_none());
+    assert!(
+        case.studio.is_project_capture(),
+        "{:?}",
+        case.studio.notices
+    );
+    assert_eq!((case.studio.first_frame(), case.studio.count()), (3, 7));
+    for frame in [6, 3] {
+        case.studio.seek(frame);
+        case.wait(|studio| studio.seeking.is_none());
+        let expected = Recording::from_bytes(&fixture::capture(frame + 1)).unwrap();
+        assert_eq!(case.studio.state, expected.state_at(frame).unwrap());
+    }
+    let output = case.root.join("另存.pvdcapture");
+    case.studio.retained_path = output.display().to_string();
+    case.studio.save_recording(case.context.clone());
+    case.wait(|studio| studio.recording_export.is_none());
+    let saved = Recording::from_path(&output).unwrap();
+    assert_eq!(saved.capture_format(), Some(pvd_core::capture::Format::V3));
+    assert_eq!((saved.first_frame(), saved.frame_count()), (3, 7));
+}
+
 fn open_live_export(case: &mut Case) -> PathBuf {
     case.studio.export_retained(case.context.clone());
     case.wait(|studio| {

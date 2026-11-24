@@ -3,10 +3,14 @@ use resources::capture::{BlobDescription, BlockDescription, CaptureBacking};
 mod atomic;
 mod export;
 mod metadata;
-mod read;
+mod packed;
+mod packed_read;
+pub(super) mod read;
 #[cfg(test)]
 mod real_tests;
 pub(super) mod record;
+mod segmented;
+mod segmented_read;
 #[cfg(test)]
 mod tests;
 mod wire;
@@ -14,7 +18,12 @@ mod wire;
 pub use atomic::write_retained_new;
 pub(super) use export::write_bank;
 pub use export::write_retained;
+pub(super) use metadata::schema_reader_bytes;
+pub use packed::{PACKED_MAGIC, PortableReport, write_portable_new};
+pub use packed_read::open_packed_with_progress;
 pub use read::open_with_progress;
+pub use segmented::SET_MAGIC;
+pub use segmented_read::open_segmented_with_progress;
 pub const MAGIC: &[u8; 8] = b"PVDCAP03";
 pub const V2_MAGIC: &[u8; 8] = b"PVDCAP02";
 pub const LEGACY_MAGIC: &[u8; 8] = b"PVDCAP01";
@@ -24,6 +33,8 @@ pub enum Format {
     V1,
     V2,
     V3,
+    V4,
+    Set,
 }
 
 impl Format {
@@ -34,7 +45,11 @@ impl Format {
             Ok(Some(Self::V2))
         } else if bytes.starts_with(MAGIC) {
             Ok(Some(Self::V3))
-        } else if bytes.starts_with(b"PVDCAP") {
+        } else if bytes.starts_with(PACKED_MAGIC) {
+            Ok(Some(Self::V4))
+        } else if bytes.starts_with(SET_MAGIC) {
+            Ok(Some(Self::Set))
+        } else if bytes.starts_with(b"PVDCAP") || bytes.starts_with(b"PVDSET") {
             Err(error("unsupported project capture version"))
         } else {
             Ok(None)
@@ -46,6 +61,8 @@ impl Format {
             Self::V1 => "PVDCAP01",
             Self::V2 => "PVDCAP02",
             Self::V3 => "PVDCAP03",
+            Self::V4 => "PVDCAP04",
+            Self::Set => "PVDSET01",
         }
     }
 }
@@ -54,6 +71,15 @@ impl Format {
 pub struct CaptureRange {
     pub first: usize,
     pub last: usize,
+}
+
+impl CaptureRange {
+    pub fn retained(recording: &crate::Recording) -> Option<Self> {
+        Some(Self {
+            first: recording.frames.first()?.index,
+            last: recording.frames.last()?.index,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -131,7 +157,9 @@ impl Budget {
             .used
             .checked_add(bytes)
             .filter(|used| *used <= self.limit)
-            .ok_or_else(|| error("project capture index exceeds its metadata budget"))?;
+            .ok_or_else(|| {
+                crate::CapacityLimit::exceeded("project capture index exceeds its metadata budget")
+            })?;
         self.peak = self.peak.max(self.used);
         Ok(())
     }

@@ -27,8 +27,55 @@ mod tests;
 struct Bank {
     first: usize,
     last: usize,
-    path: PathBuf,
+    restore_from: usize,
+    location: BankLocation,
     bytes: u64,
+    digest: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum BankLocation {
+    File(Arc<Path>),
+    Embedded {
+        path: Arc<Path>,
+        file: Arc<File>,
+        offset: u64,
+    },
+}
+
+impl BankLocation {
+    pub(super) fn open_member(
+        &self,
+        limits: &capture::CaptureLimits,
+        bytes: u64,
+        callback: &mut dyn FnMut(capture::CaptureProgress) -> bool,
+    ) -> Result<capture::read::OpenedCapture, Error> {
+        match self {
+            Self::File(path) => capture::read::open_set_part(path, limits, callback),
+            Self::Embedded { path, file, offset } => {
+                capture::read::open_embedded(path, file, *offset, bytes, limits, callback)
+            }
+        }
+    }
+
+    pub(super) fn failure(&self, failure: Error) -> Error {
+        match self {
+            Self::File(path) => capture::read::part_error(path, failure),
+            Self::Embedded { path, offset, .. } => {
+                let kind = failure
+                    .downcast_ref::<std::io::Error>()
+                    .map_or(std::io::ErrorKind::InvalidData, std::io::Error::kind);
+                std::io::Error::new(
+                    kind,
+                    format!(
+                        "capture member at byte {offset} in {}: {failure}",
+                        path.display()
+                    ),
+                )
+                .into()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -41,19 +88,66 @@ struct Directory {
 
 #[derive(Clone, Debug)]
 pub(super) struct ArchiveReader {
-    // Snapshots keep the entire temporary session alive, including subsequently sealed banks.
-    owner: Arc<CacheDirectory>,
+    source: ArchiveSource,
+    pub(super) index_limit: usize,
     directory: Arc<Mutex<Directory>>,
     transition: Arc<std::sync::RwLock<()>>,
 }
 
+#[derive(Clone, Debug)]
+enum ArchiveSource {
+    Temporary(Arc<CacheDirectory>),
+    Capture(capture::CaptureLimits, capture::Format),
+}
+
 impl ArchiveReader {
+    pub(super) fn bank_index_bytes() -> usize {
+        2 * size_of::<Bank>()
+    }
+
     fn new(owner: Arc<CacheDirectory>) -> Self {
+        Self::with_source(ArchiveSource::Temporary(owner), BANK_INDEX_BYTES)
+    }
+
+    pub(super) fn capture(limits: &capture::CaptureLimits, format: capture::Format) -> Self {
+        Self::with_source(
+            ArchiveSource::Capture(limits.clone(), format),
+            limits.index_bytes,
+        )
+    }
+
+    fn with_source(source: ArchiveSource, index_limit: usize) -> Self {
         Self {
-            owner,
+            source,
+            index_limit,
             directory: Arc::new(Mutex::new(Directory::default())),
             transition: Arc::new(std::sync::RwLock::new(())),
         }
+    }
+
+    pub(super) fn capture_format(&self) -> Option<capture::Format> {
+        match &self.source {
+            ArchiveSource::Temporary(_) => None,
+            ArchiveSource::Capture(_, format) => Some(*format),
+        }
+    }
+
+    // A later part can contain the entire earlier prefix of its first replay
+    // segment. Export this segment once, from the last applicable part.
+    pub(super) fn export_location(&self, first: usize, last: usize) -> Result<usize, Error> {
+        if self.capture_format().is_none() {
+            return Ok(first);
+        }
+        let directory = self
+            .directory
+            .lock()
+            .map_err(|_| error("capture set lock poisoned"))?;
+        let end = directory
+            .banks
+            .partition_point(|bank| bank.first <= last && bank.restore_from <= first);
+        Ok(end
+            .checked_sub(1)
+            .map_or(first, |index| first.max(directory.banks[index].first)))
     }
 
     fn bank(&self, frame: usize) -> Option<(usize, Bank)> {
@@ -103,23 +197,40 @@ impl ArchiveReader {
             }
         }
         let limits = capture::CaptureLimits {
-            index_bytes: BANK_INDEX_BYTES,
+            index_bytes: self.index_limit,
             output_bytes: bank.bytes.max(4096),
-            ..Default::default()
+            ..match &self.source {
+                ArchiveSource::Temporary(_) => capture::CaptureLimits::default(),
+                ArchiveSource::Capture(limits, _) => limits.clone(),
+            }
         };
         let mut progress = |_| !cancelled();
         let progress: &mut dyn FnMut(capture::CaptureProgress) -> bool = &mut progress;
-        let mut recording = capture::open_with_progress(&bank.path, &limits, progress)?;
-        // The open capture's file handle alone must not outlive ownership of the directory.
-        let disk = recording.disk.as_mut().unwrap();
-        disk.segments
-            .front()
-            .unwrap()
-            .resources
-            .capture_backing()
-            .unwrap()
-            .keep_owner(self.owner.clone())?;
-        disk._owner = Some(self.owner.clone());
+        let opened = match (&self.source, &bank.location) {
+            (ArchiveSource::Temporary(_), BankLocation::File(path)) => {
+                capture::read::open_report_with_progress(path, &limits, progress)
+            }
+            _ => bank.location.open_member(&limits, bank.bytes, progress),
+        }
+        .map_err(|failure| bank.location.failure(failure))?;
+        if opened.report.digest != bank.digest {
+            return Err(bank
+                .location
+                .failure(error("contents changed after capture admission")));
+        }
+        let mut recording = opened.recording;
+        if let ArchiveSource::Temporary(owner) = &self.source {
+            // A replay cursor may outlive the recording that opened a temporary bank.
+            let disk = recording.disk.as_mut().unwrap();
+            disk.segments
+                .front()
+                .unwrap()
+                .resources
+                .capture_backing()
+                .unwrap()
+                .keep_owner(owner.clone())?;
+            disk._owner = Some(owner.clone());
+        }
         let recording = Arc::new(recording);
         let mut directory = self
             .directory
@@ -129,19 +240,33 @@ impl ArchiveReader {
         Ok(Some(recording))
     }
 
-    fn publish(&self, bank: Bank) -> Result<(), Error> {
+    pub(super) fn publish(
+        &self,
+        location: BankLocation,
+        report: &capture::CaptureReport,
+        restore_from: usize,
+    ) -> Result<(), Error> {
+        let bank = Bank {
+            first: report.range.first,
+            last: report.range.last,
+            bytes: report.bytes,
+            digest: report.digest,
+            location,
+            restore_from,
+        };
         let mut directory = self
             .directory
             .lock()
             .map_err(|_| error("complete-session bank lock poisoned"))?;
-        if directory
-            .banks
-            .last()
-            .is_some_and(|last| last.last.checked_add(1) != Some(bank.first))
-        {
+        if directory.banks.last().is_some_and(|last| {
+            last.last.checked_add(1) != Some(bank.first) || last.restore_from > bank.restore_from
+        }) {
             return Err(error("complete-session banks must be contiguous"));
         }
-        directory.bytes = directory.bytes.saturating_add(bank.bytes);
+        directory.bytes = directory
+            .bytes
+            .checked_add(bank.bytes)
+            .ok_or_else(|| error("archive size overflow"))?;
         directory.banks.push(bank);
         Ok(())
     }
@@ -302,7 +427,7 @@ impl HistoryWriter {
         Ok(())
     }
 
-    fn seal_bank(&mut self, source: &crate::Recording) -> Result<(), Error> {
+    pub(super) fn seal_bank(&mut self, source: &crate::Recording) -> Result<(), Error> {
         self.seal_bank_with_progress(source, |_, _| {})
     }
 
@@ -373,7 +498,7 @@ impl HistoryWriter {
         recording.frames = disk.frames.clone();
         recording.disk = Some(disk);
         let limits = capture::CaptureLimits {
-            index_bytes: BANK_INDEX_BYTES,
+            index_bytes: archive.index_limit,
             output_bytes: available.min((1 << 63) - 1),
             ..Default::default()
         };
@@ -429,12 +554,11 @@ impl HistoryWriter {
         if let Err(failure) = cancellation.check() {
             return Err(self.remove_incomplete_bank(&owner, &path, failure));
         }
-        if let Err(failure) = archive.publish(Bank {
+        if let Err(failure) = archive.publish(
+            BankLocation::File(Arc::from(path.as_path())),
+            &report,
             first,
-            last,
-            path: path.clone(),
-            bytes: report.bytes,
-        }) {
+        ) {
             return Err(self.remove_incomplete_bank(&owner, &path, failure));
         }
         // Publication precedes lease invalidation, so old snapshots can always route
@@ -455,6 +579,7 @@ impl HistoryWriter {
         }
         cancellation.check()?;
         self.persistent_baseline = None;
+        self.bank_index = Default::default();
         Ok(())
     }
 

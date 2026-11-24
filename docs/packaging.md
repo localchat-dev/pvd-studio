@@ -33,7 +33,7 @@
 
 发布不含本地捕获的分发包时，使用 `-IncludeSource -ArchiveFormat 7z -SkipCaptureSamples`。此选项同时排除捕获对应的真值 JSON；默认本地打包仍收集上述现存样例。
 
-源码包收集 `crates/`、`vendor/`、`test-support/`、`tools/`、公共文档与根配置。编译目录、捕获、日志、符号、缓存、`docs/local/` 和 `docs/CONTINUE-PVD-STUDIO.md` 不进入源码包。过滤规则由脚本统一维护。
+源码包收集 `crates/`、`unity/`、`vendor/`、`test-support/`、`tools/`、公共文档与根配置。编译目录、捕获、日志、符号、缓存、`docs/local/` 和 `docs/CONTINUE-PVD-STUDIO.md` 不进入源码包。过滤规则由脚本统一维护。
 
 `samples/navmesh/` 另收集仓库内固定上游版本及手工多 Tile 的两份导航验证文件，供离线导入检查使用；两者均为构造数据，不与物理样例地图配对。
 

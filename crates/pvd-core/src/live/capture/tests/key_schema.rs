@@ -212,6 +212,7 @@ fn keyed_capture_rejects_damage_version_mismatch_and_budget_and_cancellation() {
     reader.capture = Some(Arc::new(CaptureBacking {
         format: Format::V1,
         file: File::open(&path).unwrap(),
+        base: 0,
         path: path.clone(),
         bytes: bytes.len() as u64,
         owner: std::sync::Mutex::new(None),
@@ -229,7 +230,9 @@ fn keyed_capture_rejects_damage_version_mismatch_and_budget_and_cancellation() {
     let corrupt = fixture.root.join("corrupt.pvdcapture");
     std::fs::write(&corrupt, damaged).unwrap();
     assert!(crate::Recording::from_path(&corrupt).is_err());
-    assert!(Format::from_magic(b"PVDCAP04").is_err());
+    assert_eq!(Format::from_magic(b"PVDCAP04").unwrap(), Some(Format::V4));
+    assert_eq!(Format::from_magic(b"PVDSET01").unwrap(), Some(Format::Set));
+    assert!(Format::from_magic(b"PVDCAP05").is_err());
     assert_eq!(Format::from_magic(b"notcapture").unwrap(), None);
     assert!(std::fs::read_dir(&fixture.root).unwrap().all(|entry| {
         !entry

@@ -38,7 +38,7 @@ function Test-PackagedFile {
     $excludedDirectories = @('target', '.deps', 'output', 'artifacts', 'pvd-cache', '__pycache__', '.vs', '.idea', 'CMakeFiles')
     return (
         @($parts | Where-Object { $_ -in $excludedDirectories }).Count -eq 0 -and
-        $RelativePath -notmatch '\.(?:py[cod]|pvd|pvdstream|pvdcapture|pxd2?|ovd|pvdspool|partial|log|exe|dll|pdb|obj|o|a|lib|exp|ilk|map|dmp|zip|7z|bak|tmp)$' -and
+        $RelativePath -notmatch '\.(?:py[cod]|pvd|pvdstream|pvdcapture|pvdset|pxd2?|ovd|pvdspool|partial|log|exe|dll|pdb|obj|o|a|lib|exp|ilk|map|dmp|zip|7z|bak|tmp)$' -and
         $RelativePath -notmatch '\.pvdstudio-clips\.json$' -and
         $parts[-1] -notin @('CMakeCache.txt', 'cmake_install.cmake') -and
         $normalizedPath -notmatch '^docs/local(?:/|$)' -and
@@ -175,7 +175,7 @@ try {
     if ($IncludeSource) {
         $source = Join-Path $distribution 'source'
         New-Item -ItemType Directory -Path $source | Out-Null
-        foreach ($directory in @('crates', 'vendor', 'test-support', 'tools', 'docs')) {
+        foreach ($directory in @('crates', 'vendor', 'test-support', 'tools', 'docs', 'unity')) {
             $sourceDirectory = Join-Path $projectRoot $directory
             foreach ($file in Get-ChildItem -LiteralPath $sourceDirectory -File -Recurse -Force) {
                 $relativePath = $file.FullName.Substring($projectRoot.Length + 1)

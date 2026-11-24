@@ -2845,24 +2845,28 @@ fn read_recording(
     file.read_exact(&mut signature)
         .and_then(|_| file.rewind())
         .map_err(|e| Message::detail("Cannot read capture header", "无法读取录制文件头", e))?;
-    if pvd_core::capture::Format::from_magic(&signature)
-        .map_err(|error| {
-            Message::detail("Cannot open project capture", "无法打开本项目捕获", error)
-        })?
-        .is_some()
-    {
+    if let Some(format) = pvd_core::capture::Format::from_magic(&signature).map_err(|error| {
+        Message::detail("Cannot open project capture", "无法打开本项目捕获", error)
+    })? {
         drop(file);
         let limits = pvd_core::capture::CaptureLimits {
             output_bytes: length.max(pvd_core::capture::CaptureLimits::default().output_bytes),
             ..Default::default()
         };
-        let recording = pvd_core::capture::open_with_progress(path, &limits, |value| {
-            progress.store(value.completed.min(length), Ordering::Relaxed);
-            !cancelled.load(Ordering::Relaxed)
-        })
-        .map_err(|error| {
-            Message::detail("Cannot open project capture", "无法打开本项目捕获", error)
-        })?;
+        let recording = format
+            .open(path, &limits, |value| {
+                let completed = if format == pvd_core::capture::Format::Set && value.total > 0 {
+                    (u128::from(value.completed.min(value.total)) * u128::from(length)
+                        / u128::from(value.total)) as u64
+                } else {
+                    value.completed.min(length)
+                };
+                progress.store(completed, Ordering::Relaxed);
+                !cancelled.load(Ordering::Relaxed)
+            })
+            .map_err(|error| {
+                Message::detail("Cannot open project capture", "无法打开本项目捕获", error)
+            })?;
         return Ok(LoadedCapture {
             recording,
             bytes: None,

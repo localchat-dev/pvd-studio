@@ -313,7 +313,7 @@ mod windows_dialog {
             PickerKind::OpenCapture => vec![
                 (
                     language.text("Physics capture files", "物理捕获文件"),
-                    "*.pvdstream;*.pvd;*.pxd;*.pxd2;*.pvdcapture;*.partial",
+                    "*.pvdstream;*.pvd;*.pxd;*.pxd2;*.pvdcapture;*.pvdset;*.partial",
                 ),
                 (language.text("All files", "所有文件"), "*.*"),
             ],

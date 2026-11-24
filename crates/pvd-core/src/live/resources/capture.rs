@@ -1,5 +1,73 @@
 use super::*;
 
+const BLOCK_READER_BYTES: usize = 2 * MAP_ENTRY_BYTES + size_of::<Block>() + 64;
+const BLOB_READER_BYTES: usize = 2 * MAP_ENTRY_BYTES + size_of::<Blob>() + 64;
+const READER_BASE_BYTES: usize =
+    size_of::<Shared>() + size_of::<Store>() + READ_BUFFER_BYTES + MAP_ENTRY_BYTES;
+
+/// Counts the unique resource closure materialized when a temporary bank is opened.
+#[derive(Default)]
+pub(in crate::live) struct BankIndex {
+    ids: std::collections::HashSet<u64>,
+    blobs: usize,
+    bytes: usize,
+    pub(in crate::live) first_frame_bytes: Option<usize>,
+}
+
+impl BankIndex {
+    pub(in crate::live) fn bytes(&self) -> usize {
+        // The capture decoder starts each wire directory at four entries and doubles it.
+        fn directory_bytes<T>(count: usize) -> usize {
+            if count == 0 {
+                return 0;
+            }
+            count
+                .max(4)
+                .next_power_of_two()
+                .saturating_mul(size_of::<T>())
+        }
+        self.bytes
+            .saturating_add(READER_BASE_BYTES)
+            .saturating_add(directory_bytes::<BlobDescription>(self.blobs))
+            .saturating_add(directory_bytes::<BlockDescription>(
+                self.ids.len() - self.blobs,
+            ))
+    }
+
+    pub(in crate::live) fn cache_bytes(&self) -> usize {
+        let capacity = self.ids.capacity();
+        if capacity == 0 {
+            return 0;
+        }
+        // Round usable capacity up to full buckets, including their control bytes.
+        capacity.next_power_of_two() * (size_of::<u64>() + 1) + 16
+    }
+
+    pub(in crate::live) fn charge(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    pub(in crate::live) fn observe(&mut self, handle: &ResourceHandle) {
+        let blob = &handle.0;
+        if !self.ids.insert(blob.id) {
+            return;
+        }
+        self.blobs += 1;
+        // Wire references and the corresponding restored handles coexist at admission.
+        self.charge(BLOB_READER_BYTES + size_of::<ResourceHandle>());
+        self.charge(blob.blocks.len() * (size_of::<u64>() + size_of::<Arc<Block>>()));
+        self.charge(blob.dependencies.len() * (size_of::<u64>() + size_of::<ResourceHandle>()));
+        for block in &blob.blocks {
+            if self.ids.insert(block.id) {
+                self.charge(BLOCK_READER_BYTES);
+            }
+        }
+        for dependency in &blob.dependencies {
+            self.observe(dependency);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::live) struct BlobDescription {
     pub id: u64,
@@ -22,6 +90,7 @@ pub(in crate::live) struct CaptureBacking {
     pub(in crate::live) format: crate::live::capture::Format,
     pub file: File,
     pub path: PathBuf,
+    pub base: u64,
     pub bytes: u64,
     // Close the file before releasing ownership can remove its cache directory.
     pub(in crate::live) owner: Mutex<Option<Arc<CacheDirectory>>>,
@@ -47,8 +116,8 @@ impl CaptureBacking {
 
     pub(in crate::live) fn read_exact_at(
         &self,
-        mut offset: u64,
-        mut bytes: &mut [u8],
+        offset: u64,
+        bytes: &mut [u8],
     ) -> Result<(), Error> {
         if offset
             .checked_add(bytes.len() as u64)
@@ -56,21 +125,13 @@ impl CaptureBacking {
         {
             return Err(error("capture read lies outside its committed file"));
         }
+        let mut offset = self
+            .base
+            .checked_add(offset)
+            .ok_or_else(|| error("capture offset overflow"))?;
+        let mut bytes = bytes;
         while !bytes.is_empty() {
-            #[cfg(windows)]
-            let count = {
-                use std::os::windows::fs::FileExt;
-                self.file.seek_read(bytes, offset)?
-            };
-            #[cfg(unix)]
-            let count = {
-                use std::os::unix::fs::FileExt;
-                self.file.read_at(bytes, offset)?
-            };
-            #[cfg(not(any(windows, unix)))]
-            let count = return Err(error(
-                "capture random reads are unsupported on this platform",
-            ));
+            let count = read_at(&self.file, offset, bytes)?;
             if count == 0 {
                 return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
             }
@@ -78,6 +139,30 @@ impl CaptureBacking {
             bytes = &mut bytes[count..];
         }
         Ok(())
+    }
+}
+
+pub(in crate::live) fn read_at(
+    file: &File,
+    offset: u64,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buffer, offset)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buffer, offset)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "capture random reads are unsupported on this platform",
+        ))
     }
 }
 
@@ -100,7 +185,7 @@ impl Resources {
             .and_then(|n| n.checked_add(256))
             .is_none_or(|bytes| bytes > maximum)
         {
-            return Err(error(
+            return Err(crate::CapacityLimit::exceeded(
                 "capture resource description exceeds its metadata budget",
             ));
         }
@@ -179,13 +264,17 @@ impl Resources {
             metadata = metadata
                 .checked_add(bytes)
                 .filter(|bytes| *bytes <= metadata_limit)
-                .ok_or_else(|| error("capture resource directory exceeds its metadata budget"))?;
+                .ok_or_else(|| {
+                    crate::CapacityLimit::exceeded(
+                        "capture resource directory exceeds its metadata budget",
+                    )
+                })?;
             Ok(())
         };
-        charge(size_of::<Shared>() + size_of::<Store>() + READ_BUFFER_BYTES + MAP_ENTRY_BYTES)?;
+        charge(READER_BASE_BYTES)?;
         for block in blocks {
             check_replay_cancelled(cancelled)?;
-            charge(2 * MAP_ENTRY_BYTES + size_of::<Block>() + 64)?;
+            charge(BLOCK_READER_BYTES)?;
             if block.id == 0
                 || block.id >= RESOURCE_ID
                 || block.len > MAX_BLOCK
@@ -218,7 +307,7 @@ impl Resources {
                         .checked_mul(size_of::<ResourceHandle>())
                         .and_then(|m| n.checked_add(m))
                 })
-                .and_then(|n| n.checked_add(2 * MAP_ENTRY_BYTES + size_of::<Blob>() + 64))
+                .and_then(|n| n.checked_add(BLOB_READER_BYTES))
                 .ok_or_else(|| error("capture resource metadata overflow"))?;
             charge(refs)?;
             if blob.id < RESOURCE_ID || blob.len > MAX_RECORD || blob_map.contains_key(&blob.id) {

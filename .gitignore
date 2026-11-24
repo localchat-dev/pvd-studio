@@ -12,6 +12,7 @@ __pycache__/
 *.pvdstream
 *.pvd
 *.pvdcapture
+*.pvdset
 *.pxd
 *.pxd2
 *.ovd

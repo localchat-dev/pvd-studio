@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 mod admission_tests;
 mod key_schema;
+mod portable;
 mod reexport_tests;
 mod source_tests;
 

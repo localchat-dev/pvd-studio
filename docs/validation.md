@@ -222,3 +222,7 @@ cargo test --locked -p pvd-desktop studio::rooms::tests::tcp -- --ignored --noca
 - 原版多页、非空起点、更多绘制、错误生命周期及保存/裁剪互验的范围分别维护在兼容矩阵中。
 
 验证记录应绑定 Git 提交、输入摘要、参数和实际结果，分别记录失败及未执行项。性能测量需区分核心恢复、模型提交、GPU 完成与原生显示，并注明机器和构建配置。
+
+Unity 编辑器插件的安装包、TCP 最新帧接收、完整长录制、跨块回放及 Scene 视图现场验证见 [Unity 插件](unity.md#验证)。最新帧探针检查零磁盘缓存和重新打开视图时的帧恢复。实际地图的主线程帧耗时用独立的编辑器对照测量。
+
+单文件分段回归可运行 `cargo test --locked -p pvd-core portable`、`cargo test --locked -p pvd-core packed` 和 `cargo test --locked -p pvd-desktop desktop_opens_packed_range_and_resaves_to_one_compatible_capture`。跨端验证用插件的 `--portable --output` 探针生成录制，只复制导出的 `.pvdcapture` 到新目录，执行 `pvd-cli verify <复制后的文件>`，再用桌面 Studio 定位到内部段边界两侧。

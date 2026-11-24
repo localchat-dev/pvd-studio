@@ -53,11 +53,19 @@ pub(crate) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
                 "保存任务正在进行，请等待完成。",
             )
             .to_owned()
-    } else if history {
-        language.text(
-            &format!("Save all scenes' available frames {}–{} as .pvdcapture. Previously expired history cannot be recovered. TCP reception continues.", studio.first_frame(), studio.count().saturating_sub(1)),
-            &format!("将全部场景当前可用的 {}–{} 帧保存为 .pvdcapture；已淘汰历史无法补回，TCP 接收继续。", studio.first_frame(), studio.count().saturating_sub(1)),
-        ).to_owned()
+    } else if let Some(range) = studio.retained_range().filter(|_| history) {
+        language
+            .text(
+                &format!(
+                    "Save available frames {}–{} from all scenes. TCP reception continues.",
+                    range.first, range.last
+                ),
+                &format!(
+                    "保存全部场景当前可用的 {}–{} 帧，期间继续接收 TCP 数据。",
+                    range.first, range.last
+                ),
+            )
+            .to_owned()
     } else {
         raw_detail(studio).to_owned()
     };

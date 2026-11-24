@@ -274,6 +274,7 @@ fn source_with_replaced_backing(
     let backing = Arc::new(CaptureBacking {
         format: directory.format,
         file: File::open(path).unwrap(),
+        base: 0,
         path: path.to_owned(),
         bytes: original.len() as u64,
         owner: std::sync::Mutex::new(None),

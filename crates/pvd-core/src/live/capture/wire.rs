@@ -31,7 +31,9 @@ impl<'a, W: Write> Writer<'a, W> {
             .bytes
             .checked_add(bytes.len() as u64)
             .filter(|next| *next <= self.limit)
-            .ok_or_else(|| error("project capture exceeds its output byte limit"))?;
+            .ok_or_else(|| {
+                crate::CapacityLimit::exceeded("project capture exceeds its output byte limit")
+            })?;
         self.output.write_all(bytes)?;
         self.hash.update(bytes);
         self.bytes = next;
@@ -55,7 +57,9 @@ impl<'a, W: Write> Writer<'a, W> {
             .and_then(|n| n.checked_add(length as u64))
             .is_none_or(|end| end > self.limit)
         {
-            return Err(error("project capture exceeds its output byte limit"));
+            return Err(crate::CapacityLimit::exceeded(
+                "project capture exceeds its output byte limit",
+            ));
         }
         let mut hash = blake3::Hasher::new();
         hash.update(&[kind]);
@@ -107,12 +111,16 @@ impl<'a> Input<'a> {
     }
     pub fn count(&mut self, limit: usize, minimum_width: usize) -> Result<usize, Error> {
         let count = self.usize()?;
-        if count > limit
-            || count
-                .checked_mul(minimum_width)
-                .is_none_or(|size| size > self.bytes.len() - self.offset)
+        if count
+            .checked_mul(minimum_width)
+            .is_none_or(|size| size > self.bytes.len() - self.offset)
         {
             return Err(error("project capture directory count exceeds its bounds"));
+        }
+        if count > limit {
+            return Err(crate::CapacityLimit::exceeded(
+                "project capture directory count exceeds its bounds",
+            ));
         }
         Ok(count)
     }
@@ -138,7 +146,9 @@ pub(super) fn encode_segment(segment: &Segment, limit: usize) -> Result<Vec<u8>,
         })
         .and_then(|n| n.checked_add(40))
         .filter(|n| *n <= limit)
-        .ok_or_else(|| error("capture segment directory exceeds its temporary budget"))?;
+        .ok_or_else(|| {
+            crate::CapacityLimit::exceeded("capture segment directory exceeds its temporary budget")
+        })?;
     let mut out = u64_bytes([
         segment.analysis_base,
         segment
@@ -149,7 +159,7 @@ pub(super) fn encode_segment(segment: &Segment, limit: usize) -> Result<Vec<u8>,
     ]);
     out.try_reserve_exact(size - out.len())?;
     if out.capacity() > limit {
-        return Err(error(
+        return Err(crate::CapacityLimit::exceeded(
             "capture segment capacity exceeds its temporary budget",
         ));
     }

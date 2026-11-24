@@ -10,6 +10,54 @@ pub fn write_retained_new(
 ) -> Result<CaptureReport, Error> {
     limits.validate()?;
     progress(&mut callback, CapturePhase::Inspect, 0, 0)?;
+    let destination = destination_for_new(source, path)?;
+    let parent = destination.parent().unwrap();
+    space(parent, minimum_free_bytes, 0)?;
+    let (temporary, report) = admitted_temporary(
+        source,
+        parent,
+        range,
+        limits,
+        minimum_free_bytes,
+        &mut callback,
+    )?;
+    temporary.publish(&destination)?;
+    Ok(report)
+}
+
+pub(super) fn admitted_temporary(
+    source: &crate::Recording,
+    parent: &Path,
+    range: CaptureRange,
+    limits: &CaptureLimits,
+    minimum_free_bytes: u64,
+    mut callback: impl FnMut(CaptureProgress) -> bool,
+) -> Result<(Temporary, CaptureReport), Error> {
+    let mut temporary = Temporary::create(parent)?;
+    let report = {
+        let mut checked = temporary.checked_writer(parent, minimum_free_bytes);
+        write_retained(source, &mut checked, range, limits, &mut callback)?
+    };
+    temporary.close_synced()?;
+    // The full reader also budgets the resident resource directory and restoration state.
+    drop(read::open_with_progress(
+        &temporary.path,
+        limits,
+        &mut callback,
+    )?);
+    progress(
+        &mut callback,
+        CapturePhase::Validate,
+        report.bytes,
+        report.bytes,
+    )?;
+    Ok((temporary, report))
+}
+
+pub(super) fn destination_for_new(
+    source: &crate::Recording,
+    path: &Path,
+) -> Result<PathBuf, Error> {
     let name = path
         .file_name()
         .ok_or_else(|| error("capture output requires a file name"))?;
@@ -37,61 +85,61 @@ pub fn write_retained_new(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    space(&parent, minimum_free_bytes, 0)?;
-    let mut temporary = None;
-    for _ in 0..32 {
-        let path = parent.join(format!(
-            ".pvd-capture-{}-{}.tmp",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => {
-                temporary = Some(Temporary {
-                    path,
-                    file: Some(file),
-                });
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let mut temporary = temporary.ok_or_else(|| error("capture temporary names are in use"))?;
-    let report = {
-        let file = temporary.file.as_mut().unwrap();
-        let mut checked = SpaceChecked {
-            file,
-            parent: &parent,
-            minimum_free_bytes,
-        };
-        write_retained(source, &mut checked, range, limits, &mut callback)?
-    };
-    temporary.file.as_ref().unwrap().sync_all()?;
-    temporary.file.take();
-    // Opening also budgets the resident resource directory and restoration
-    // state, beyond the wire directory checked by write_retained. Close both
-    // handles before publication so Windows can rename the validated file.
-    let admitted = read::open_with_progress(&temporary.path, limits, &mut callback)?;
-    drop(admitted);
-    progress(
-        &mut callback,
-        CapturePhase::Validate,
-        report.bytes,
-        report.bytes,
-    )?;
-    publish_new(&temporary.path, &destination)?;
-    Ok(report)
+    Ok(destination)
 }
 
-struct Temporary {
-    path: PathBuf,
+pub(super) struct Temporary {
+    pub(super) path: PathBuf,
     file: Option<File>,
+}
+
+impl Temporary {
+    pub(super) fn checked_writer<'a>(
+        &'a mut self,
+        parent: &'a Path,
+        minimum_free_bytes: u64,
+    ) -> impl Read + Write + Seek + 'a {
+        SpaceChecked {
+            file: self.file.as_mut().unwrap(),
+            parent,
+            minimum_free_bytes,
+        }
+    }
+
+    pub(super) fn create(parent: &Path) -> Result<Self, Error> {
+        for _ in 0..32 {
+            let path = parent.join(format!(
+                ".pvd-capture-{}-{}.tmp",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error("capture temporary names are in use"))
+    }
+
+    pub(super) fn close_synced(&mut self) -> Result<(), Error> {
+        self.file.take().unwrap().sync_all()?;
+        Ok(())
+    }
+
+    pub(super) fn publish(self, destination: &Path) -> Result<(), Error> {
+        publish_new(&self.path, destination)
+    }
 }
 impl Drop for Temporary {
     fn drop(&mut self) {
@@ -99,7 +147,7 @@ impl Drop for Temporary {
         let _ = std::fs::remove_file(&self.path);
     }
 }
-fn space(parent: &Path, minimum: u64, additional: u64) -> Result<(), Error> {
+pub(super) fn space(parent: &Path, minimum: u64, additional: u64) -> Result<(), Error> {
     if minimum != 0 {
         let available=available_disk_space(parent)?.ok_or_else(|| error("capture free-space reserve is unsupported on this platform; specify zero explicitly"))?;
         if available

@@ -451,7 +451,7 @@ impl ReceiveContext<'_> {
             finish,
             intake_quiesced,
         } = *self;
-        stream.set_read_timeout(Some(POLL))?;
+        configure_receive_stream(&stream)?;
         let mut capture = config
             .capture_directory
             .as_deref()

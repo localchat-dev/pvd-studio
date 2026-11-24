@@ -1,6 +1,27 @@
 use super::*;
 
 const LIMIT: usize = 8 << 20;
+const CLASS_BYTES: usize = 256;
+const PROPERTY_BYTES: usize = 320;
+const TEXT_OVERHEAD: usize = 64;
+
+pub(in crate::live) fn schema_reader_bytes(
+    classes: &BTreeMap<String, crate::ClassDefinition>,
+) -> usize {
+    let text = |value: &str| value.len() + TEXT_OVERHEAD;
+    let mut bytes = 0usize;
+    for (name, class) in classes {
+        bytes += CLASS_BYTES + text(name) + class.parent.as_deref().map_or(0, text);
+        for (name, property) in &class.properties {
+            bytes +=
+                PROPERTY_BYTES + text(name) + text(&property.datatype) + text(&property.semantic);
+            for (name, _) in &property.named_values {
+                bytes += size_of::<(String, u32)>() + text(name);
+            }
+        }
+    }
+    bytes
+}
 
 pub(super) fn encode(
     source: &crate::Recording,
@@ -129,7 +150,7 @@ fn text(input: &mut wire::Input<'_>, budget: &mut Budget) -> Result<String, Erro
     let bytes = input.take(len)?;
     let source = std::str::from_utf8(bytes)?;
     budget.charge(
-        len.checked_add(64)
+        len.checked_add(TEXT_OVERHEAD)
             .ok_or_else(|| error("capture text size overflow"))?,
     )?;
     let mut value = String::new();
@@ -163,7 +184,7 @@ pub(super) fn decode(
         return Err(error("invalid capture metadata version or frame bounds"));
     }
     let count = input.count(LIMIT / 24, 24)?;
-    budget.entries(count, 256)?;
+    budget.entries(count, CLASS_BYTES)?;
     let mut classes = BTreeMap::new();
     for _ in 0..count {
         check_replay_cancelled(cancelled)?;
@@ -174,7 +195,7 @@ pub(super) fn decode(
             None
         };
         let count = input.count(LIMIT / 40, 40)?;
-        budget.entries(count, 320)?;
+        budget.entries(count, PROPERTY_BYTES)?;
         let mut properties = BTreeMap::new();
         for _ in 0..count {
             check_replay_cancelled(cancelled)?;

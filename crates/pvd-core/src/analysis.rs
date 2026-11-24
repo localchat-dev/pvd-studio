@@ -1759,8 +1759,7 @@ mod tests {
                     },
                     crate::frame_sources::FrameBinding::sdk("frame", 1, &builder.state).unwrap(),
                     &builder.state,
-                    &builder.recording.analysis,
-                    &mut builder.recording.frame_sources,
+                    &mut builder.recording,
                 )
                 .unwrap();
             if targets.contains(&frame) {

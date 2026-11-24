@@ -2,6 +2,12 @@ use crate::{Error, Geometry, Object, SceneState, Value, error};
 use pvd_protocol::{Endian, Header};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod display;
+pub use display::collect_display_rays_in_scenes;
+pub use display::{DisplayRay, DisplayRays, collect_display_rays};
+mod display_shapes;
+pub use display_shapes::{DisplayLine, DisplayLineStyle, DisplayShapes, collect_display_shapes};
+
 const MAX_RECORDS: usize = 100_000;
 const MAX_MESH_BYTES: usize = 128 * 1024 * 1024;
 #[cfg(test)]
@@ -165,49 +171,34 @@ fn collect_scene(
             for (index, value) in records.iter().enumerate() {
                 match suffix {
                     "Raycasts" => {
-                        let fields = record_fields(value, 9)?;
-                        let kind = uint(&fields[0])?;
-                        if kind > 2 {
-                            return Err(error(format!("Unsupported raycast kind {kind}")));
-                        }
-                        let origin = vector(&fields[3])?;
-                        let direction = unit_direction(&fields[4])?;
-                        let distance = positive_distance(&fields[5])?;
-                        let hits = c.hits(&fields[6..9], Some(distance), false)?;
+                        let ray = raycast_record(value)?;
+                        let hits = c.hits(ray.hits, Some(ray.distance), false)?;
                         result.raycasts.push(Raycast {
                             scene_id: scene.id,
                             index,
                             batched,
-                            kind,
-                            filter_data: filter_data(&fields[1])?,
-                            filter_flags: uint(&fields[2])?,
-                            origin,
-                            direction,
-                            distance,
+                            kind: ray.kind,
+                            filter_data: ray.filter_data,
+                            filter_flags: ray.filter_flags,
+                            origin: ray.origin,
+                            direction: ray.direction,
+                            distance: ray.distance,
                             hits,
                         });
                     }
                     "Sweeps" => {
-                        let fields = record_fields(value, 16)?;
-                        let kind = uint(&fields[0])?;
-                        if !(8..=10).contains(&kind) {
-                            return Err(error(format!("Unsupported sweep kind {kind}")));
-                        }
-                        let direction = unit_direction(&fields[2])?;
-                        let distance = positive_distance(&fields[3])?;
-                        let pose = singleton(c.range(&fields[7..10], "PoseList")?)?.clone();
-                        let data =
-                            filter_data(singleton(c.range(&fields[10..13], "FilterDataList")?)?)?;
-                        let geometry = c.geometry(&fields[4..7], &pose)?;
-                        validate_kind(kind, &geometry.geometry, true)?;
-                        let hits = c.hits(&fields[13..16], Some(distance), true)?;
+                        let query = c.sweep_record(value)?;
+                        let (direction, distance) = query.motion.expect("sweep motion");
+                        let geometry = c.geometry(query.geometry, &query.pose)?;
+                        validate_kind(query.kind, &geometry.geometry, true)?;
+                        let hits = c.hits(query.hits, Some(distance), true)?;
                         result.sweeps.push(Sweep {
                             scene_id: scene.id,
                             index,
                             batched,
-                            kind,
-                            filter_data: data,
-                            filter_flags: uint(&fields[1])?,
+                            kind: query.kind,
+                            filter_data: query.filter_data,
+                            filter_flags: query.filter_flags,
                             geometry,
                             direction,
                             distance,
@@ -215,21 +206,17 @@ fn collect_scene(
                         });
                     }
                     _ => {
-                        let fields = record_fields(value, 10)?;
-                        let kind = uint(&fields[0])?;
-                        if !(3..=7).contains(&kind) {
-                            return Err(error(format!("Unsupported overlap kind {kind}")));
-                        }
-                        let geometry = c.geometry(&fields[4..7], &fields[3])?;
-                        validate_kind(kind, &geometry.geometry, false)?;
-                        let hits = c.hits(&fields[7..10], None, false)?;
+                        let query = overlap_record(value)?;
+                        let geometry = c.geometry(query.geometry, &query.pose)?;
+                        validate_kind(query.kind, &geometry.geometry, false)?;
+                        let hits = c.hits(query.hits, None, false)?;
                         result.overlaps.push(Overlap {
                             scene_id: scene.id,
                             index,
                             batched,
-                            kind,
-                            filter_data: filter_data(&fields[1])?,
-                            filter_flags: uint(&fields[2])?,
+                            kind: query.kind,
+                            filter_data: query.filter_data,
+                            filter_flags: query.filter_flags,
                             geometry,
                             hits,
                         });
@@ -241,46 +228,53 @@ fn collect_scene(
     Ok((result, c.used))
 }
 
-impl Collector<'_> {
+impl<'a> Collector<'a> {
+    fn sweep_record<'r>(&self, value: &'r Value) -> Result<ShapeQueryRecord<'r>, Error> {
+        let fields = record_fields(value, 16)?;
+        let kind = uint(&fields[0])?;
+        if !(8..=10).contains(&kind) {
+            return Err(error(format!("Unsupported sweep kind {kind}")));
+        }
+        Ok(ShapeQueryRecord {
+            kind,
+            filter_data: filter_data(singleton(self.range(&fields[10..13], "FilterDataList")?)?)?,
+            filter_flags: uint(&fields[1])?,
+            motion: Some((unit_direction(&fields[2])?, positive_distance(&fields[3])?)),
+            pose: singleton(self.range(&fields[7..10], "PoseList")?)?.clone(),
+            geometry: &fields[4..7],
+            hits: &fields[13..16],
+        })
+    }
+
     fn range(&self, fields: &[Value], suffix: &str) -> Result<&[Value], Error> {
         let property = format!("{}.{}", self.prefix, suffix);
-        if !matches!(&fields[0], Value::String(name) if name == &property) {
-            return Err(error(format!(
-                "Scene query references an unsupported {suffix} array"
-            )));
-        }
-        let base = uint(&fields[1])? as usize;
-        let count = uint(&fields[2])? as usize;
-        let end = base
-            .checked_add(count)
-            .ok_or_else(|| error("Scene-query array range overflow"))?;
-        let values = self
-            .scene
-            .properties
-            .get(&property)
-            .map(array)
-            .transpose()?
-            .unwrap_or(&[]);
-        values.get(base..end).ok_or_else(|| {
-            error(format!(
-                "Scene-query {suffix} range exceeds the captured array"
-            ))
-        })
+        query_range(self.scene, fields, &property, suffix)
+    }
+
+    fn geometry_object(&self, fields: &[Value]) -> Result<&'a Object, Error> {
+        let Value::Ref(id) = singleton(self.range(fields, "GeometryList")?)? else {
+            return Err(error("Scene-query geometry requires an object reference"));
+        };
+        let property = format!("{}.GeometryList", self.prefix);
+        self.state
+            .resolve_reference(self.scene.id, &property, *id)
+            .ok_or_else(|| {
+                error("Scene-query geometry reference is absent or belongs to a different lifetime")
+            })
     }
 
     fn geometry(&mut self, fields: &[Value], pose: &Value) -> Result<QueryGeometry, Error> {
         let (position, rotation) = checked_transform(pose)?;
-        let Value::Ref(id) = singleton(self.range(fields, "GeometryList")?)? else {
-            return Err(error("Scene-query geometry requires an object reference"));
-        };
-        let id = *id;
-        let property = format!("{}.GeometryList", self.prefix);
-        let object = self
-            .state
-            .resolve_reference(self.scene.id, &property, id)
-            .ok_or_else(|| {
-                error("Scene-query geometry reference is absent or belongs to a different lifetime")
-            })?;
+        let object = self.geometry_object(fields)?;
+        self.geometry_at(object, position, rotation)
+    }
+
+    fn geometry_at(
+        &mut self,
+        object: &Object,
+        position: [f32; 3],
+        rotation: [f32; 4],
+    ) -> Result<QueryGeometry, Error> {
         let geometry = if object.type_name.ends_with("::PxBoxGeometry") {
             let half_extents = vector(required(object, "HalfExtents")?)?;
             if half_extents.iter().any(|v| *v <= 0.0) {
@@ -337,7 +331,7 @@ impl Collector<'_> {
         };
         Ok(QueryGeometry {
             reference: ObjectReference {
-                id,
+                id: object.id,
                 generation: Some(object.generation),
             },
             geometry,
@@ -360,16 +354,7 @@ impl Collector<'_> {
         let property = format!("{}.Hits", self.prefix);
         let mut result = Vec::with_capacity(count);
         for value in selected {
-            let fields = record_fields(value, 9)?;
-            let flags = uint(&fields[3])?;
-            let hit_distance = real(&fields[6])?;
-            if distance.is_some_and(|maximum| {
-                hit_distance > maximum + 0.001 || (!sweep && hit_distance < 0.0)
-            }) {
-                return Err(error(
-                    "Scene-query hit distance lies outside the query segment",
-                ));
-            }
+            let (fields, flags, hit_distance) = hit_fields(value, distance, sweep)?;
             let reference = |value: &Value| -> Result<ObjectReference, Error> {
                 let Value::Ref(id) = value else {
                     return Err(error("Scene query hit requires typed object references"));
@@ -414,6 +399,107 @@ impl Collector<'_> {
         self.used.hits += count;
         Ok(result)
     }
+}
+
+struct ShapeQueryRecord<'a> {
+    kind: u32,
+    filter_data: [u32; 4],
+    filter_flags: u32,
+    motion: Option<([f32; 3], f32)>,
+    pose: Value,
+    geometry: &'a [Value],
+    hits: &'a [Value],
+}
+
+fn overlap_record(value: &Value) -> Result<ShapeQueryRecord<'_>, Error> {
+    let fields = record_fields(value, 10)?;
+    let kind = uint(&fields[0])?;
+    if !(3..=7).contains(&kind) {
+        return Err(error(format!("Unsupported overlap kind {kind}")));
+    }
+    Ok(ShapeQueryRecord {
+        kind,
+        filter_data: filter_data(&fields[1])?,
+        filter_flags: uint(&fields[2])?,
+        motion: None,
+        pose: fields[3].clone(),
+        geometry: &fields[4..7],
+        hits: &fields[7..10],
+    })
+}
+
+struct RaycastRecord<'a> {
+    kind: u32,
+    filter_data: [u32; 4],
+    filter_flags: u32,
+    origin: [f32; 3],
+    direction: [f32; 3],
+    distance: f32,
+    hits: &'a [Value],
+}
+
+fn raycast_record(value: &Value) -> Result<RaycastRecord<'_>, Error> {
+    let fields = record_fields(value, 9)?;
+    let kind = uint(&fields[0])?;
+    if kind > 2 {
+        return Err(error(format!("Unsupported raycast kind {kind}")));
+    }
+    Ok(RaycastRecord {
+        kind,
+        filter_data: filter_data(&fields[1])?,
+        filter_flags: uint(&fields[2])?,
+        origin: vector(&fields[3])?,
+        direction: unit_direction(&fields[4])?,
+        distance: positive_distance(&fields[5])?,
+        hits: &fields[6..9],
+    })
+}
+
+fn query_range<'a>(
+    scene: &'a Object,
+    fields: &[Value],
+    property: &str,
+    suffix: &str,
+) -> Result<&'a [Value], Error> {
+    if !matches!(&fields[0], Value::String(name) if name == property) {
+        return Err(error(format!(
+            "Scene query references an unsupported {suffix} array"
+        )));
+    }
+    let base = uint(&fields[1])? as usize;
+    let count = uint(&fields[2])? as usize;
+    let end = base
+        .checked_add(count)
+        .ok_or_else(|| error("Scene-query array range overflow"))?;
+    let values = scene
+        .properties
+        .get(property)
+        .map(array)
+        .transpose()?
+        .unwrap_or(&[]);
+    values.get(base..end).ok_or_else(|| {
+        error(format!(
+            "Scene-query {suffix} range exceeds the captured array"
+        ))
+    })
+}
+
+fn hit_fields(
+    value: &Value,
+    distance: Option<f32>,
+    sweep: bool,
+) -> Result<(&[Value], u32, f32), Error> {
+    let fields = record_fields(value, 9)?;
+    let flags = uint(&fields[3])?;
+    let hit_distance = real(&fields[6])?;
+    if distance
+        .is_some_and(|maximum| hit_distance > maximum + 0.001 || (!sweep && hit_distance < 0.0))
+    {
+        return Err(error(
+            "Scene-query hit distance lies outside the query segment",
+        ));
+    }
+    Ok((fields, flags, hit_distance))
 }
 
 fn validate_kind(kind: u32, geometry: &Geometry, sweep: bool) -> Result<(), Error> {
@@ -885,6 +971,96 @@ mod tests {
     }
 
     #[test]
+    fn display_rays_clip_the_recorded_segment_and_use_the_nearest_usable_hit() {
+        let mut fields = array(&query_record(4)).unwrap().to_vec();
+        fields[3] = Value::Vec3([-20_000.0, 0.0, 0.0]);
+        fields[4] = Value::Vec3([1.0, 0.0, 0.0]);
+        fields[5] = Value::F32(40_000.0);
+        let hits = [
+            (20_002.0, [2.0, 0.0, 0.0], 1),
+            (19_999.0, [-1.0, 0.0, 0.0], 0),
+            (20_000.0, [f32::NAN, 0.0, 0.0], 1),
+            (20_001.0, [1.0, 0.0, 0.0], 1),
+        ]
+        .map(|(distance, position, flags)| {
+            let mut hit = array(&hit_record()).unwrap().to_vec();
+            hit[3] = Value::U64(flags);
+            hit[4] = Value::Vec3(position);
+            hit[6] = Value::F32(distance);
+            Value::Array(hit.into())
+        });
+        let mut state = SceneState::default();
+        state.objects.insert(
+            1,
+            scene(1, vec![Value::Array(fields.into())], hits.to_vec()),
+        );
+
+        let region = crate::RenderRegion::new([0.0; 3], 3.0);
+        let local = collect_display_rays(&state, None, region, 1, 10_000.0);
+        assert_eq!(local.rays.len(), 1);
+        let ray = &local.rays[0];
+        assert_eq!(ray.start, [-3.0, 0.0, 0.0]);
+        assert_eq!(ray.end, [3.0, 0.0, 0.0]);
+        assert_eq!(ray.marker, Some([1.0, 0.0, 0.0]));
+        assert!(ray.has_hit && !local.truncated);
+
+        let region = crate::RenderRegion::new([0.0; 3], 0.5);
+        let local = collect_display_rays(&state, None, region, 1, 10_000.0);
+        assert!(local.rays[0].has_hit);
+        assert_eq!(local.rays[0].marker, None);
+
+        let region = crate::RenderRegion::new([2.0, 0.0, 0.0], 0.25);
+        let local = collect_display_rays(&state, None, region, 1, 10_000.0);
+        assert_eq!(local.rays[0].marker, Some([2.0, 0.0, 0.0]));
+
+        let global = collect_display_rays(&state, None, None, 1, 10_000.0);
+        assert_eq!(global.rays[0].end, [-10_000.0, 0.0, 0.0]);
+        assert!(global.rays[0].has_hit);
+        assert_eq!(global.rays[0].marker, None);
+    }
+
+    #[test]
+    fn display_rays_use_the_scene_generation_and_limit_only_visible_rays() {
+        let mut ordinary = array(&query_record(0)).unwrap().to_vec();
+        ordinary[3] = Value::Vec3([0.0, 20.0, 0.0]);
+        ordinary[4] = Value::Vec3([1.0, 0.0, 0.0]);
+        let mut batched = array(&query_record(0)).unwrap().to_vec();
+        batched[3] = Value::Vec3([0.0; 3]);
+        batched[6] = Value::String("BatchedQueries.Hits".into());
+        let batched = Value::Array(batched.into());
+        let mut state = SceneState::default();
+        let mut scene = scene(1, vec![Value::Array(ordinary.into())], vec![]);
+        scene.generation = 5;
+        scene.properties.insert(
+            "BatchedQueries.Raycasts".into(),
+            Value::Array(vec![Value::F32(f32::NAN), batched.clone(), batched].into()),
+        );
+        scene
+            .properties
+            .insert("SceneQueries.Sweeps".into(), Value::U64(1));
+        state.objects.insert(1, scene);
+
+        let region = crate::RenderRegion::new([0.0; 3], 3.0);
+        let current = crate::frame_sources::FrameObject {
+            id: 1,
+            generation: 5,
+        };
+        let visible = collect_display_rays(&state, Some(current), region, 2, 10_000.0);
+        assert_eq!(visible.rays.len(), 2);
+        assert!(!visible.truncated);
+        let limited = collect_display_rays(&state, Some(current), region, 1, 10_000.0);
+        assert_eq!(limited.rays.len(), 1);
+        assert!(limited.truncated);
+
+        let obsolete = crate::frame_sources::FrameObject {
+            id: 1,
+            generation: 4,
+        };
+        let other = collect_display_rays(&state, Some(obsolete), region, 1, 10_000.0);
+        assert!(other.rays.is_empty() && !other.truncated);
+    }
+
+    #[test]
     fn invalid_scene_does_not_consume_other_scenes_hit_budget() {
         let valid_hit = hit_record();
         let mut invalid_fields = array(&valid_hit).unwrap().to_vec();
@@ -1069,6 +1245,142 @@ mod tests {
             std::sync::Arc::new(BTreeMap::from([(2, 4)])),
         );
         state
+    }
+
+    #[test]
+    fn shape_display_retains_valid_records_after_malformed_records_and_limits_lines() {
+        let mut state = shape_scene();
+        let scene = state.objects.get_mut(&1).unwrap();
+        let records = scene.properties.get_mut("SceneQueries.Overlaps").unwrap();
+        let valid = array(records).unwrap()[0].clone();
+        *records = Value::Array(vec![Value::U64(0), valid].into());
+        let collect =
+            |limit| collect_display_shapes(&state, state.objects.values(), None, limit, 10_000.0);
+        let all = collect(12);
+        assert_eq!(all.lines.len(), 12);
+        assert!(!all.truncated);
+        assert!(
+            all.lines
+                .iter()
+                .all(|line| line.style == DisplayLineStyle::Overlap)
+        );
+        assert!(all.lines.iter().any(|line| line.end == [1.0, 6.0, 1.0]));
+        let limited = collect(1);
+        assert_eq!(limited.lines.len(), 1);
+        assert!(limited.truncated);
+    }
+
+    #[test]
+    fn batched_capsule_sweep_clips_crossing_path_and_rotates_physx_x_axis() {
+        let mut state = shape_scene();
+        let source = state.objects.get_mut(&1).unwrap();
+        let properties = &mut source.properties;
+        properties.remove("SceneQueries.Overlaps");
+        let transform = Value::Transform {
+            position: [-20_000.0, 0.0, 0.0],
+            rotation: [
+                0.0,
+                0.0,
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
+            ],
+        };
+        let decoded = decode_property(
+            "physx3::PvdSweep",
+            &shape_query_bytes(8, Endian::Little, true),
+            1,
+            &header(8, Endian::Little),
+        )
+        .unwrap()
+        .unwrap();
+        let mut fields = array(&array(&decoded).unwrap()[0]).unwrap().to_vec();
+        fields[0] = Value::U64(9);
+        fields[2] = Value::Vec3([1.0, 0.0, 0.0]);
+        fields[3] = Value::F32(40_000.0);
+        for (base, suffix) in [
+            (4, "GeometryList"),
+            (7, "PoseList"),
+            (10, "FilterDataList"),
+            (13, "Hits"),
+        ] {
+            fields[base] = Value::String(format!("BatchedQueries.{suffix}"));
+            fields[base + 1] = Value::U64(0);
+        }
+        properties.insert(
+            "BatchedQueries.GeometryList".into(),
+            Value::Array(vec![Value::Ref(2)].into()),
+        );
+        properties.insert(
+            "BatchedQueries.PoseList".into(),
+            Value::Array(vec![transform].into()),
+        );
+        properties.insert(
+            "BatchedQueries.FilterDataList".into(),
+            Value::Array(vec![Value::Array(vec![Value::U64(0); 4].into())].into()),
+        );
+        properties.insert(
+            "BatchedQueries.Sweeps".into(),
+            Value::Array(vec![Value::Array(fields.into())].into()),
+        );
+        let mut hit = array(&hit_record()).unwrap().to_vec();
+        hit[3] = Value::U64(0);
+        hit[4] = Value::Vec3([0.0, 20.0, 0.0]);
+        hit[6] = Value::F32(20_000.0);
+        properties.insert(
+            "BatchedQueries.Hits".into(),
+            Value::Array(vec![Value::Array(hit.into())].into()),
+        );
+        let capsule = state.objects.get_mut(&2).unwrap();
+        capsule.type_name = "physx3::PxCapsuleGeometry".into();
+        capsule.properties = BTreeMap::from([
+            ("Radius".into(), Value::F32(0.5)),
+            ("HalfHeight".into(), Value::F32(2.0)),
+        ]);
+        state.reference_lifetimes.insert(
+            (1, "BatchedQueries.GeometryList".into()),
+            std::sync::Arc::new(BTreeMap::from([(2, 4)])),
+        );
+        let display =
+            |region| collect_display_shapes(&state, state.objects.values(), region, 1000, 10_000.0);
+        let local = display(crate::RenderRegion::new([0.0; 3], 3.0));
+        assert!(!local.truncated);
+        assert!(
+            local
+                .lines
+                .iter()
+                .any(|line| line.style == DisplayLineStyle::Sweep
+                    && line.start == [-3.0, 0.0, 0.0]
+                    && line.end == [3.0, 0.0, 0.0])
+        );
+        assert!(
+            local
+                .lines
+                .iter()
+                .filter(|line| line.style == DisplayLineStyle::Hit)
+                .any(|line| line.end[1] > 2.49 && line.end[0].abs() < 0.51)
+        );
+        assert!(
+            local
+                .lines
+                .iter()
+                .flat_map(|line| [line.start, line.end])
+                .all(|point| point.into_iter().map(|v| v * v).sum::<f32>() < 9.001)
+        );
+        let global = display(None);
+        assert!(
+            global
+                .lines
+                .iter()
+                .any(|line| line.style == DisplayLineStyle::Sweep
+                    && line.start == [-20_000.0, 0.0, 0.0]
+                    && line.end == [-10_000.0, 0.0, 0.0])
+        );
+        assert!(
+            global
+                .lines
+                .iter()
+                .all(|line| line.style != DisplayLineStyle::Hit)
+        );
     }
 
     #[test]

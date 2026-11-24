@@ -139,7 +139,25 @@ fn copy<W: Write>(
         };
         // Resolve one bank at a time. The returned segment keeps its resources
         // alive while the archive's bounded reader cache moves to another bank.
-        let owned = disk.owned_segment(first, &mut cancelled)?;
+        let location = match &disk.archive {
+            Some(archive) => archive.export_location(first, range.last)?,
+            None => first,
+        };
+        let mut owned = disk.owned_segment(first, &mut cancelled)?;
+        while owned.frames.last().unwrap().info.index < location {
+            let end = owned.frames.last().unwrap().info.index;
+            let expected = copied.prefix_digest(&owned, end, &mut cancelled)?;
+            let next = disk.owned_segment(end + 1, &mut cancelled)?;
+            if copied.prefix_digest(&next, end, &mut cancelled)? != expected {
+                return Err(read::part_error(
+                    &next.path,
+                    error(
+                        "capture part restoration prefix differs from the preceding visible history",
+                    ),
+                ));
+            }
+            owned = next;
+        }
         let segment = owned.as_ref();
         let last = segment
             .frames
@@ -155,96 +173,7 @@ fn copy<W: Write>(
                     .ok_or_else(|| error("capture frame index overflow"))?,
             )
         };
-        copied.resource(
-            segment,
-            segment.analysis_base,
-            &mut writer,
-            0,
-            &mut cancelled,
-        )?;
-        let mut saved = Segment {
-            analysis_base: segment.analysis_base,
-            previous_frame: segment.previous_frame,
-            continuity: segment.analysis_continuity,
-            frames: Vec::new(),
-            checkpoints: BTreeMap::new(),
-        };
-        for location in segment
-            .frames
-            .iter()
-            .take_while(|frame| frame.info.index <= range.last)
-        {
-            check_replay_cancelled(&mut cancelled)?;
-            if !segment.lease.available() {
-                return Err(error("history expired during capture export"));
-            }
-            let (bytes, record) = source_record(segment, location.offset, &mut cancelled)?;
-            let Record::Frame(frame) = record else {
-                return Err(error("capture frame record type mismatch"));
-            };
-            if frame.info.index != location.info.index
-                || frame.info.timestamp != location.info.timestamp
-                || frame.info.scene_id != location.info.scene_id
-            {
-                return Err(error(
-                    "capture frame metadata differs from its source index",
-                ));
-            }
-            for id in frame
-                .update
-                .objects
-                .iter()
-                .chain(&frame.update.debug)
-                .chain(&frame.update.contacts)
-                .filter_map(|(_, id)| *id)
-            {
-                copied.resource(segment, id, &mut writer, 0, &mut cancelled)?;
-            }
-            let offset = copy_record(&bytes, &mut writer, &mut cancelled)?;
-            copied.budget.push(
-                &mut saved.frames,
-                FrameLocation {
-                    undo: None,
-                    offset,
-                    ..location.clone()
-                },
-            )?;
-            if let Some(&checkpoint) = segment.checkpoints.get(&location.info.index) {
-                let (bytes, record) = source_record(segment, checkpoint, &mut cancelled)?;
-                let Record::Checkpoint(index) = record else {
-                    return Err(error("capture checkpoint record type mismatch"));
-                };
-                for id in index
-                    .objects
-                    .values()
-                    .chain(index.debug.values())
-                    .chain(index.contacts.values())
-                {
-                    copied.resource(segment, *id, &mut writer, 0, &mut cancelled)?;
-                }
-                let offset = copy_record(&bytes, &mut writer, &mut cancelled)?;
-                copied.budget.charge(160)?;
-                saved.checkpoints.insert(location.info.index, offset);
-            }
-        }
-        let bytes = wire::encode_segment(
-            &saved,
-            limits.index_bytes.saturating_sub(copied.budget.used),
-        )?;
-        copied.budget.charge(bytes.capacity())?;
-        writer.entry(wire::SEGMENT, &[&bytes], &mut cancelled)?;
-        let encoded_bytes = bytes.capacity();
-        drop(bytes);
-        copied.budget.release(encoded_bytes);
-        copied_frames += saved
-            .frames
-            .iter()
-            .filter(|frame| frame.info.index >= range.first)
-            .count() as u64;
-        let saved_bytes =
-            saved.frames.capacity() * size_of::<FrameLocation>() + saved.checkpoints.len() * 160;
-        drop(saved);
-        copied.budget.release(saved_bytes);
+        copied_frames += copied.segment(segment, range, &mut writer, &mut cancelled)?;
     }
     if copied_frames != count as u64 {
         return Err(error("capture range changed or contains a history gap"));
@@ -320,6 +249,133 @@ struct Copied<'a> {
     limits: &'a CaptureLimits,
 }
 impl Copied<'_> {
+    // Encode from a common file offset so checksums compare the frame records,
+    // baseline, checkpoints and their resource closures across different members.
+    fn prefix_digest(
+        &mut self,
+        segment: &SegmentView,
+        last: usize,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<blake3::Hash, Error> {
+        let mut sink = std::io::sink();
+        let mut writer = wire::Writer::new(&mut sink, self.limits.output_bytes)?;
+        let limits = CaptureLimits {
+            index_bytes: self.budget.limit - self.budget.used,
+            ..self.limits.clone()
+        };
+        let mut prefix = Copied {
+            resources: Default::default(),
+            blocks: Default::default(),
+            limits: &limits,
+            budget: Budget::new(limits.index_bytes),
+        };
+        prefix.segment(
+            segment,
+            CaptureRange {
+                first: segment.frames.first().unwrap().info.index,
+                last,
+            },
+            &mut writer,
+            cancelled,
+        )?;
+        self.budget.peak = self.budget.peak.max(self.budget.used + prefix.budget.peak);
+        Ok(writer.hash.finalize())
+    }
+
+    fn segment<W: Write>(
+        &mut self,
+        segment: &SegmentView,
+        range: CaptureRange,
+        writer: &mut wire::Writer<'_, W>,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<u64, Error> {
+        self.resource(segment, segment.analysis_base, writer, 0, cancelled)?;
+        let mut saved = Segment {
+            analysis_base: segment.analysis_base,
+            previous_frame: segment.previous_frame,
+            continuity: segment.analysis_continuity,
+            frames: Vec::new(),
+            checkpoints: BTreeMap::new(),
+        };
+        for location in segment
+            .frames
+            .iter()
+            .take_while(|frame| frame.info.index <= range.last)
+        {
+            check_replay_cancelled(cancelled)?;
+            if !segment.lease.available() {
+                return Err(error("history expired during capture export"));
+            }
+            let (bytes, record) = source_record(segment, location.offset, cancelled)?;
+            let Record::Frame(frame) = record else {
+                return Err(error("capture frame record type mismatch"));
+            };
+            if frame.info.index != location.info.index
+                || frame.info.timestamp != location.info.timestamp
+                || frame.info.scene_id != location.info.scene_id
+            {
+                return Err(error(
+                    "capture frame metadata differs from its source index",
+                ));
+            }
+            for id in frame
+                .update
+                .objects
+                .iter()
+                .chain(&frame.update.debug)
+                .chain(&frame.update.contacts)
+                .filter_map(|(_, id)| *id)
+            {
+                self.resource(segment, id, writer, 0, cancelled)?;
+            }
+            let offset = copy_record(&bytes, writer, cancelled)?;
+            self.budget.push(
+                &mut saved.frames,
+                FrameLocation {
+                    undo: None,
+                    offset,
+                    ..location.clone()
+                },
+            )?;
+            if let Some(&checkpoint) = segment.checkpoints.get(&location.info.index) {
+                let (bytes, record) = source_record(segment, checkpoint, cancelled)?;
+                let Record::Checkpoint(index) = record else {
+                    return Err(error("capture checkpoint record type mismatch"));
+                };
+                for id in index
+                    .objects
+                    .values()
+                    .chain(index.debug.values())
+                    .chain(index.contacts.values())
+                {
+                    self.resource(segment, *id, writer, 0, cancelled)?;
+                }
+                let offset = copy_record(&bytes, writer, cancelled)?;
+                self.budget.charge(160)?;
+                saved.checkpoints.insert(location.info.index, offset);
+            }
+        }
+        let bytes = wire::encode_segment(
+            &saved,
+            self.limits.index_bytes.saturating_sub(self.budget.used),
+        )?;
+        self.budget.charge(bytes.capacity())?;
+        writer.entry(wire::SEGMENT, &[&bytes], cancelled)?;
+        let encoded_bytes = bytes.capacity();
+        drop(bytes);
+        self.budget.release(encoded_bytes);
+        let count = saved
+            .frames
+            .iter()
+            .filter(|frame| frame.info.index >= range.first)
+            .count() as u64;
+        let saved_bytes =
+            saved.frames.capacity() * size_of::<FrameLocation>() + saved.checkpoints.len() * 160;
+        drop(saved);
+        self.budget.release(saved_bytes);
+        Ok(count)
+    }
+
     fn resource<W: Write>(
         &mut self,
         segment: &SegmentView,
@@ -343,7 +399,9 @@ impl Copied<'_> {
             .checked_add(self.blocks.len())
             .is_none_or(|n| n >= self.limits.resources)
         {
-            return Err(error("capture resource count exceeds its limit"));
+            return Err(crate::CapacityLimit::exceeded(
+                "capture resource count exceeds its limit",
+            ));
         }
         let description = segment
             .resources
@@ -372,7 +430,9 @@ impl Copied<'_> {
                 .checked_add(self.blocks.len())
                 .is_none_or(|n| n >= self.limits.resources)
             {
-                return Err(error("capture resource count exceeds its limit"));
+                return Err(crate::CapacityLimit::exceeded(
+                    "capture resource count exceeds its limit",
+                ));
             }
             if !segment.lease.available() {
                 return Err(error("history expired during capture block export"));
@@ -394,7 +454,9 @@ impl Copied<'_> {
             .checked_add(self.blocks.len())
             .is_none_or(|n| n >= self.limits.resources)
         {
-            return Err(error("capture resource count exceeds its limit"));
+            return Err(crate::CapacityLimit::exceeded(
+                "capture resource count exceeds its limit",
+            ));
         }
         let mut encoded = Vec::new();
         let encoded_size = 64usize

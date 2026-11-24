@@ -280,6 +280,12 @@ impl CaptureFile {
     }
 }
 
+fn configure_receive_stream(stream: &TcpStream) -> io::Result<()> {
+    // Windows accepted sockets inherit the listener's nonblocking mode.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(POLL))
+}
+
 fn receive_session(
     mut stream: TcpStream,
     config: &ListenConfig,
@@ -287,7 +293,7 @@ fn receive_session(
     output: &Output,
     finish: &AtomicBool,
 ) -> io::Result<()> {
-    stream.set_read_timeout(Some(POLL))?;
+    configure_receive_stream(&stream)?;
     let mut capture = config
         .capture_directory
         .as_deref()

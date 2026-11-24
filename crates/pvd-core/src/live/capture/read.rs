@@ -1,13 +1,57 @@
 use super::*;
 use std::io::SeekFrom;
 
+pub(in crate::live) fn part_error(path: &Path, failure: Error) -> Error {
+    let kind = failure
+        .downcast_ref::<std::io::Error>()
+        .map_or(std::io::ErrorKind::InvalidData, std::io::Error::kind);
+    std::io::Error::new(kind, format!("capture part {}: {failure}", path.display())).into()
+}
+
 pub fn open_with_progress(
     path: &Path,
     limits: &CaptureLimits,
-    mut callback: impl FnMut(CaptureProgress) -> bool,
+    callback: impl FnMut(CaptureProgress) -> bool,
 ) -> Result<crate::Recording, Error> {
+    let opened = open_report_with_progress(path, limits, callback)?;
+    let mut recording = opened.recording;
+    note_visible_range(&mut recording, opened.report.range);
+    Ok(recording)
+}
+
+pub(super) fn note_visible_range(recording: &mut crate::Recording, range: CaptureRange) {
+    recording.diagnostics.push(format!("Project capture retains source frames {}..={}; hidden restoration history and analysis retention boundaries are preserved. Type metadata belongs to the export snapshot.", range.first, range.last));
+}
+
+pub(in crate::live) struct OpenedCapture {
+    pub(in crate::live) recording: crate::Recording,
+    pub(in crate::live) report: CaptureReport,
+    pub(super) has_room_directory: bool,
+}
+
+pub(in crate::live) fn open_set_part(
+    path: &Path,
+    limits: &CaptureLimits,
+    callback: &mut dyn FnMut(CaptureProgress) -> bool,
+) -> Result<OpenedCapture, Error> {
+    segmented::check_part_location(path)?;
+    open_report_with_progress(path, limits, callback)
+}
+
+pub(in crate::live) fn open_report_with_progress(
+    path: &Path,
+    limits: &CaptureLimits,
+    mut callback: impl FnMut(CaptureProgress) -> bool,
+) -> Result<OpenedCapture, Error> {
     limits.validate()?;
     let path = std::fs::canonicalize(path)?;
+    let mut file = open_file(&path)?;
+    let bytes = file.metadata()?.len();
+    let directory = directory(&mut file, bytes, limits, &mut callback)?;
+    restore(path, file, 0, directory, limits, callback)
+}
+
+pub(super) fn open_file(path: &Path) -> Result<File, Error> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -15,14 +59,44 @@ pub fn open_with_progress(
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(1);
     }
-    let mut file = options.open(&path)?;
-    let bytes = file.metadata()?.len();
-    let directory = directory(&mut file, bytes, limits, &mut callback)?;
+    Ok(options.open(path)?)
+}
+
+pub(in crate::live) fn open_embedded(
+    path: &Path,
+    file: &File,
+    base: u64,
+    bytes: u64,
+    limits: &CaptureLimits,
+    mut callback: &mut dyn FnMut(CaptureProgress) -> bool,
+) -> Result<OpenedCapture, Error> {
+    let view = packed_read::FileView::new(file, base, bytes)?;
+    let directory = directory(&mut BufReader::new(view), bytes, limits, &mut callback)?;
+    restore(
+        path.to_owned(),
+        file.try_clone()?,
+        base,
+        directory,
+        limits,
+        callback,
+    )
+}
+
+fn restore(
+    path: PathBuf,
+    file: File,
+    base: u64,
+    directory: Directory,
+    limits: &CaptureLimits,
+    mut callback: impl FnMut(CaptureProgress) -> bool,
+) -> Result<OpenedCapture, Error> {
     let report = directory.report;
+    let bytes = report.bytes;
     let backing = Arc::new(CaptureBacking {
         format: directory.format,
         file,
         path: path.clone(),
+        base,
         bytes,
         owner: std::sync::Mutex::new(None),
     });
@@ -118,7 +192,6 @@ pub fn open_with_progress(
     let has_room_directory = metadata.rooms.is_some();
     recording.rooms = metadata.rooms.unwrap_or_default();
     recording.diagnostics = metadata.diagnostics;
-    recording.diagnostics.push(format!("Project capture retains source frames {}..={}; hidden restoration history and analysis retention boundaries are preserved. Type metadata belongs to the export snapshot.", report.range.first, report.range.last));
     recording.streamed_frame_end = Some(
         report
             .range
@@ -163,7 +236,11 @@ pub fn open_with_progress(
     }
     recording.analysis = recording.analysis_at_with_cancel(report.range.first, &mut cancelled)?;
     check_replay_cancelled(&mut cancelled)?;
-    Ok(recording)
+    Ok(OpenedCapture {
+        recording,
+        report,
+        has_room_directory,
+    })
 }
 
 fn validate_records(
@@ -283,6 +360,9 @@ pub(super) fn directory<R: Read + Seek>(
     input.read_exact(&mut magic)?;
     let format =
         Format::from_magic(&magic)?.ok_or_else(|| error("invalid project capture header"))?;
+    if !matches!(format, Format::V1 | Format::V2 | Format::V3) {
+        return Err(error("capture member must be a single PVDCAP01/02/03 file"));
+    }
     let mut hash = blake3::Hasher::new();
     hash.update(&magic);
     let mut position = 8u64;
@@ -485,7 +565,9 @@ pub(super) fn directory<R: Read + Seek>(
                 frame_total = frame_total
                     .checked_add(segment.frames.len())
                     .filter(|count| *count <= limits.frames)
-                    .ok_or_else(|| error("capture frame count exceeds its limit"))?;
+                    .ok_or_else(|| {
+                        crate::CapacityLimit::exceeded("capture frame count exceeds its limit")
+                    })?;
                 budget.push(&mut segments, segment)?;
             }
             wire::METADATA => {
@@ -647,7 +729,9 @@ pub(super) fn directory<R: Read + Seek>(
             .checked_add(blob_ids.len())
             .is_none_or(|n| n > limits.resources)
         {
-            return Err(error("capture resource count exceeds its limit"));
+            return Err(crate::CapacityLimit::exceeded(
+                "capture resource count exceeds its limit",
+            ));
         }
     }
 }

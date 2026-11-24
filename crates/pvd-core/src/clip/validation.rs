@@ -1,4 +1,4 @@
-use crate::{Action, Error, SceneState, debug_draw::Primitive, error};
+use crate::{Action, Error, ErrorEvent, SceneState, Value, debug_draw::Primitive, error};
 
 #[derive(Default)]
 pub(crate) struct ValidationState {
@@ -15,26 +15,24 @@ impl ValidationState {
         limit: usize,
     ) -> Result<(), Error> {
         let affected_bytes = |state: &SceneState| match &action {
-            Action::Set(id, key, _) => state
-                .objects
-                .get(id)
-                .and_then(|object| object.properties.get(key))
-                .map_or(0, |value| property_bytes(key, value)),
-            Action::Create(object) => object_bytes(state, object.id),
-            Action::Destroy(id)
-            | Action::Push(id, ..)
-            | Action::Remove(id, ..)
-            | Action::Debug(id, ..)
-            | Action::Contacts(id, ..) => object_bytes(state, *id),
-            Action::ClearDebug(ids) => ids.iter().map(|id| object_bytes(state, *id)).sum(),
-            Action::ReplaceDebug(_) => state
-                .debug_draw
-                .values()
-                .map(|draw| {
-                    (draw.capacity() - draw.len()) * std::mem::size_of::<Primitive>()
-                        + crate::debug_windows::primitive_bytes(draw)
+            Action::Set(id, key, _) => property_bytes(state, *id, key, Value::retained_bytes),
+            Action::Push(id, key, _) | Action::Remove(id, key, _) => {
+                // Only the top-level array allocation and its reference bindings can change.
+                property_bytes(state, *id, key, |value| match value {
+                    Value::Array(values) => values.capacity() * std::mem::size_of::<Value>(),
+                    _ => 0,
                 })
+            }
+            Action::Create(object) => object_bytes(state, object.id),
+            Action::Destroy(id) => object_bytes(state, *id),
+            Action::Debug(id, ..) => state.debug_draw.get(id).map_or(0, draw_bytes),
+            Action::Contacts(id, ..) => contacts_bytes(state, *id),
+            Action::ClearDebug(ids) => ids
+                .iter()
+                .filter_map(|id| state.debug_draw.get(id))
+                .map(draw_bytes)
                 .sum(),
+            Action::ReplaceDebug(_) => state.debug_draw.values().map(draw_bytes).sum(),
             Action::Error(_) => 0,
             Action::Camera(name, _) | Action::RemoveCamera(name) => state
                 .cameras
@@ -45,9 +43,7 @@ impl ValidationState {
         action.apply(state);
         let after = affected_bytes(state);
         let error_bytes = match &action {
-            Action::Error(event) => {
-                2 * std::mem::size_of_val(event) + event.message.len() + event.file.len()
-            }
+            Action::Error(event) => error_bytes(event),
             _ => 0,
         };
         self.state_bytes = self
@@ -62,10 +58,51 @@ impl ValidationState {
         }
         Ok(())
     }
+
+    pub fn discard_errors(&mut self, state: &mut SceneState) {
+        self.state_bytes -= state
+            .errors
+            .drain(..)
+            .map(|event| error_bytes(&event))
+            .sum::<usize>();
+    }
 }
 
-fn property_bytes(key: &str, value: &crate::Value) -> usize {
-    key.len() + 96 + value.retained_bytes() + value.reference_count() * 80
+fn error_bytes(event: &ErrorEvent) -> usize {
+    2 * std::mem::size_of_val(event) + event.message.len() + event.file.len()
+}
+
+fn property_bytes(
+    state: &SceneState,
+    id: u64,
+    key: &str,
+    value_bytes: impl FnOnce(&Value) -> usize,
+) -> usize {
+    state
+        .objects
+        .get(&id)
+        .and_then(|object| object.properties.get(key))
+        .map_or(0, |value| key.len() + 96 + value_bytes(value))
+        + state
+            .reference_lifetimes
+            .get(&(id, key.to_owned()))
+            .map_or(0, |bindings| binding_bytes(key, bindings.len()))
+}
+
+fn binding_bytes(key: &str, count: usize) -> usize {
+    key.len() + 96 + count * 80
+}
+
+fn draw_bytes(draw: &std::sync::Arc<Vec<Primitive>>) -> usize {
+    (draw.capacity() - draw.len()) * std::mem::size_of::<Primitive>()
+        + crate::debug_windows::primitive_bytes(draw)
+}
+
+fn contacts_bytes(state: &SceneState, id: u64) -> usize {
+    state
+        .contacts
+        .get(&id)
+        .map_or(0, |contacts| 80 + std::mem::size_of_val(contacts.as_ref()))
 }
 
 fn object_bytes(state: &SceneState, id: u64) -> usize {
@@ -74,21 +111,16 @@ fn object_bytes(state: &SceneState, id: u64) -> usize {
             + object
                 .properties
                 .iter()
-                .map(|(key, value)| property_bytes(key, value))
-                .sum::<usize>()
-    }) + state.debug_draw.get(&id).map_or(0, |draw| {
-        draw.capacity() * std::mem::size_of::<Primitive>()
-            + draw
-                .iter()
-                .map(|primitive| match primitive {
-                    Primitive::Text { text, .. } => text.len(),
-                    _ => 0,
-                })
+                .map(|(key, value)| key.len() + 96 + value.retained_bytes())
                 .sum::<usize>()
     }) + state
-        .contacts
-        .get(&id)
-        .map_or(0, |contacts| std::mem::size_of_val(contacts.as_ref()))
+        .reference_lifetimes
+        .range((id, String::new())..)
+        .take_while(|((owner, _), _)| *owner == id)
+        .map(|((_, key), bindings)| binding_bytes(key, bindings.len()))
+        .sum::<usize>()
+        + state.debug_draw.get(&id).map_or(0, draw_bytes)
+        + contacts_bytes(state, id)
         + usize::from(state.generations.contains_key(&id)) * 80
 }
 
@@ -201,5 +233,25 @@ mod tests {
         );
         assert!(result.unwrap_err().to_string().contains("resource budget"));
         assert_eq!(scene.errors.len(), 1);
+    }
+
+    #[test]
+    fn reference_bindings_count_towards_the_scene_budget_without_a_value() {
+        let mut validation = ValidationState::default();
+        let mut state = SceneState::default();
+        validation
+            .apply(Action::Push(1, "actors".into(), 2), &mut state, 1024)
+            .unwrap();
+        let first = validation.state_bytes;
+        assert!(first > 0);
+        assert!(
+            validation
+                .apply(Action::Push(1, "actors".into(), 3), &mut state, first)
+                .is_err()
+        );
+        validation
+            .apply(Action::Destroy(1), &mut state, 1024)
+            .unwrap();
+        assert_eq!(validation.state_bytes, 0);
     }
 }

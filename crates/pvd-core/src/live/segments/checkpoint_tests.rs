@@ -50,6 +50,39 @@ fn append(writer: &mut SegmentWriter, index: usize, scene: &SceneState) {
 }
 
 #[test]
+fn new_bank_counts_only_roots_visible_after_its_first_update() {
+    let directory = crate::frame_source_tests::TestDirectory::new();
+    let owner = CacheDirectory::new(&directory.config().directory).unwrap();
+    let mut writer = SegmentWriter::new(&owner, 0).unwrap();
+    let mut scene = scene(3);
+    append(&mut writer, 0, &scene);
+    let roots = (1..=3)
+        .map(|id| writer.state.roots[&writer.state.index.objects[&id]].clone())
+        .collect::<Vec<_>>();
+    let mut next = SegmentWriter::with_state(
+        &owner,
+        1,
+        writer.view.resources.clone(),
+        Some(writer.state),
+        true,
+    )
+    .unwrap();
+    Action::Set(2, "value".into(), Value::U64(99)).apply(&mut scene);
+    scene.objects.remove(&3);
+    let patch = SceneUpdate::capture(&scene, &[2, 3].into(), false);
+    let plan = next
+        .prepare(&info(1), &scene, &patch, &Analysis::default(), &[])
+        .unwrap();
+    let mut bank = resources::capture::BankIndex::default();
+    plan.exceeds_bank_target(&mut bank, &next, usize::MAX);
+    for (i, root) in roots.iter().enumerate() {
+        let before = bank.bytes();
+        bank.observe(root);
+        assert_eq!(bank.bytes() == before, i == 0, "inherited object {}", i + 1);
+    }
+}
+
+#[test]
 fn repeated_full_checkpoints_share_blocks_without_object_dependency_vectors() {
     let path = directory();
     {

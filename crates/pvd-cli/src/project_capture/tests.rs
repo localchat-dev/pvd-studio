@@ -58,8 +58,37 @@ fn inspect_verify_frame_and_bench_use_only_visible_absolute_frames() {
         |_| true,
     )
     .unwrap();
+    let portable = case.0.join("portable.pvdcapture");
+    pvd_core::capture::write_portable_new(
+        &recording,
+        &portable,
+        pvd_core::capture::CaptureRange { first: 3, last: 6 },
+        &pvd_core::capture::CaptureLimits {
+            frames: 2,
+            ..Default::default()
+        },
+        0,
+        |_| true,
+    )
+    .unwrap();
     drop(recording);
     drop(live);
+    let portable_path = portable.to_str().unwrap();
+    assert!(is_capture(portable_path).unwrap());
+    assert_eq!(
+        pvd_core::capture::open_with_progress(&portable, &Default::default(), |_| true)
+            .unwrap()
+            .capture_format(),
+        Some(pvd_core::capture::Format::V4)
+    );
+    assert!(Recording::from_bytes(&std::fs::read(&portable).unwrap()).is_err());
+    assert_eq!(
+        sample_frames(&Recording::from_path(portable_path).unwrap()).unwrap(),
+        [3, 5, 6]
+    );
+    assert!(require_full_source(portable_path).is_err());
+    crate::inspect(portable_path).unwrap();
+    crate::verify(portable_path).unwrap();
     let path = path.to_str().unwrap();
     assert!(is_capture(path).unwrap());
     let reopened = Recording::from_path(path).unwrap();

@@ -333,6 +333,7 @@ fn reclaim_io_errors_preserve_the_active_directory_and_propagate_without_rollove
                 &patch(&state),
                 Some(&Analysis::default()),
                 &[],
+                None,
             )
             .unwrap_err();
         assert!(

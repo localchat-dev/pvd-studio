@@ -161,6 +161,38 @@ fn cancelled_frame_preparation_is_an_interruption_not_a_retention_limit() {
 }
 
 #[test]
+fn cancelled_index_triggered_seal_preserves_the_last_completed_boundary() {
+    let directory = TestDirectory::new();
+    let history = HistoryWriter::new_persistent(directory.config()).unwrap();
+    let mut live = Streaming::new(history);
+    let mut capture = metadata();
+    let scene = state(0);
+    live.complete(info(0), binding(), &scene, &mut capture)
+        .unwrap();
+    live.prepare_persistent(&capture).unwrap();
+    live.history.archive.as_mut().unwrap().index_limit = live.history.bank_index.bytes();
+    live.history
+        .set_cancellation(IngestCancellation(Some(Arc::new(AtomicBool::new(true)))));
+
+    let failure = live
+        .complete(info(1), binding(), &scene, &mut capture)
+        .unwrap_err();
+    interrupted(&failure);
+    assert!(live.history.accepting_frames());
+    assert!(live.history.warning.is_none());
+    assert_eq!(live.frames_seen, 1);
+    assert_eq!(
+        capture
+            .frame_sources
+            .source(binding().source)
+            .unwrap()
+            .observed_frames(),
+        1
+    );
+    assert_value(&recording(&live.history), 0);
+}
+
+#[test]
 fn cancellation_after_publication_keeps_the_sealed_bank_and_readable_prefix() {
     let directory = TestDirectory::new();
     let mut history = history_with_cold_prefix(&directory);

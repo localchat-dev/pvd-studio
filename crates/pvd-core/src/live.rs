@@ -1167,6 +1167,13 @@ impl DiskRecording {
     }
 
     pub(crate) fn capture_format(&self) -> Option<capture::Format> {
+        if let Some(format) = self
+            .archive
+            .as_ref()
+            .and_then(persistent::ArchiveReader::capture_format)
+        {
+            return Some(format);
+        }
         self.segments
             .front()
             .map(Arc::as_ref)
@@ -1444,10 +1451,16 @@ pub(crate) struct HistoryWriter {
     retention_stopped: bool,
     pending_archive_bytes: u64,
     persistent_baseline: Option<persistent::PressureBaseline>,
+    bank_index: resources::capture::BankIndex,
+    schema_reader_bytes: Option<usize>,
     cancellation: IngestCancellation,
 }
 
 impl HistoryWriter {
+    pub(crate) fn directory(&self) -> Option<&Path> {
+        self.owner.as_ref().map(|owner| owner.path.as_path())
+    }
+
     pub fn new(mut config: HistoryConfig) -> Result<Self, Error> {
         if config.disk_budget_bytes < 4096 || config.segment_frames == 0 {
             return Err(error(
@@ -1491,6 +1504,8 @@ impl HistoryWriter {
             retention_stopped: false,
             pending_archive_bytes: 0,
             persistent_baseline: None,
+            bank_index: Default::default(),
+            schema_reader_bytes: None,
             cancellation: IngestCancellation::default(),
         })
     }
@@ -1540,8 +1555,13 @@ impl HistoryWriter {
                 .map_or(0, |segment| segment.view.lease.bytes())
     }
 
+    pub(crate) fn invalidate_schema_size(&mut self) {
+        self.schema_reader_bytes = None;
+    }
+
     pub fn cache_bytes(&self) -> usize {
         self.resources.as_ref().map_or(0, Resources::metadata_bytes)
+            + self.bank_index.cache_bytes()
             + self.lease_bytes()
             + self.analysis_cache.bytes()
             + self
@@ -1684,7 +1704,8 @@ impl HistoryWriter {
         analysis: &Analysis,
         inputs: Vec<AnalysisInput>,
     ) {
-        self.append_captured(info, state, patch, Some(analysis), None, inputs);
+        self.append_shared(info, state, patch, &analysis.clone().into(), inputs, None)
+            .unwrap();
     }
 
     pub fn append_shared(
@@ -1694,36 +1715,18 @@ impl HistoryWriter {
         patch: &SceneUpdate,
         analysis: &SharedAnalysis,
         inputs: Vec<AnalysisInput>,
-    ) {
-        self.append_captured(
-            info,
-            state,
-            patch,
-            analysis.legacy(),
-            analysis.resident(),
-            inputs,
-        );
-    }
-
-    fn append_captured(
-        &mut self,
-        info: &FrameInfo,
-        state: &SceneState,
-        patch: &SceneUpdate,
-        analysis: Option<&Analysis>,
-        resident: Option<&crate::analysis::resident::ResidentAnalysis>,
-        inputs: Vec<AnalysisInput>,
-    ) {
+        source: Option<&crate::Recording>,
+    ) -> Result<(), Error> {
         if self.retention_stopped {
-            return;
+            return Ok(());
         }
         let _timer = self.metrics.measure(Stage::HistoryAppend);
         let preparation = if let Some(pages) = &mut self.analysis_pages {
-            match resident {
+            match analysis.resident() {
                 Some(analysis) => pages.adopt(info.index, analysis, &inputs),
                 None => pages.advance(info.index, &inputs),
             }
-        } else if analysis.is_none() {
+        } else if analysis.legacy().is_none() {
             Err(error(
                 "legacy history cannot store a resident analysis root",
             ))
@@ -1737,12 +1740,21 @@ impl HistoryWriter {
             if self.archive.is_some() {
                 self.stop_retention(failure);
             }
-            return;
+            return Ok(());
         }
         if Instant::now() < self.retry_after {
-            return;
+            return Ok(());
         }
-        if let Err(error) = self.append_inner(info, state, patch, analysis, &inputs) {
+        if let Err(error) =
+            self.append_inner(info, state, patch, analysis.legacy(), &inputs, source)
+        {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|failure| failure.kind() == std::io::ErrorKind::Interrupted)
+            {
+                return Err(error);
+            }
+            self.cancellation.check()?;
             self.warning = Some(format!(
                 "Disk history unavailable; live decoding continues: {error}"
             ));
@@ -1759,6 +1771,7 @@ impl HistoryWriter {
         } else {
             self.warning = None;
         }
+        Ok(())
     }
 
     fn reclaim(
@@ -1829,6 +1842,7 @@ impl HistoryWriter {
         patch: &SceneUpdate,
         analysis: Option<&Analysis>,
         inputs: &[AnalysisInput],
+        source: Option<&crate::Recording>,
     ) -> Result<(), Error> {
         if self.owner.is_none() {
             let owner = CacheDirectory::new(&self.config.directory)?;
@@ -1952,6 +1966,21 @@ impl HistoryWriter {
                         ));
                     }
                 }
+            }
+            if let (Some(archive), Some(source)) = (&self.archive, source)
+                && prepared.exceeds_bank_target(
+                    &mut self.bank_index,
+                    self.active.as_ref().unwrap(),
+                    archive.index_limit.saturating_sub(
+                        *self
+                            .schema_reader_bytes
+                            .get_or_insert_with(|| capture::schema_reader_bytes(&source.classes)),
+                    ),
+                )
+            {
+                drop(prepared);
+                self.seal_bank(source)?;
+                continue;
             }
             let before = resources.physical_bytes();
             prepared.persist_resources(&resources)?;
@@ -2288,8 +2317,7 @@ impl Streaming {
         info: FrameInfo,
         binding: FrameBinding,
         state: &SceneState,
-        analysis: &SharedAnalysis,
-        directory: &mut FrameDirectory,
+        recording: &mut crate::Recording,
     ) -> Result<(), Error> {
         let _timer = self.history.metrics.measure(Stage::FrameComplete);
         if info.index != self.frames_seen {
@@ -2313,14 +2341,16 @@ impl Streaming {
             &info,
             state,
             &patch,
-            analysis,
+            &recording.analysis,
             std::mem::take(&mut self.analysis_inputs),
-        );
+            Some(recording),
+        )?;
         let retained = self
             .history
             .frame_infos
             .last()
             .is_some_and(|last| last.index == info.index);
+        let directory = &mut recording.frame_sources;
         directory.observe(info.index, binding, retained)?;
         self.frames_seen = next_frame;
         self.prune_frame_sources(directory);
@@ -2359,7 +2389,7 @@ impl Streaming {
                 },
             ));
             self.frame = Some(info);
-            self.display_analysis = Some(analysis.clone());
+            self.display_analysis = Some(recording.analysis.clone());
             self.display_requires_full = false;
             self.clear_display_changes();
         } else {

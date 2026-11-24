@@ -44,11 +44,15 @@ pub fn encode_with_cancel(
             bytes = bytes
                 .checked_add(objects * OBJECT_BYTES)
                 .filter(|bytes| *bytes <= max_bytes)
-                .ok_or_else(|| error("frame source encoded byte limit exceeded"))?;
+                .ok_or_else(|| {
+                    crate::CapacityLimit::exceeded("frame source encoded byte limit exceeded")
+                })?;
         }
     }
     if bytes > max_bytes {
-        return Err(error("frame source encoded byte limit exceeded"));
+        return Err(crate::CapacityLimit::exceeded(
+            "frame source encoded byte limit exceeded",
+        ));
     }
     let temporary_bytes = directory
         .sources
@@ -61,7 +65,9 @@ pub fn encode_with_cancel(
         .checked_add(temporary_bytes)
         .is_none_or(|total| total > max_bytes)
     {
-        return Err(error("frame source encoding workspace limit exceeded"));
+        return Err(crate::CapacityLimit::exceeded(
+            "frame source encoding workspace limit exceeded",
+        ));
     }
     let mut output = Vec::new();
     output
@@ -180,7 +186,9 @@ pub fn decode_with_cancel(
         .index_bytes
         .checked_sub(temporary_bytes)
         .filter(|bytes| *bytes >= size_of::<FrameDirectory>())
-        .ok_or_else(|| error("frame source decoding workspace limit exceeded"))?;
+        .ok_or_else(|| {
+            crate::CapacityLimit::exceeded("frame source decoding workspace limit exceeded")
+        })?;
     let mut directory = FrameDirectory::new(FrameDirectoryLimits {
         index_bytes,
         ..limits

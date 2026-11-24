@@ -1,0 +1,7 @@
+{
+  "name": "PvdStudio.Editor.Tests",
+  "references": ["PvdStudio.Editor"],
+  "includePlatforms": ["Editor"],
+  "defineConstraints": ["UNITY_EDITOR_WIN", "UNITY_INCLUDE_TESTS"],
+  "optionalUnityReferences": ["TestAssemblies"]
+}

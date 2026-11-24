@@ -20,6 +20,10 @@ fn source_key(section: FrameSection) -> FrameSourceKey {
 }
 
 fn source_fixture(paged: bool) -> Fixture {
+    source_fixture_with_step_offset(paged, 0)
+}
+
+fn source_fixture_with_step_offset(paged: bool, step_offset: u64) -> Fixture {
     let root = std::env::temp_dir().join(format!(
         "pvd-source-capture-{}-{}",
         std::process::id(),
@@ -67,7 +71,7 @@ fn source_fixture(paged: bool) -> Fixture {
         let object = state.objects.get_mut(&source).unwrap();
         object
             .properties
-            .insert("step".into(), Value::U64((index / 2) as u64));
+            .insert("step".into(), Value::U64((index / 2) as u64 + step_offset));
         if source == APEX && index >= 9 {
             object.generation = 2;
         }
@@ -134,7 +138,6 @@ fn source_fixture(paged: bool) -> Fixture {
 }
 
 fn assert_source_range(recording: &crate::Recording, fixture: &Fixture, range: CaptureRange) {
-    assert_eq!(recording.capture_format(), Some(Format::V3));
     recording
         .frame_sources
         .validate_frames(&recording.frames)
@@ -613,3 +616,5 @@ fn source_directory_budget_and_late_cancellation_reject_incomplete_archives() {
             .starts_with(".pvd-capture-")
     }));
 }
+
+mod segmented;

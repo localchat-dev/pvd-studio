@@ -1,6 +1,13 @@
 use super::*;
+use pvd_core::capture::CaptureRange;
 
 impl Studio {
+    pub fn retained_range(&self) -> Option<CaptureRange> {
+        self.timeline_recording_arc()
+            .as_deref()
+            .and_then(CaptureRange::retained)
+    }
+
     pub fn recording_saves_history(&self) -> bool {
         self.timeline_recording().is_some_and(|recording| {
             recording.is_disk_backed()
@@ -46,19 +53,21 @@ impl Studio {
             && self.job.is_none()
             && self.save_job.is_none()
             && self.recording_export.is_none()
-            && self.timeline_recording().is_some_and(|recording| {
+            && self.timeline_recording_arc().is_some_and(|recording| {
                 matches!(
                     recording.source,
                     pvd_core::RecordingSource::SdkStream
                         | pvd_core::RecordingSource::ProjectCapture
                 ) && recording.is_disk_backed()
-                    && recording.first_frame() < recording.frame_count()
+                    && !recording.frames.is_empty()
             })
     }
 
     pub fn use_retained_range(&mut self) {
-        self.retained_first = self.first_frame();
-        self.retained_last = self.count().saturating_sub(1);
+        if let Some(range) = self.retained_range() {
+            self.retained_first = range.first;
+            self.retained_last = range.last;
+        }
     }
 
     pub fn export_retained(&mut self, context: egui::Context) {
@@ -66,7 +75,12 @@ impl Studio {
             return;
         }
         let (first, last) = (self.retained_first, self.retained_last);
-        if first < self.first_frame() || first > last || last >= self.count() {
+        let Some(recording) = self.timeline_recording_arc() else {
+            return;
+        };
+        if !CaptureRange::retained(&recording).is_some_and(|available| {
+            available.first <= first && first <= last && last <= available.last
+        }) {
             self.notice(Message::new(
                 "The requested range is no longer retained. Select an available range and retry.",
                 "所选范围已不在保留历史中，请选择可用范围后重试。",
@@ -78,13 +92,13 @@ impl Studio {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("pvdcapture"))
         {
             self.notice(Message::new(
-                "Use .pvdcapture for a retained project capture.",
-                "保留范围的项目捕获请使用 .pvdcapture 扩展名。",
+                "Choose a .pvdcapture filename for the recording.",
+                "录制文件请使用 .pvdcapture 扩展名。",
             ));
             return;
         }
         let source = crate::recording_export::Source::Retained {
-            recording: self.timeline_recording_arc().unwrap(),
+            recording,
             epoch: self.capture_epoch.clone(),
             expected_epoch: self.capture_epoch.load(Ordering::Relaxed),
         };

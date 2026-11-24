@@ -1,0 +1,7 @@
+{
+  "name": "PvdStudio.Editor",
+  "rootNamespace": "PvdStudio.Editor",
+  "includePlatforms": ["Editor"],
+  "defineConstraints": ["UNITY_EDITOR_WIN"],
+  "autoReferenced": false
+}

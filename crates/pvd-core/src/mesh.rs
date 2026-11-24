@@ -1,8 +1,29 @@
+mod terrain;
+
+use crate::render_region::{LocalBounds, ShapeRegion};
 use crate::{Geometry, Object, SceneState, Value, refs, rotate, scalar, vec3};
 use std::collections::BTreeMap;
+use std::sync::{Arc, Weak};
+pub(crate) use terrain::{FrameTerrainSelections, RegionMesh};
+use terrain::{IndexedTerrain, TerrainCache, TerrainSource};
 
 const MAX_VERTICES: usize = 1_000_000;
 const MAX_INDICES: usize = 3_000_000;
+const MAX_BOUNDS_BYTES: usize = 4 * 1024 * 1024;
+const BOUNDS_ENTRY_BYTES: usize =
+    std::mem::size_of::<MeshKey>() + std::mem::size_of::<CachedBounds>();
+
+struct CachedBounds {
+    values: Weak<Vec<Value>>,
+    dimensions: [usize; 2],
+    bounds: Option<LocalBounds>,
+}
+
+impl CachedBounds {
+    fn matches(&self, values: &Arc<Vec<Value>>, dimensions: [usize; 2]) -> bool {
+        self.values.as_ptr() == Arc::as_ptr(values) && self.dimensions == dimensions
+    }
+}
 
 struct CachedMesh {
     source: Object,
@@ -13,6 +34,8 @@ struct CachedMesh {
 /// Derived geometry is shared across displayed frames while captured mesh data stays equal.
 pub struct MeshCache {
     entries: BTreeMap<MeshKey, CachedMesh>,
+    bounds: BTreeMap<MeshKey, CachedBounds>,
+    terrain: TerrainCache,
     bytes: usize,
     limit: usize,
 }
@@ -27,17 +50,21 @@ impl MeshCache {
     pub fn with_byte_limit(limit: usize) -> Self {
         Self {
             entries: BTreeMap::new(),
+            bounds: BTreeMap::new(),
+            terrain: TerrainCache::default(),
             bytes: 0,
             limit,
         }
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.bytes
+        self.bytes + self.bounds.len() * BOUNDS_ENTRY_BYTES + self.terrain.retained_bytes()
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.bounds.clear();
+        self.terrain = TerrainCache::default();
         self.bytes = 0;
     }
 
@@ -52,6 +79,105 @@ impl MeshCache {
             }
             keep
         });
+        self.bounds.retain(|key, entry| {
+            key.bounds_source(state)
+                .is_some_and(|(values, dimensions)| entry.matches(values, dimensions))
+        });
+        self.terrain.retain_resources(state);
+    }
+
+    pub(crate) fn decode_terrain(
+        &mut self,
+        state: &SceneState,
+        geometry: &Object,
+        key: &MeshKey,
+        region: ShapeRegion,
+        max_mesh_bytes: usize,
+        frame: &mut FrameTerrainSelections,
+    ) -> RegionMesh {
+        let Some(source) = TerrainSource::capture(state, key) else {
+            return RegionMesh::Full;
+        };
+        let Some(mut terrain) = self.terrain.take(key, &source).or_else(|| {
+            let decoded = state.mesh_geometry(geometry)?;
+            IndexedTerrain::new(source, decoded)
+        }) else {
+            return RegionMesh::Invalid;
+        };
+        let result = terrain.select(
+            region,
+            max_mesh_bytes,
+            frame.entry(key.clone()).or_default(),
+        );
+        let ordinary_bytes = self.bytes + self.bounds.len() * BOUNDS_ENTRY_BYTES;
+        if terrain.index_bytes() <= self.limit
+            && terrain.index_bytes() > self.limit - ordinary_bytes
+        {
+            self.entries.clear();
+            self.bounds.clear();
+            self.bytes = 0;
+        }
+        let available = self.limit - self.bytes - self.bounds.len() * BOUNDS_ENTRY_BYTES;
+        self.terrain.insert(key.clone(), terrain, available);
+        result
+    }
+
+    pub(crate) fn local_bounds(
+        &mut self,
+        state: &SceneState,
+        key: &MeshKey,
+    ) -> Option<LocalBounds> {
+        let (values, dimensions) = key.bounds_source(state)?;
+        if let Some(entry) = self.bounds.get(key)
+            && entry.matches(values, dimensions)
+        {
+            return entry.bounds;
+        }
+        self.bounds.remove(key);
+        let scale = key.scale.map(f32::from_bits);
+        let bounds = if key.kind == MeshKind::HeightField {
+            let [rows, columns] = dimensions;
+            let (min, max) =
+                values
+                    .iter()
+                    .try_fold((i16::MAX, i16::MIN), |(min, max), value| {
+                        let Value::Array(fields) = value else {
+                            return None;
+                        };
+                        let Value::I64(height) = fields.first()? else {
+                            return None;
+                        };
+                        let height = i16::try_from(*height).ok()?;
+                        Some((min.min(height), max.max(height)))
+                    })?;
+            LocalBounds::from_points([
+                Some([0.0, f32::from(min) * scale[1], 0.0]),
+                Some([
+                    (rows - 1) as f32 * scale[0],
+                    f32::from(max) * scale[1],
+                    (columns - 1) as f32 * scale[2],
+                ]),
+            ])
+        } else {
+            let rotation = key.rotation.map(f32::from_bits);
+            LocalBounds::from_points(values.iter().map(|value| {
+                vec3(Some(value)).map(|point| scale_mesh_point(point, scale, rotation))
+            }))
+        };
+        if self.bounds.len() < MAX_BOUNDS_BYTES / BOUNDS_ENTRY_BYTES
+            && BOUNDS_ENTRY_BYTES <= self.limit.saturating_sub(self.retained_bytes())
+        {
+            // A weak reference tracks array replacements and copy-on-write edits without retaining samples.
+            self.bounds.insert(
+                key.clone(),
+                CachedBounds {
+                    values: Arc::downgrade(values),
+                    dimensions,
+                    bounds,
+                },
+            );
+        }
+        bounds
     }
 
     pub(crate) fn decode(&mut self, state: &SceneState, geometry: &Object) -> Option<Geometry> {
@@ -85,7 +211,7 @@ impl MeshCache {
                 .sum::<usize>()
             + geometry_bytes;
         if bytes <= self.limit {
-            if bytes > self.limit.saturating_sub(self.bytes) {
+            if bytes > self.limit.saturating_sub(self.retained_bytes()) {
                 self.clear();
             }
             self.bytes += bytes;
@@ -109,6 +235,30 @@ pub(crate) struct MeshKey {
     kind: MeshKind,
     scale: [u32; 3],
     rotation: [u32; 4],
+}
+
+impl MeshKey {
+    fn bounds_source<'a>(
+        &self,
+        state: &'a SceneState,
+    ) -> Option<(&'a Arc<Vec<Value>>, [usize; 2])> {
+        let source = state.objects.get(&self.resource)?;
+        if source.generation != self.generation {
+            return None;
+        }
+        let (property, dimensions) = if self.kind == MeshKind::HeightField {
+            ("Samples", height_field_dimensions(source)?)
+        } else {
+            ("Points", [0; 2])
+        };
+        let Value::Array(values) = source.properties.get(property)? else {
+            return None;
+        };
+        let [rows, columns] = dimensions;
+        (values.len() <= MAX_VERTICES
+            && (self.kind != MeshKind::HeightField || values.len() == rows * columns))
+            .then_some((values, dimensions))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -152,7 +302,7 @@ fn height_field_scale(geometry: &Object) -> Option<[f32; 3]> {
         .then_some(scale)
 }
 
-fn height_field_geometry(mesh: &Object, geometry: &Object, thickness: f32) -> Option<Geometry> {
+fn height_field_dimensions(mesh: &Object) -> Option<[usize; 2]> {
     if integer(mesh.properties.get("Format")?)? != 1 {
         return None;
     }
@@ -166,6 +316,13 @@ fn height_field_geometry(mesh: &Object, geometry: &Object, thickness: f32) -> Op
     if rows < 2 || columns < 2 || count > MAX_VERTICES || index_count > MAX_INDICES {
         return None;
     }
+    Some([rows, columns])
+}
+
+fn height_field_geometry(mesh: &Object, geometry: &Object, thickness: f32) -> Option<Geometry> {
+    let [rows, columns] = height_field_dimensions(mesh)?;
+    let count = rows * columns;
+    let index_count = (rows - 1) * (columns - 1) * 6;
     let scale = height_field_scale(geometry)?;
     let Value::Array(samples) = mesh.properties.get("Samples")? else {
         return None;
@@ -253,7 +410,7 @@ impl SceneState {
     pub(crate) fn mesh_key(&self, geometry: &Object) -> Option<MeshKey> {
         let kind = MeshKind::for_geometry(geometry)?;
         let property = kind.property();
-        let id = *refs(geometry.properties.get(property)).first()?;
+        let id = refs(geometry.properties.get(property)).next()?;
         let resource = self.resolve_reference(geometry.id, property, id)?;
         let (scale, rotation) = if kind == MeshKind::HeightField {
             self.height_field_thickness(resource)?;
@@ -276,7 +433,7 @@ impl SceneState {
     pub(crate) fn mesh_geometry(&self, geometry: &Object) -> Option<Geometry> {
         let kind = MeshKind::for_geometry(geometry)?;
         let property = kind.property();
-        let id = *refs(geometry.properties.get(property)).first()?;
+        let id = refs(geometry.properties.get(property)).next()?;
         let mesh = self.resolve_reference(geometry.id, property, id)?;
         if kind == MeshKind::HeightField {
             return height_field_geometry(mesh, geometry, self.height_field_thickness(mesh)?);
@@ -350,17 +507,8 @@ impl SceneState {
         let Some(Value::Quat(rotation)) = geometry.properties.get("Scale.Rotation") else {
             return None;
         };
-        let inverse = [-rotation[0], -rotation[1], -rotation[2], rotation[3]];
         for vertex in &mut vertices {
-            let local = rotate(*rotation, *vertex);
-            *vertex = rotate(
-                inverse,
-                [
-                    local[0] * scale[0],
-                    local[1] * scale[1],
-                    local[2] * scale[2],
-                ],
-            );
+            *vertex = scale_mesh_point(*vertex, scale, *rotation);
         }
         if scale[0] * scale[1] * scale[2] < 0.0 {
             for triangle in indices.chunks_exact_mut(3) {
@@ -373,6 +521,16 @@ impl SceneState {
         })
     }
 }
+
+fn scale_mesh_point(point: [f32; 3], scale: [f32; 3], rotation: [f32; 4]) -> [f32; 3] {
+    let inverse = [-rotation[0], -rotation[1], -rotation[2], rotation[3]];
+    let local = rotate(rotation, point);
+    rotate(
+        inverse,
+        std::array::from_fn(|axis| local[axis] * scale[axis]),
+    )
+}
+
 fn integer(value: &Value) -> Option<u32> {
     if let Value::U64(v) = value {
         u32::try_from(*v).ok()
@@ -384,9 +542,238 @@ fn integer(value: &Value) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Action;
+    use crate::{Action, RenderRegion};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    fn create(state: &mut SceneState, id: u64, name: &str) {
+        Action::Create(Object {
+            id,
+            generation: 0,
+            type_name: format!("physx::{name}"),
+            properties: BTreeMap::new(),
+        })
+        .apply(state);
+    }
+
+    fn set_pose(
+        state: &mut SceneState,
+        id: u64,
+        key: &str,
+        position: [f32; 3],
+        rotation: [f32; 4],
+    ) {
+        Action::Set(id, key.into(), Value::Transform { position, rotation }).apply(state);
+    }
+
+    fn add_shape(state: &mut SceneState, id: u64, name: &str) {
+        let shape = id + 1;
+        let geometry = id + 2;
+        create(state, id, "PxRigidDynamic");
+        create(state, shape, "PxShape");
+        create(state, geometry, name);
+        Action::Push(id, "Shapes".into(), shape).apply(state);
+        Action::Set(shape, "Geometry".into(), Value::Ref(geometry)).apply(state);
+    }
+
+    const IDENTITY: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+    const QUARTER_TURN: [f32; 4] = [
+        0.0,
+        0.0,
+        std::f32::consts::FRAC_1_SQRT_2,
+        std::f32::consts::FRAC_1_SQRT_2,
+    ];
+
+    #[test]
+    fn render_region_composes_nonunit_poses_like_the_unity_frame_writer() {
+        let mut state = SceneState::default();
+        add_shape(&mut state, 1, "PxBoxGeometry");
+        Action::Set(3, "HalfExtents".into(), Value::Vec3([0.5; 3])).apply(&mut state);
+        set_pose(&mut state, 1, "GlobalPose", [0.0; 3], [0.0, 0.0, 0.0, 2.0]);
+        set_pose(
+            &mut state,
+            2,
+            "LocalPose",
+            [10.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.5],
+        );
+        let region = RenderRegion::new([10.0, 0.0, 0.0], 1.0).unwrap();
+        let scoped = state.render_scene_in_region(&mut MeshCache::default(), region);
+        assert_eq!(scoped.objects.len(), 1);
+        assert_eq!(scoped.objects[0].position, [10.0, 0.0, 0.0]);
+        assert_eq!(state.render_scene().objects[0].position, [40.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn render_region_checks_rotated_local_shape_extent_and_dynamic_pose() {
+        let mut state = SceneState::default();
+        add_shape(&mut state, 1, "PxBoxGeometry");
+        add_shape(&mut state, 4, "PxCapsuleGeometry");
+        Action::Set(3, "HalfExtents".into(), Value::Vec3([20.0, 0.5, 0.5])).apply(&mut state);
+        Action::Set(6, "Radius".into(), Value::F32(0.5)).apply(&mut state);
+        Action::Set(6, "HalfHeight".into(), Value::F32(20.0)).apply(&mut state);
+        for actor in [1, 4] {
+            set_pose(
+                &mut state,
+                actor,
+                "GlobalPose",
+                [5.0, 21.0, 0.0],
+                QUARTER_TURN,
+            );
+            set_pose(
+                &mut state,
+                actor + 1,
+                "LocalPose",
+                [0.0, 5.0, 0.0],
+                IDENTITY,
+            );
+        }
+        let mut cache = MeshCache::default();
+        let region = RenderRegion::new([0.0; 3], 1.05).unwrap();
+        let visible = state.render_scene_in_region(&mut cache, region);
+        assert_eq!(
+            visible
+                .objects
+                .iter()
+                .map(|shape| shape.id)
+                .collect::<Vec<_>>(),
+            [1, 4]
+        );
+        assert_eq!(
+            state
+                .render_actors_in_region([4, 10], &mut cache, region)
+                .objects[0]
+                .id,
+            4
+        );
+
+        set_pose(&mut state, 4, "GlobalPose", [5.0, 25.0, 0.0], QUARTER_TURN);
+        for (center, expected) in [([0.0; 3], 1), ([1.55, 0.0, 0.0], 0)] {
+            let region = RenderRegion::new(center, 1.05).unwrap();
+            assert_eq!(
+                state
+                    .render_scene_in_region(&mut cache, region)
+                    .objects
+                    .len(),
+                expected
+            );
+        }
+        assert_eq!(state.render_scene().objects.len(), 2);
+    }
+
+    #[test]
+    fn render_region_validates_inputs_and_includes_tangent_reference_geometry() {
+        let mut state = SceneState::default();
+        let mut cache = MeshCache::default();
+        for radius in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            assert!(RenderRegion::new([0.0; 3], radius).is_none());
+        }
+        assert!(RenderRegion::new([0.0, f32::INFINITY, 0.0], 1.0).is_none());
+        let region = RenderRegion::new([0.0; 3], 1.0).unwrap();
+        assert!(
+            state
+                .render_scene_in_region(&mut cache, region)
+                .objects
+                .is_empty()
+        );
+        add_shape(&mut state, 1, "PxSphereGeometry");
+        add_shape(&mut state, 4, "PxPlaneGeometry");
+        add_shape(&mut state, 7, "PxSphereGeometry");
+        Action::Set(3, "Radius".into(), Value::F32(1.0)).apply(&mut state);
+        Action::Set(9, "Radius".into(), Value::F32(f32::INFINITY)).apply(&mut state);
+        set_pose(&mut state, 1, "GlobalPose", [2.0, 0.0, 0.0], IDENTITY);
+        set_pose(&mut state, 4, "GlobalPose", [1.0, 4.0, 0.0], IDENTITY);
+        assert_eq!(
+            state
+                .render_scene_in_region(&mut cache, region)
+                .objects
+                .len(),
+            2
+        );
+        set_pose(&mut state, 1, "GlobalPose", [f32::NAN, 0.0, 0.0], IDENTITY);
+        set_pose(&mut state, 4, "GlobalPose", [1.0, 7.0, 0.0], IDENTITY);
+        assert!(
+            state
+                .render_scene_in_region(&mut cache, region)
+                .objects
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn render_region_mesh_bounds_apply_scale_and_survive_resource_changes_without_allocating_far_meshes()
+     {
+        let mut state = SceneState::default();
+        for id in [1, 4, 7] {
+            add_shape(&mut state, id, "PxTriangleMeshGeometry");
+            create(&mut state, id + 20, "PxTriangleMesh");
+            Action::Set(id + 2, "TriangleMesh".into(), Value::Ref(id + 20)).apply(&mut state);
+            Action::Set(id + 2, "Scale.Scale".into(), Value::Vec3([1.0, -2.0, 1.0]))
+                .apply(&mut state);
+            Action::Set(id + 2, "Scale.Rotation".into(), Value::Quat(QUARTER_TURN))
+                .apply(&mut state);
+            Action::Set(
+                id + 20,
+                "Triangles".into(),
+                Value::Array(vec![Value::U64(0), Value::U64(1), Value::U64(2)].into()),
+            )
+            .apply(&mut state);
+            let x = if id == 4 { 5.0 } else { 100.0 };
+            Action::Set(
+                id + 20,
+                "Points".into(),
+                Value::Array(
+                    vec![
+                        Value::Vec3([x, 0.0, 0.0]),
+                        Value::Vec3([x, 1.0, 0.0]),
+                        Value::Vec3([x, 0.0, 1.0]),
+                    ]
+                    .into(),
+                ),
+            )
+            .apply(&mut state);
+        }
+        let mut cache = MeshCache::default();
+        let region = RenderRegion::new([-10.0, 0.0, 0.0], 0.5).unwrap();
+        let visible = state.render_scene_with_cache(1, 48, &mut cache, Some(region));
+        assert_eq!(
+            visible
+                .objects
+                .iter()
+                .map(|shape| shape.id)
+                .collect::<Vec<_>>(),
+            [4]
+        );
+        assert!(visible.diagnostics.is_empty());
+        assert_eq!(cache.entries.len(), 1);
+        assert!(
+            !cache
+                .entries
+                .contains_key(&state.mesh_key(&state.objects[&3]).unwrap())
+        );
+
+        let Value::Array(points) = state
+            .objects
+            .get_mut(&21)
+            .unwrap()
+            .properties
+            .get_mut("Points")
+            .unwrap()
+        else {
+            panic!()
+        };
+        for point in Arc::make_mut(points) {
+            let Value::Vec3(point) = point else { panic!() };
+            point[0] = 5.0;
+        }
+        assert_eq!(
+            state
+                .render_scene_in_region(&mut cache, region)
+                .objects
+                .len(),
+            2
+        );
+    }
 
     fn height_field_state() -> SceneState {
         let mut state = SceneState::default();
@@ -442,6 +829,222 @@ mod tests {
             panic!("expected height-field geometry")
         };
         vertices
+    }
+
+    fn terrain_triangles() -> SceneState {
+        let mut state = SceneState::default();
+        add_shape(&mut state, 1, "PxTriangleMeshGeometry");
+        create(&mut state, 30, "PxTriangleMesh");
+        Action::Set(3, "TriangleMesh".into(), Value::Ref(30)).apply(&mut state);
+        Action::Set(3, "Scale.Scale".into(), Value::Vec3([1.0; 3])).apply(&mut state);
+        Action::Set(
+            3,
+            "Scale.Rotation".into(),
+            Value::Quat([0.0, 0.0, 0.0, 1.0]),
+        )
+        .apply(&mut state);
+        let mut points = Vec::new();
+        for i in -512..512 {
+            let x = i as f32 * 128.0;
+            points.extend([[x, 0.0, 0.0], [x, 1.0, 0.0], [x + 1.0, 0.0, 0.0]].map(Value::Vec3));
+        }
+        points.extend(
+            [
+                [-36000.0, 0.0, 0.0],
+                [36000.0, 0.0, 0.0],
+                [50000.0, 10.0, 0.0],
+            ]
+            .map(Value::Vec3),
+        );
+        let triangles = (0..points.len() as u64).map(Value::U64).collect::<Vec<_>>();
+        Action::Set(30, "Points".into(), Value::Array(points.into())).apply(&mut state);
+        Action::Set(30, "Triangles".into(), Value::Array(triangles.into())).apply(&mut state);
+        state
+    }
+
+    fn surface(scene: &crate::RenderScene, object: usize) -> (&Arc<Vec<[f32; 3]>>, &Arc<Vec<u32>>) {
+        let Geometry::TriangleMesh { vertices, indices } = &scene.objects[object].geometry else {
+            panic!("expected a triangle surface")
+        };
+        (vertices, indices)
+    }
+
+    fn triangles(scene: &crate::RenderScene, object: usize) -> Vec<[[f32; 3]; 3]> {
+        let (vertices, indices) = surface(scene, object);
+        indices
+            .chunks_exact(3)
+            .map(|i| std::array::from_fn(|j| vertices[i[j] as usize]))
+            .collect()
+    }
+
+    #[test]
+    fn scoped_terrain_selects_local_blocks_and_preserves_a_crossing_triangle() {
+        let state = terrain_triangles();
+        let mut cache = MeshCache::default();
+        let near = RenderRegion::new([0.0, 0.0, 0.0], 2.0).unwrap();
+        let far = RenderRegion::new([-49152.0, 0.0, 0.0], 2.0).unwrap();
+        let local = state.render_scene_in_region(&mut cache, near);
+        let distant = state.render_scene_in_region(&mut cache, far);
+        let local_triangles = triangles(&local, 0);
+        let distant_triangles = triangles(&distant, 0);
+        assert!(local_triangles.len() < 200);
+        assert!(distant_triangles.len() < 200);
+        assert!(local_triangles.contains(&[[0.0; 3], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]));
+        assert!(local_triangles.contains(&[
+            [-36000.0, 0.0, 0.0],
+            [36000.0, 0.0, 0.0],
+            [50000.0, 10.0, 0.0]
+        ]));
+        assert!(distant_triangles.contains(&[
+            [-49152.0, 0.0, 0.0],
+            [-49152.0, 1.0, 0.0],
+            [-49151.0, 0.0, 0.0]
+        ]));
+        assert!(!distant_triangles.contains(&local_triangles[0]));
+        let repeat = state.render_scene_in_region(&mut cache, near);
+        assert!(Arc::ptr_eq(surface(&local, 0).0, surface(&repeat, 0).0));
+        assert!(Arc::ptr_eq(surface(&local, 0).1, surface(&repeat, 0).1));
+        assert_eq!(
+            triangles(&state.render_scene_cached(&mut cache), 0).len(),
+            1025
+        );
+    }
+
+    #[test]
+    fn scoped_terrain_separates_shared_meshes_by_shape_pose_and_display_budget() {
+        let mut state = terrain_triangles();
+        for actor in [4, 7] {
+            add_shape(&mut state, actor, "PxTriangleMeshGeometry");
+            Action::Set(actor + 1, "Geometry".into(), Value::Ref(3)).apply(&mut state);
+        }
+        let half_turn_y = [0.0, 1.0, 0.0, 0.0];
+        set_pose(
+            &mut state,
+            5,
+            "LocalPose",
+            [-49152.0, 0.0, 0.0],
+            half_turn_y,
+        );
+        let mut cache = MeshCache::default();
+        let region = RenderRegion::new([0.0; 3], 2.0).unwrap();
+        let rendered = state.render_actors_in_region([1, 7, 4], &mut cache, region);
+        assert_eq!(
+            rendered
+                .objects
+                .iter()
+                .map(|o| (o.id, o.shape_id))
+                .collect::<Vec<_>>(),
+            [(1, 2), (7, 8), (4, 5)]
+        );
+        assert!(Arc::ptr_eq(
+            surface(&rendered, 0).0,
+            surface(&rendered, 1).0
+        ));
+        assert!(!Arc::ptr_eq(
+            surface(&rendered, 0).0,
+            surface(&rendered, 2).0
+        ));
+        assert!(triangles(&rendered, 2).contains(&[
+            [-49152.0, 0.0, 0.0],
+            [-49152.0, 1.0, 0.0],
+            [-49151.0, 0.0, 0.0]
+        ]));
+        let (vertices, indices) = surface(&rendered, 0);
+        let first_bytes = vertices.len() * 12 + indices.len() * 4;
+        let limited = state.render_actor_objects(
+            [&state.objects[&1], &state.objects[&7], &state.objects[&4]],
+            10,
+            first_bytes,
+            &mut cache,
+            Vec::new(),
+            Some(region),
+        );
+        assert_eq!(limited.objects.len(), 2);
+        assert!(
+            limited
+                .diagnostics
+                .iter()
+                .any(|text| text.contains("unique mesh allocation limit"))
+        );
+        let tiny = state.render_scene_with_cache(10, 47, &mut cache, Some(region));
+        assert!(tiny.objects.is_empty());
+        assert!(
+            tiny.diagnostics
+                .iter()
+                .any(|text| text.contains("unique mesh allocation limit"))
+        );
+        let mut transient = MeshCache::with_byte_limit(0);
+        let limited = state.render_actor_objects(
+            [&state.objects[&1], &state.objects[&7], &state.objects[&4]],
+            10,
+            first_bytes,
+            &mut transient,
+            Vec::new(),
+            Some(region),
+        );
+        assert_eq!(limited.objects.len(), 2);
+        assert!(Arc::ptr_eq(surface(&limited, 0).0, surface(&limited, 1).0));
+        assert_eq!(transient.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn scoped_terrain_height_field_preserves_winding_holes_and_resource_edits() {
+        let mut state = height_field_state();
+        for name in ["NbRows", "NbColumns"] {
+            Action::Set(4, name.into(), Value::U64(64)).apply(&mut state);
+        }
+        let sample = |height, m0, m1| {
+            Value::Array(vec![Value::I64(height), Value::U64(m0), Value::U64(m1)].into())
+        };
+        let mut samples = vec![sample(0, 0, 0); 64 * 64];
+        samples[0] = sample(-6, 128, 127);
+        Action::Set(4, "Samples".into(), Value::Array(samples.into())).apply(&mut state);
+        let region = RenderRegion::new([0.0; 3], 5.0).unwrap();
+        let mut cache = MeshCache::default();
+        let initial = state.render_scene_in_region(&mut cache, region);
+        let local = triangles(&initial, 0);
+        assert!(local.len() < 500);
+        assert!(local.contains(&[[2.0, 0.0, 0.0], [0.0, -3.0, 0.0], [2.0, 0.0, 3.0]]));
+        assert!(!local.contains(&[[0.0, 0.0, 3.0], [2.0, 0.0, 3.0], [0.0, -3.0, 0.0]]));
+        let Value::Array(samples) = state
+            .objects
+            .get_mut(&4)
+            .unwrap()
+            .properties
+            .get_mut("Samples")
+            .unwrap()
+        else {
+            panic!()
+        };
+        Arc::make_mut(samples)[0] = sample(-8, 128, 127);
+        let edited = state.render_scene_in_region(&mut cache, region);
+        assert!(triangles(&edited, 0).contains(&[
+            [2.0, 0.0, 0.0],
+            [0.0, -4.0, 0.0],
+            [2.0, 0.0, 3.0]
+        ]));
+        assert!(!Arc::ptr_eq(surface(&initial, 0).0, surface(&edited, 0).0));
+        let mut replacement = state.objects[&4].clone();
+        replacement.generation = 1;
+        replacement
+            .properties
+            .insert("Thickness".into(), Value::F32(1.0));
+        Action::Destroy(4).apply(&mut state);
+        Action::Create(replacement).apply(&mut state);
+        assert!(
+            state
+                .render_scene_in_region(&mut cache, region)
+                .objects
+                .is_empty()
+        );
+        Action::Set(3, "HeightField".into(), Value::Ref(4)).apply(&mut state);
+        let rebound = state.render_scene_in_region(&mut cache, region);
+        assert!(triangles(&rebound, 0).contains(&[
+            [2.0, 0.0, 0.0],
+            [2.0, 0.0, 3.0],
+            [0.0, -4.0, 0.0]
+        ]));
+        assert!(cache.retained_bytes() <= cache.limit);
     }
 
     #[test]

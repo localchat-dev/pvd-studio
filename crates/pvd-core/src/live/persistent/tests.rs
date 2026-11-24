@@ -86,6 +86,140 @@ fn fixed_analysis_reservation_does_not_seal_every_frame() {
 }
 
 #[test]
+fn dense_frames_seal_before_replay_index_admission_fails() {
+    let directory = TestDirectory::new();
+    let mut config = directory.config();
+    config.segment_frames = 600;
+    let mut history = HistoryWriter::new_persistent(config).unwrap();
+    history.archive.as_mut().unwrap().index_limit = 1 << 20;
+    let mut live = Streaming::new(history);
+    let mut recording = metadata();
+    let mut scene = SceneState::default();
+    for id in 1..=24 {
+        live.action(
+            Action::Create(Object {
+                id,
+                generation: 0,
+                type_name: "Actor".into(),
+                properties: BTreeMap::new(),
+            }),
+            &mut scene,
+            8 << 20,
+        )
+        .unwrap();
+    }
+    for index in 0..100 {
+        for id in 1..=24 {
+            live.action(
+                Action::Set(id, "value".into(), Value::U64(index as u64)),
+                &mut scene,
+                8 << 20,
+            )
+            .unwrap();
+        }
+        live.prepare_persistent(&recording).unwrap();
+        live.complete(info(index), binding(), &scene, &mut recording)
+            .unwrap();
+        assert!(
+            live.history.accepting_frames(),
+            "{:?}",
+            live.history.warning
+        );
+    }
+    live.history.seal_bank(&recording).unwrap();
+    let archive = live.history.archive.as_ref().unwrap();
+    assert!(archive.len() > 1 && archive.len() < 50);
+    let replay = source(&live.history);
+    for index in (0..100).rev() {
+        assert_value(&replay, index);
+    }
+}
+
+#[test]
+fn schema_declared_after_first_frame_counts_toward_bank_admission() {
+    use pvd_protocol::{Event, EventGroup, Name};
+    let directory = TestDirectory::new();
+    let mut history = HistoryWriter::new_persistent(directory.config()).unwrap();
+    history.archive.as_mut().unwrap().index_limit = 1 << 20;
+    let mut builder = RecordingBuilder::new(metadata().header);
+    builder.enable_streaming(history);
+    let group = |events| EventGroup {
+        stream_id: 1,
+        timestamp: 0,
+        offset: 0,
+        events,
+    };
+    builder
+        .push(group(vec![Event::StringHandle {
+            handle: 1,
+            value: "frame".into(),
+        }]))
+        .unwrap();
+    for id in 1..=24 {
+        builder
+            .action(Action::Create(Object {
+                id,
+                generation: 0,
+                type_name: "Actor".into(),
+                properties: BTreeMap::new(),
+            }))
+            .unwrap();
+    }
+    for index in 0..80 {
+        if index == 1 {
+            let class = Name {
+                namespace: 0,
+                name: 2,
+            };
+            let mut events = vec![Event::StringHandle {
+                handle: 2,
+                value: "Actor".into(),
+            }];
+            for handle in 3..803 {
+                events.push(Event::StringHandle {
+                    handle,
+                    value: format!("field{handle}"),
+                });
+                events.push(Event::CreateProperty {
+                    class,
+                    name: handle,
+                    semantic: 0,
+                    datatype: class,
+                    kind: 1,
+                    named_values: vec![],
+                });
+            }
+            builder.push(group(events)).unwrap();
+        }
+        for id in 1..=24 {
+            builder
+                .action(Action::Set(id, "value".into(), Value::U64(index)))
+                .unwrap();
+        }
+        builder
+            .push(group(vec![Event::EndSection {
+                id: 0,
+                name: 1,
+                timestamp: index,
+            }]))
+            .unwrap();
+        let history = &builder.streaming.as_ref().unwrap().history;
+        assert!(
+            history.warning.is_none(),
+            "frame {index}: {:?}",
+            history.warning
+        );
+    }
+    let history = &mut builder.streaming.as_mut().unwrap().history;
+    history.seal_bank(&builder.recording).unwrap();
+    assert!(history.archive.as_ref().unwrap().len() > 1);
+    let replay = builder.snapshot().unwrap();
+    for index in [0, 20, 79] {
+        assert_value(&replay, index);
+    }
+}
+
+#[test]
 fn unreclaimable_metadata_pressure_does_not_repeat_sealing() {
     let directory = TestDirectory::new();
     let mut config = directory.config();
@@ -286,7 +420,8 @@ fn check_directory_limit(limits: FrameDirectoryLimits, expected_warning: &str) {
         1 << 20,
     )
     .unwrap();
-    let mut sources = FrameDirectory::new(limits);
+    let mut capture = metadata();
+    capture.frame_sources = FrameDirectory::new(limits);
     let mut stopped_warning = None;
     for index in 0..5 {
         live.action(
@@ -295,22 +430,18 @@ fn check_directory_limit(limits: FrameDirectoryLimits, expected_warning: &str) {
             1 << 20,
         )
         .unwrap();
-        let bytes = live.directory_bytes(index, binding(), &sources).unwrap();
+        let bytes = live
+            .directory_bytes(index, binding(), &capture.frame_sources)
+            .unwrap();
         assert!(bytes <= limits.index_bytes);
-        live.complete(
-            info(index),
-            binding(),
-            &state,
-            &SharedAnalysis::default(),
-            &mut sources,
-        )
-        .unwrap();
+        live.complete(info(index), binding(), &state, &mut capture)
+            .unwrap();
         if index < 2 {
             assert!(live.history.accepting_frames());
-            assert!(sources.frame(index).is_some());
+            assert!(capture.frame_sources.frame(index).is_some());
         } else {
             assert!(!live.history.accepting_frames());
-            assert!(sources.frame(index).is_none());
+            assert!(capture.frame_sources.frame(index).is_none());
             let warning = live.history.warning.clone().unwrap();
             assert!(warning.contains(expected_warning), "{warning}");
             assert_eq!(
@@ -321,13 +452,17 @@ fn check_directory_limit(limits: FrameDirectoryLimits, expected_warning: &str) {
     }
     assert_eq!(live.frames_seen, 5);
     assert_eq!(
-        sources.source(binding().source).unwrap().observed_frames(),
+        capture
+            .frame_sources
+            .source(binding().source)
+            .unwrap()
+            .observed_frames(),
         5
     );
-    assert_eq!(sources.retained_frames(), 2);
+    assert_eq!(capture.frame_sources.retained_frames(), 2);
     assert_eq!(live.history.snapshot().stats.first_frame, 0);
     let mut recording = recording(&live.history);
-    recording.frame_sources = sources;
+    recording.frame_sources = capture.frame_sources;
     recording
         .frame_sources
         .validate_frames(&recording.frames)

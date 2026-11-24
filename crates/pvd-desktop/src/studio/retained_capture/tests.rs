@@ -100,6 +100,17 @@ impl Drop for Case {
 }
 
 #[test]
+fn saving_all_uses_the_published_history_when_live_reception_is_ahead() {
+    let mut case = Case::new();
+    case.studio.live_frame = 120;
+    case.studio.use_retained_range();
+    assert_eq!(
+        (case.studio.retained_first, case.studio.retained_last),
+        (0, 8)
+    );
+}
+
+#[test]
 fn timeline_save_button_preserves_tcp_history_without_a_complete_raw_stream() {
     for language in [Language::Chinese, Language::English] {
         for connected in [true, false] {

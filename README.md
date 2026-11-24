@@ -28,6 +28,8 @@ cargo run --locked -p pvd-desktop -- --language en
 
 捕获和 SDK 不随源码提供。测试输入可按 [SDK 生产器说明](tools/physx-sample/README.md)生成；桌面操作见 [Windows 使用说明](docs/distribution.md)。
 
+Windows Unity 编辑器的 Scene 视图也可以接收和回放会话，安装与缓存位置见 [Unity 插件](docs/unity.md)。
+
 ## 文件与存储
 
 | 数据 | 默认位置与用途 |
@@ -35,7 +37,7 @@ cargo run --locked -p pvd-desktop -- --language en
 | 回放历史 | 当前工作目录下的 `pvd-cache/history/`，默认滚动上限 8 GiB，可配置 |
 | 接收缓存 | 历史目录下的 `receive/`，与回放历史独立，受可用空间保护 |
 | 永久录制 | `captures/`；完整 SDK 原始流需在监听前启用自动录制 |
-| 项目捕获 | 时间轴“保存录制”将仍可读取的历史保存为独立 `.pvdcapture` |
+| 项目捕获 | Unity 和桌面将保留历史保存为一个 `.pvdcapture`。长录制在文件内[自动分段](docs/retained-capture.md#分段导入与导出)，可在桌面连续回放 |
 
 暂停不停止接收和历史写入。临时历史会淘汰旧帧，不能替代永久录制。保存默认位于当前工作目录的 `captures/`，也可指定其他位置；已有文件不覆盖。
 

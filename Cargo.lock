@@ -3225,6 +3225,16 @@ name = "pvd-transport"
 version = "0.2.1"
 
 [[package]]
+name = "pvd-unity"
+version = "0.2.1"
+dependencies = [
+ "pvd-core",
+ "pvd-transport",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"

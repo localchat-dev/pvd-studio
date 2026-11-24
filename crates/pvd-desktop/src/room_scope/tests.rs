@@ -1,6 +1,7 @@
 use super::*;
-use pvd_core::{Recording, RecordingBuilder};
+use pvd_core::{Recording, RecordingBuilder, Value, frame_sources::FrameObject, live::SceneUpdate};
 use pvd_protocol::{Endian, Event, EventGroup, Header, Name};
+use std::collections::BTreeSet;
 
 fn name(handle: u32) -> Name {
     Name {
@@ -184,7 +185,7 @@ fn pose_updates_reuse_membership_while_reference_changes_invalidate_it() {
     let mut motion = SceneUpdate::full(&moved);
     motion.replace_all = false;
     scope.retain_for_update(&motion, &state, 1);
-    assert_eq!(scope.revision, Some(2));
+    assert_eq!(scope.revision(), Some(2));
     motion.apply_owned(&mut state);
     scope.update(&state, room(100, 0), 2);
     assert_eq!(scope.version(), version);
@@ -192,7 +193,7 @@ fn pose_updates_reuse_membership_while_reference_changes_invalidate_it() {
     let mut transferred = SceneUpdate::full(&next);
     transferred.replace_all = false;
     scope.retain_for_update(&transferred, &state, 2);
-    assert_eq!(scope.revision, Some(2));
+    assert_eq!(scope.revision(), Some(2));
     transferred.apply_owned(&mut state);
     scope.update(&state, room(100, 0), 3);
     assert!(!scope.contains(10));
