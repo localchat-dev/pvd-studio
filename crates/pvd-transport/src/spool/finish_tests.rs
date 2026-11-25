@@ -121,6 +121,7 @@ fn finishing_intake_preserves_committed_backlog_and_terminal_event() {
     let finish = Arc::new(AtomicBool::new(false));
     let (output, receiver) = Output::channel(1, cancel.clone(), || {});
     let control = CaptureControl {
+        role: None,
         cancel: cancel.clone(),
         finish: finish.clone(),
         intake_quiesced: Arc::new(AtomicBool::new(false)),
@@ -184,6 +185,7 @@ fn cancelling_after_finish_still_wakes_a_blocked_delivery() {
     let cancel = Arc::new(AtomicBool::new(false));
     let (output, receiver) = Output::channel(1, cancel.clone(), || {});
     let control = CaptureControl {
+        role: None,
         cancel: cancel.clone(),
         finish: Arc::new(AtomicBool::new(false)),
         intake_quiesced: Arc::new(AtomicBool::new(false)),

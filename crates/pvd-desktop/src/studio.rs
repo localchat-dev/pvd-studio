@@ -19,7 +19,7 @@ use crate::network::{
 use bevy::prelude::Resource;
 use egui_dock::{DockState, NodeIndex};
 use pvd_core::{LiveRecording, Recording, SceneState, analysis::view::ProfileSource};
-use pvd_transport::{ListenConfig, SpoolSnapshot};
+use pvd_transport::{LateJoinStorage, ListenConfig, ShareOptions, SpoolSnapshot, Viewer};
 use serde::{Deserialize, Serialize};
 
 const MAX_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
@@ -183,6 +183,7 @@ pub struct Preferences {
     pub dock: DockState<Panel>,
     #[serde(flatten)]
     pub listener: crate::listen_settings::ListenSettings,
+    pub allow_late_join: bool,
     pub auto_capture: bool,
     pub capture_directory: String,
     pub history_directory: String,
@@ -283,6 +284,7 @@ impl Default for Preferences {
             language: Language::default(),
             dock,
             listener: crate::listen_settings::ListenSettings::default(),
+            allow_late_join: true,
             auto_capture: false,
             capture_directory: "captures".into(),
             history_directory: pvd_core::live::HistoryConfig::default()
@@ -1762,6 +1764,14 @@ impl Studio {
         };
         let options = NetworkOptions {
             history: self.history_config(),
+            sharing: Some(ShareOptions {
+                viewer: Viewer::Desktop,
+                late_join: self.prefs.allow_late_join.then(|| {
+                    LateJoinStorage::Disk(
+                        Path::new(&self.prefs.history_directory).join("shared-receive"),
+                    )
+                }),
+            }),
             receive_budget_bytes: u64::from(self.prefs.receive_budget_gib) * 1024 * 1024 * 1024,
             refresh_hz: self.prefs.live_refresh_hz.clamp(15, 120),
             raw_limit_bytes: u64::from(self.prefs.raw_capture_limit_gib) * 1024 * 1024 * 1024,
@@ -4793,7 +4803,9 @@ mod tests {
         let original_dock = stored["dock"].clone();
         stored.as_object_mut().unwrap().remove("receive_budget_gib");
         stored.as_object_mut().unwrap().remove("min_free_disk_mib");
+        stored.as_object_mut().unwrap().remove("allow_late_join");
         let restored = Preferences::from_bytes(&serde_json::to_vec(&stored).unwrap());
+        assert!(restored.allow_late_join);
         assert_eq!(restored.receive_budget_gib, 0);
         assert_eq!(restored.min_free_disk_mib, 512);
         assert_eq!(restored.history_budget_gib, 24);
@@ -4803,9 +4815,11 @@ mod tests {
             original_dock
         );
         for (stored_reserve, expected_reserve) in [(0, 512), (128, 512), (2048, 2048)] {
+            stored["allow_late_join"] = false.into();
             stored["receive_budget_gib"] = 16.into();
             stored["min_free_disk_mib"] = stored_reserve.into();
             let restored = Preferences::from_bytes(&serde_json::to_vec(&stored).unwrap());
+            assert!(!restored.allow_late_join);
             assert_eq!(restored.receive_budget_gib, 16);
             assert_eq!(restored.min_free_disk_mib, expected_reserve);
             let mut studio = Studio::default();

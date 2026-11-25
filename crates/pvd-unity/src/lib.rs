@@ -27,6 +27,8 @@ struct Request {
     address: Option<String>,
     #[serde(rename = "recordHistory")]
     record_history: Option<bool>,
+    #[serde(rename = "allowLateJoin")]
+    allow_late_join: Option<bool>,
     session: Option<u64>,
     path: Option<String>,
 }
@@ -44,6 +46,7 @@ fn dispatch(request: Request) -> Result<Value, String> {
                 root,
                 request.address.as_deref().ok_or("missing address")?,
                 request.record_history.unwrap_or(true),
+                request.allow_late_join.unwrap_or(true),
             )?;
             bridge.frame_error.clear();
         }

@@ -5,7 +5,8 @@ use pvd_core::{
     rooms::RoomDirectory,
 };
 use pvd_transport::{
-    CaptureControl, CaptureServer, ListenConfig, ReceiverEvent, SpoolOptions, SpoolStats,
+    CaptureControl, CaptureServer, LateJoinStorage, ListenConfig, ListenerRole, ReceiverEvent,
+    ShareOptions, SpoolOptions, SpoolStats, Viewer,
 };
 use serde_json::{Value, json};
 use std::{
@@ -354,6 +355,7 @@ impl Sessions {
         root: &Path,
         address: &str,
         record_history: bool,
+        allow_late_join: bool,
     ) -> Result<(), String> {
         if self
             .listener
@@ -368,6 +370,16 @@ impl Sessions {
             max_session_bytes: u64::MAX,
             ..Default::default()
         };
+        let sharing = Some(ShareOptions {
+            viewer: Viewer::Unity,
+            late_join: allow_late_join.then(|| {
+                if record_history {
+                    LateJoinStorage::Disk(root.join("shared-receive"))
+                } else {
+                    LateJoinStorage::Memory
+                }
+            }),
+        });
         let (server, history) = if record_history {
             fs::create_dir_all(root).map_err(detail)?;
             let root = fs::canonicalize(root).map_err(detail)?;
@@ -377,18 +389,22 @@ impl Sessions {
                 return Err("history directory resolves outside the selected cache path".into());
             }
             pvd_core::live::cleanup_stale_history(&history).map_err(detail)?;
-            let server = CaptureServer::bind_spooled(
+            let server = CaptureServer::bind_spooled_with_sharing(
                 config,
                 SpoolOptions {
                     directory: root.join("receive"),
                     ..Default::default()
                 },
+                sharing,
                 || {},
             )
             .map_err(detail)?;
             (server, Some(history))
         } else {
-            (CaptureServer::bind(config, || {}).map_err(detail)?, None)
+            (
+                CaptureServer::bind_with_sharing(config, sharing, || {}).map_err(detail)?,
+                None,
+            )
         };
         let address = server.address().to_string();
         let control = server.control();
@@ -487,9 +503,25 @@ impl Sessions {
                 value
             })
             .collect();
+        let role = self
+            .listener
+            .as_ref()
+            .map(|listener| listener.control.role());
+        let owner = match role {
+            Some(ListenerRole::Shared(owner) | ListenerRole::WaitingForSession(owner)) => {
+                match owner {
+                    Viewer::Desktop => "desktop",
+                    Viewer::Unity => "unity",
+                }
+            }
+            _ => "",
+        };
         json!({
             "listening":self.listener.as_ref().is_some_and(|l| !l.worker.is_finished()),
             "address":self.listener.as_ref().map_or("", |l| l.address.as_str()),
+            "sharedFrom":owner,
+            "waitingForSession":matches!(role, Some(ListenerRole::WaitingForSession(_))),
+            "takingOver":matches!(role, Some(ListenerRole::TakingOver)),
             "error":error, "active":active_id,
             "totalBytes":total, "clearableBytes":clearable, "sessions":sessions
         })

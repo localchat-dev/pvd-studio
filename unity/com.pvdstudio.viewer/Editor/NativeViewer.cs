@@ -41,6 +41,9 @@ namespace PvdStudio.Editor
     {
         public bool listening;
         public string address;
+        public string sharedFrom;
+        public bool waitingForSession;
+        public bool takingOver;
         public string error;
         public string frameError;
         public SessionExport export;
@@ -64,6 +67,7 @@ namespace PvdStudio.Editor
             public long session;
             public string path;
             public bool recordHistory;
+            public bool allowLateJoin;
         }
 
         [Serializable]
@@ -203,12 +207,13 @@ namespace PvdStudio.Editor
         }
 
         internal static Reply Command(string op, string address = null, long session = 0, string path = null,
-            bool recordHistory = false)
+            bool recordHistory = false, bool allowLateJoin = true)
         {
             if (unloading && (op == "start" || op == "export"))
                 throw new InvalidOperationException("插件正在重载，请在完成后重试。");
             var request = new Request {
                 op = op, address = address, session = session, path = path, recordHistory = recordHistory,
+                allowLateJoin = allowLateJoin,
                 root = Path.Combine(Application.temporaryCachePath, "PvdStudio")
             };
             byte[] input = Encoding.UTF8.GetBytes(JsonUtility.ToJson(request) + "\0");

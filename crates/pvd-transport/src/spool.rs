@@ -441,7 +441,11 @@ struct ReceiveContext<'a> {
 }
 
 impl ReceiveContext<'_> {
-    fn receive(&self, stream: &mut TcpStream, session: u64) -> io::Result<(u64, Option<PathBuf>)> {
+    fn receive(
+        &self,
+        stream: &mut Incoming<'_>,
+        session: u64,
+    ) -> io::Result<(u64, Option<PathBuf>)> {
         let Self {
             config,
             options,
@@ -451,7 +455,7 @@ impl ReceiveContext<'_> {
             finish,
             intake_quiesced,
         } = *self;
-        configure_receive_stream(&stream)?;
+        stream.configure()?;
         let mut capture = config
             .capture_directory
             .as_deref()
@@ -476,7 +480,11 @@ impl ReceiveContext<'_> {
                 let received = if finish.load(Ordering::Acquire) {
                     Ok(0)
                 } else {
-                    stream.read(&mut buffer)
+                    stream.read(&mut buffer, &|| {
+                        cancel.load(Ordering::Acquire)
+                            || finish.load(Ordering::Acquire)
+                            || queue.abort.load(Ordering::Acquire)
+                    })
                 };
                 let received = match received {
                     Err(_) if finish.load(Ordering::Acquire) => Ok(0),
@@ -484,6 +492,12 @@ impl ReceiveContext<'_> {
                 };
                 let length = match received {
                     Ok(0) => {
+                        if !cancel.load(Ordering::Acquire)
+                            && !finish.load(Ordering::Acquire)
+                            && !queue.abort.load(Ordering::Acquire)
+                        {
+                            stream.complete();
+                        }
                         return Ok((total, capture.take().map(CaptureFile::finish).transpose()?));
                     }
                     Ok(length) => length,
@@ -513,6 +527,7 @@ impl ReceiveContext<'_> {
                         config.max_session_bytes
                     )));
                 }
+                stream.share(&buffer[..length]);
                 if let Some(capture) = capture.as_mut() {
                     capture.writer.write_all(&buffer[..length])?;
                 }
@@ -542,6 +557,15 @@ impl CaptureServer {
         options: SpoolOptions,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> io::Result<Self> {
+        Self::bind_spooled_with_sharing(config, options, None, wake)
+    }
+
+    pub fn bind_spooled_with_sharing(
+        config: ListenConfig,
+        options: SpoolOptions,
+        sharing: Option<ShareOptions>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> io::Result<Self> {
         if config.max_session_bytes == 0
             || !(1..=1024).contains(&config.queue_capacity)
             || options.segment_bytes == 0
@@ -556,7 +580,7 @@ impl CaptureServer {
         if let Some(directory) = &config.capture_directory {
             fs::create_dir_all(directory)?;
         }
-        let wake = Arc::new(wake);
+        let wake: intake::Wake = Arc::new(wake);
         let stats = Arc::new(SpoolStats {
             connected: AtomicBool::new(false),
             session: AtomicU64::new(0),
@@ -568,9 +592,9 @@ impl CaptureServer {
             wake: wake.clone(),
         });
         let owner = Directory::new(&options, stats.clone())?;
-        let listener = TcpListener::bind(config.address)?;
-        listener.set_nonblocking(true)?;
-        let address = listener.local_addr()?;
+        let mut listener = Listener::bind(config.address, sharing, wake.clone())?;
+        let address = listener.address()?;
+        let role = listener.role();
         let cancel = Arc::new(AtomicBool::new(false));
         let finish = Arc::new(AtomicBool::new(false));
         let intake_quiesced = Arc::new(AtomicBool::new(false));
@@ -595,22 +619,22 @@ impl CaptureServer {
             .spawn(move || {
                 let intake_completion = intake_completion;
                 let mut session = 0u64;
-                while !stop.load(Ordering::Acquire)
-                    && !finish_intake.load(Ordering::Acquire)
-                    && !queue.abort.load(Ordering::Acquire)
-                {
-                    match listener.accept() {
-                        Ok((mut stream, peer)) => {
+                let stopped = || {
+                    stop.load(Ordering::Acquire)
+                        || finish_intake.load(Ordering::Acquire)
+                        || queue.abort.load(Ordering::Acquire)
+                };
+                while !stopped() {
+                    match listener.accept(&stopped) {
+                        Ok(mut stream) => {
+                            let peer = stream.peer;
                             let mut active_socket = queue.socket.lock().unwrap();
                             // request_stop sets cancellation before taking this
                             // same gate. Once it returns, idle cannot race a new
                             // writer that has already passed the stop check.
                             intake_completion.0.store(false, Ordering::Release);
-                            if finish_intake.load(Ordering::Acquire)
-                                || stop.load(Ordering::Acquire)
-                                || queue.abort.load(Ordering::Acquire)
-                            {
-                                let _ = stream.shutdown(Shutdown::Both);
+                            if stopped() {
+                                stream.shutdown();
                                 break;
                             }
                             session += 1;
@@ -619,8 +643,8 @@ impl CaptureServer {
                             receive_stats.session.store(session, Ordering::Release);
                             receive_stats.received.store(0, Ordering::Release);
                             (receive_stats.wake)();
-                            let registered = stream.try_clone().map(|socket| {
-                                *active_socket = Some(socket);
+                            let registered = stream.control_socket().map(|socket| {
+                                *active_socket = socket;
                             });
                             drop(active_socket);
                             let result = registered
@@ -642,7 +666,7 @@ impl CaptureServer {
                                     }
                                     .receive(&mut stream, session)
                                 });
-                            let _ = stream.shutdown(Shutdown::Both);
+                            stream.shutdown();
                             drop(stream);
                             queue.socket.lock().unwrap().take();
                             receive_stats.disconnected();
@@ -674,6 +698,7 @@ impl CaptureServer {
                                 }
                             }
                         }
+                        Err(_) if stopped() => break,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             thread::park_timeout(POLL)
                         }
@@ -709,6 +734,7 @@ impl CaptureServer {
             spool_stats: Some(stats),
             socket,
             delivery_signal,
+            role,
         })
     }
 }
@@ -1228,6 +1254,41 @@ mod tests {
                 .is_err()
         );
         assert_eq!(queue.state.lock().unwrap().items.len(), MAX_ITEMS);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepted_windows_socket_waits_for_its_read_timeout() {
+        for spooled in [false, true] {
+            let directory = TestDirectory::new();
+            let server = if spooled {
+                CaptureServer::bind_spooled(config(), directory.options(2 << 20), || {}).unwrap()
+            } else {
+                CaptureServer::bind(config(), || {}).unwrap()
+            };
+            let mut client = TcpStream::connect(server.address()).unwrap();
+            client.write_all(b"a").unwrap();
+            assert!(matches!(event(&server), ReceiverEvent::Listening(_)));
+            assert!(matches!(event(&server), ReceiverEvent::Connected { .. }));
+            assert!(matches!(event(&server), ReceiverEvent::Data { bytes, .. } if bytes == b"a"));
+
+            let socket = server
+                .socket
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap();
+            assert_eq!(socket.read_timeout().unwrap(), Some(POLL));
+            assert_eq!(
+                socket.peek(&mut [0]).unwrap_err().kind(),
+                io::ErrorKind::TimedOut,
+                "spooled={spooled}"
+            );
+            client.write_all(b"b").unwrap();
+            assert!(matches!(event(&server), ReceiverEvent::Data { bytes, .. } if bytes == b"b"));
+        }
     }
 
     #[test]

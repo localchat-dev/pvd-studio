@@ -1,4 +1,5 @@
 use super::*;
+use pvd_transport::{ListenerRole, Viewer};
 
 pub(super) fn show(
     ui: &mut egui::Ui,
@@ -114,52 +115,72 @@ pub(super) fn show(
 
 fn connection(ui: &mut egui::Ui, studio: &Studio) {
     let language = studio.prefs.language;
-    let label = if studio
+    let role = studio.server.as_ref().map(|server| server.listener_role());
+    let stopping = studio
         .server
         .as_ref()
-        .is_some_and(|server| server.is_stopping())
-    {
-        language.text("TCP · Stopping", "TCP · 正在停止")
-    } else if studio
+        .is_some_and(|server| server.is_stopping());
+    let error = studio
         .receive_status
         .as_ref()
-        .is_some_and(|status| status.last_failure.is_some())
-    {
-        language.text("TCP · Receive error", "TCP · 接收异常")
-    } else if studio.receive_backlog_warning() {
-        language.text("TCP · Backlog", "TCP · 接收积压")
-    } else if studio
+        .is_some_and(|status| status.last_failure.is_some());
+    let backlog = studio.receive_backlog_warning();
+    let receiving = studio
         .receive_status
         .as_ref()
-        .is_some_and(|status| status.connected)
-    {
-        if studio
-            .receive_status
-            .as_ref()
-            .is_some_and(|status| status.received_bytes == 0)
-        {
-            language.text("TCP · Waiting for data", "TCP · 等待数据")
-        } else {
-            language.text("TCP · Receiving", "TCP · 接收中")
+        .filter(|status| status.connected);
+    let label = match (role, receiving) {
+        _ if stopping => language.text("TCP · Stopping", "TCP · 正在停止"),
+        (Some(ListenerRole::TakingOver), _) => language.text("TCP · Taking over", "TCP · 正在接管"),
+        (Some(ListenerRole::WaitingForSession(_)), _) => {
+            language.text("Shared · Waiting", "共享 · 等待连接")
         }
-    } else if studio.server.is_some() {
-        language.text("TCP · Listening", "TCP · 监听中")
-    } else {
-        language.text("TCP · Off", "TCP · 未监听")
+        _ if error => language.text("TCP · Receive error", "TCP · 接收异常"),
+        _ if backlog => language.text("TCP · Backlog", "TCP · 接收积压"),
+        (Some(ListenerRole::Shared(_)), Some(_)) => {
+            language.text("Shared · Receiving", "共享 · 接收中")
+        }
+        (Some(ListenerRole::Shared(_)), None) => language.text("Shared · Ready", "共享 · 已就绪"),
+        (_, Some(status)) if status.received_bytes == 0 => {
+            language.text("TCP · Waiting for data", "TCP · 等待数据")
+        }
+        (_, Some(_)) => language.text("TCP · Receiving", "TCP · 接收中"),
+        (Some(ListenerRole::Listening), None) => language.text("TCP · Listening", "TCP · 监听中"),
+        (None, None) => language.text("TCP · Off", "TCP · 未监听"),
     };
     let mut detail = studio.connection.text(language).to_owned();
+    if let (
+        Some(server),
+        Some(ListenerRole::Shared(owner) | ListenerRole::WaitingForSession(owner)),
+    ) = (&studio.server, role)
+    {
+        let owner = match owner {
+            Viewer::Desktop => language.text("Desktop", "桌面端"),
+            Viewer::Unity => "Unity",
+        };
+        let address = server.address();
+        detail = if matches!(role, Some(ListenerRole::WaitingForSession(_))) {
+            format!(
+                "{} · {owner} · {address}",
+                language.text(
+                    "Waiting for the next PhysX connection",
+                    "等待下一次 PhysX 连接"
+                )
+            )
+        } else {
+            format!(
+                "{} · {owner} · {address}",
+                language.text("Shared receiver", "共享接收")
+            )
+        };
+    }
     if let Some(summary) = studio.receive_summary(language) {
         detail.push('\n');
         detail.push_str(&summary);
         detail.push('\n');
         detail.push_str(&studio.receive_detail(language));
     }
-    let color = if studio
-        .receive_status
-        .as_ref()
-        .is_some_and(|status| status.last_failure.is_some())
-        || studio.receive_backlog_warning()
-    {
+    let color = if error || backlog {
         receive_status_color(studio)
     } else if studio.server.is_some() {
         ACCENT
@@ -200,6 +221,15 @@ fn settings(ui: &mut egui::Ui, studio: &mut Studio) {
             ui.label(language.text("Port", "端口"));
             ui.add(egui::DragValue::new(&mut studio.prefs.listener.port).range(1..=65535));
         });
+        #[cfg(windows)]
+        ui.checkbox(
+            &mut studio.prefs.allow_late_join,
+            language.text("Allow joining a running capture", "允许中途加入"),
+        )
+        .on_hover_text(language.text(
+            "When this viewer owns the port, keep up to 512 MiB of raw session data so Unity can catch up.",
+            "桌面端持有端口时，临时缓存最多 512 MiB 原始数据，供 Unity 中途加入。",
+        ));
         ui.separator();
         ui.strong(language.text("Recording and playback", "录制与回放"));
         ui.add(egui::TextEdit::singleline(&mut studio.prefs.history_directory).desired_width(340.0))

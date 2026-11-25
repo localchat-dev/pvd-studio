@@ -11,6 +11,7 @@ namespace PvdStudio.Editor
         private const float DefaultCropRadius = 20f;
         [SerializeField] private string address = "0.0.0.0:5425";
         [SerializeField] private bool recordHistory;
+        [SerializeField] private bool allowLateJoin = true;
         [SerializeField] private long sessionId;
         [SerializeField] private long room;
         [SerializeField] private bool autoSelect = true;
@@ -532,6 +533,7 @@ namespace PvdStudio.Editor
         {
             bool listening = status?.listening == true;
             bool receiving = Receiving;
+            bool shared = listening && !string.IsNullOrEmpty(status.sharedFrom);
             EditorGUILayout.BeginHorizontal();
             Rect dot = GUILayoutUtility.GetRect(10, 23, GUILayout.ExpandWidth(false));
             Color32 stateColor = !listening ? new Color32(132, 132, 132, 255) : receiving
@@ -540,10 +542,22 @@ namespace PvdStudio.Editor
             if (Event.current.type == EventType.Repaint)
                 GUI.DrawTexture(new Rect(dot.center.x - 3.5f, dot.center.y - 3.5f, 7f, 7f), Texture2D.whiteTexture,
                     ScaleMode.StretchToFill, true, 0, stateColor, 0, 3.5f);
-            var tcp = receiving ? "TCP · 接收中" : listening ? "TCP · 监听中" : "TCP · 未监听";
-            GUILayout.Label(new GUIContent(tcp, listening ? status.address : address), EditorStyles.boldLabel);
+            string label = "TCP · 未监听";
+            string endpoint = listening ? status.address : address;
+            string detail = endpoint;
+            if (shared)
+            {
+                label = receiving ? "共享 · 接收中" : status.waitingForSession ? "共享 · 等待连接" : "共享 · 已就绪";
+                endpoint = $"桌面端 · {status.address}";
+                detail = $"共享接收 · 来自{endpoint}";
+                if (status.waitingForSession) detail += "\n等待下一次 PhysX 连接";
+            }
+            else if (listening)
+                label = status.takingOver ? "TCP · 正在接管" : receiving ? "TCP · 接收中" : "TCP · 监听中";
+            GUILayout.Label(new GUIContent(label, detail), EditorStyles.boldLabel);
             if (GUILayout.Button(listening ? "停止监听" : "开始监听", GUILayout.Height(23), GUILayout.ExpandWidth(false)))
-                Run(() => NativeViewer.Command(listening ? "stop" : "start", address, recordHistory: recordHistory));
+                Run(() => NativeViewer.Command(listening ? "stop" : "start", address,
+                    recordHistory: recordHistory, allowLateJoin: allowLateJoin));
             EditorGUILayout.EndHorizontal();
             GUILayout.Space(5);
             ViewerSession selected = status != null ? DrawSession() : null;
@@ -556,8 +570,13 @@ namespace PvdStudio.Editor
                     address = EditorGUILayout.TextField("监听地址", address);
                     recordHistory = EditorGUILayout.ToggleLeft(
                         new GUIContent("完整录制", "保留历史，支持逐帧回看、正倒放和导出。"), recordHistory);
+                    allowLateJoin = EditorGUILayout.ToggleLeft(
+                        new GUIContent("允许中途加入", recordHistory
+                            ? "Unity 持有端口时，完整录制可为桌面端补发最多 512 MiB 的磁盘前缀。"
+                            : "Unity 持有端口时，仅实时模式在内存中保留最多 128 MiB 的原始数据，供桌面端中途加入。"),
+                        allowLateJoin);
                 }
-                if (listening) EditorGUILayout.LabelField("实际监听", status.address);
+                if (listening) EditorGUILayout.LabelField(shared ? "共享来源" : "实际监听", endpoint);
             }
             ShowError(pollError);
             if (!string.IsNullOrEmpty(status?.error) && status.error != pollError && status.error != commandError)

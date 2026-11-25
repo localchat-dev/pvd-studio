@@ -3223,6 +3223,9 @@ version = "0.2.1"
 [[package]]
 name = "pvd-transport"
 version = "0.2.1"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "pvd-unity"

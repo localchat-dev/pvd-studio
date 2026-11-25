@@ -11,10 +11,14 @@ const POLL: Duration = Duration::from_millis(40);
 const CHUNK_SIZE: usize = 64 * 1024;
 
 mod delivery;
+mod intake;
+#[cfg(windows)]
+mod share;
 mod spool;
 mod spool_directory;
 pub use delivery::EventReceiver;
 use delivery::{DeliverySignal, Output};
+use intake::{Incoming, Listener};
 pub use spool::{SpoolFailure, SpoolOptions, SpoolSnapshot, SpoolStats};
 pub use spool_directory::{SpoolCleanupReport, cleanup_stale_spools};
 
@@ -24,6 +28,33 @@ pub struct ListenConfig {
     pub capture_directory: Option<PathBuf>,
     pub max_session_bytes: u64,
     pub queue_capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Viewer {
+    Desktop = 1,
+    Unity = 2,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShareOptions {
+    pub viewer: Viewer,
+    pub late_join: Option<LateJoinStorage>,
+}
+
+#[derive(Clone, Debug)]
+pub enum LateJoinStorage {
+    Memory,
+    Disk(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenerRole {
+    Listening,
+    Shared(Viewer),
+    WaitingForSession(Viewer),
+    TakingOver,
 }
 
 impl Default for ListenConfig {
@@ -73,6 +104,7 @@ pub struct CaptureServer {
     spool_stats: Option<Arc<SpoolStats>>,
     socket: Arc<Mutex<Option<TcpStream>>>,
     delivery_signal: Arc<DeliverySignal>,
+    role: Option<Arc<Mutex<ListenerRole>>>,
 }
 
 #[derive(Clone)]
@@ -83,9 +115,16 @@ pub struct CaptureControl {
     socket: Arc<Mutex<Option<TcpStream>>>,
     stats: Option<Arc<SpoolStats>>,
     delivery_signal: Arc<DeliverySignal>,
+    role: Option<Arc<Mutex<ListenerRole>>>,
 }
 
 impl CaptureControl {
+    pub fn role(&self) -> ListenerRole {
+        self.role
+            .as_ref()
+            .map_or(ListenerRole::Listening, |role| *role.lock().unwrap())
+    }
+
     /// After requesting stop/finish, true once socket intake and raw/spool
     /// writes have ended. Temporary-file deletion may still be running.
     pub fn intake_quiesced(&self) -> bool {
@@ -124,6 +163,14 @@ impl Drop for IntakeCompletion {
 
 impl CaptureServer {
     pub fn bind(config: ListenConfig, wake: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
+        Self::bind_with_sharing(config, None, wake)
+    }
+
+    pub fn bind_with_sharing(
+        config: ListenConfig,
+        sharing: Option<ShareOptions>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> io::Result<Self> {
         if config.max_session_bytes == 0 || !(1..=1024).contains(&config.queue_capacity) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -133,15 +180,17 @@ impl CaptureServer {
         if let Some(directory) = &config.capture_directory {
             fs::create_dir_all(directory)?;
         }
-        let listener = TcpListener::bind(config.address)?;
-        listener.set_nonblocking(true)?;
-        let address = listener.local_addr()?;
+        let wake: intake::Wake = Arc::new(wake);
+        let mut listener = Listener::bind(config.address, sharing, wake.clone())?;
+        let address = listener.address()?;
+        let role = listener.role();
         let cancel = Arc::new(AtomicBool::new(false));
         let finish = Arc::new(AtomicBool::new(false));
         let intake_quiesced = Arc::new(AtomicBool::new(false));
         let intake_completion = IntakeCompletion(intake_quiesced.clone());
         let finish_intake = finish.clone();
-        let (output, receiver) = Output::channel(config.queue_capacity, cancel.clone(), wake);
+        let (output, receiver) =
+            Output::channel(config.queue_capacity, cancel.clone(), move || wake());
         let delivery_signal = output.signal.clone();
         let socket = Arc::new(Mutex::new(None));
         let active_socket = socket.clone();
@@ -154,15 +203,18 @@ impl CaptureServer {
                 }
                 let mut session = 0;
                 while !output.stopped() && !finish_intake.load(Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((stream, peer)) => {
+                    match listener
+                        .accept(&|| output.stopped() || finish_intake.load(Ordering::Acquire))
+                    {
+                        Ok(stream) => {
+                            let peer = stream.peer;
                             {
                                 let mut socket = active_socket.lock().unwrap();
                                 if finish_intake.load(Ordering::Acquire) || output.stopped() {
-                                    let _ = stream.shutdown(Shutdown::Both);
+                                    stream.shutdown();
                                     break;
                                 }
-                                *socket = stream.try_clone().ok();
+                                *socket = stream.control_socket().ok().flatten();
                             }
                             session += 1;
                             if !output.send(ReceiverEvent::Connected { session, peer }) {
@@ -181,6 +233,9 @@ impl CaptureServer {
                             {
                                 break;
                             }
+                        }
+                        Err(_) if output.stopped() || finish_intake.load(Ordering::Acquire) => {
+                            break;
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             thread::park_timeout(POLL)
@@ -208,6 +263,7 @@ impl CaptureServer {
             spool_stats: None,
             socket,
             delivery_signal,
+            role,
         })
     }
 
@@ -223,6 +279,7 @@ impl CaptureServer {
             socket: self.socket.clone(),
             stats: self.spool_stats.clone(),
             delivery_signal: self.delivery_signal.clone(),
+            role: self.role.clone(),
         }
     }
 
@@ -287,13 +344,13 @@ fn configure_receive_stream(stream: &TcpStream) -> io::Result<()> {
 }
 
 fn receive_session(
-    mut stream: TcpStream,
+    mut stream: Incoming<'_>,
     config: &ListenConfig,
     session: u64,
     output: &Output,
     finish: &AtomicBool,
 ) -> io::Result<()> {
-    configure_receive_stream(&stream)?;
+    stream.configure()?;
     let mut capture = config
         .capture_directory
         .as_deref()
@@ -313,7 +370,9 @@ fn receive_session(
         let received = if finish.load(Ordering::Acquire) {
             Ok(0)
         } else {
-            stream.read(&mut buffer)
+            stream.read(&mut buffer, &|| {
+                output.stopped() || finish.load(Ordering::Acquire)
+            })
         };
         let received = match received {
             Err(_) if finish.load(Ordering::Acquire) => Ok(0),
@@ -321,6 +380,9 @@ fn receive_session(
         };
         match received {
             Ok(0) => {
+                if !output.stopped() && !finish.load(Ordering::Acquire) {
+                    stream.complete();
+                }
                 let path = capture.map(CaptureFile::finish).transpose()?;
                 output.send(ReceiverEvent::Disconnected {
                     session,
@@ -339,6 +401,7 @@ fn receive_session(
                         config.max_session_bytes
                     )));
                 }
+                stream.share(&buffer[..count]);
                 if let Some(file) = &mut capture {
                     file.writer.write_all(&buffer[..count])?;
                 }

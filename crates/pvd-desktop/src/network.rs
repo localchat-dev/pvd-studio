@@ -18,8 +18,8 @@ use pvd_core::{
     metrics::{Metrics, MetricsSnapshot},
 };
 use pvd_transport::{
-    CaptureControl, CaptureServer, ListenConfig, ReceiverEvent, SpoolOptions, SpoolSnapshot,
-    SpoolStats,
+    CaptureControl, CaptureServer, ListenConfig, ListenerRole, ReceiverEvent, ShareOptions,
+    SpoolOptions, SpoolSnapshot, SpoolStats,
 };
 
 static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -51,6 +51,7 @@ impl Drop for WorkerPermit {
 #[derive(Clone, Debug)]
 pub struct NetworkOptions {
     pub history: HistoryConfig,
+    pub sharing: Option<ShareOptions>,
     pub receive_budget_bytes: u64,
     pub refresh_hz: u32,
     pub raw_limit_bytes: u64,
@@ -62,6 +63,7 @@ impl Default for NetworkOptions {
     fn default() -> Self {
         Self {
             history: HistoryConfig::default(),
+            sharing: None,
             receive_budget_bytes: 0,
             refresh_hz: 60,
             raw_limit_bytes: 0,
@@ -525,7 +527,7 @@ impl NetworkSession {
     }
     pub fn start_tracked(
         mut config: ListenConfig,
-        options: NetworkOptions,
+        mut options: NetworkOptions,
         context: egui::Context,
         jobs: &crate::background_jobs::BackgroundJobs,
     ) -> io::Result<Self> {
@@ -545,7 +547,7 @@ impl NetworkSession {
         let space_directory = receive_directory.clone();
         let reserve = options.history.min_free_disk_bytes;
         let wake_context = context.clone();
-        let server = CaptureServer::bind_spooled(
+        let server = CaptureServer::bind_spooled_with_sharing(
             config,
             SpoolOptions {
                 directory: receive_directory,
@@ -566,6 +568,7 @@ impl NetworkSession {
                 })),
                 ..Default::default()
             },
+            options.sharing.take(),
             move || wake_context.request_repaint(),
         )?;
         let receive_stats = server.spool_stats();
@@ -918,6 +921,11 @@ impl NetworkSession {
     }
     pub fn address(&self) -> std::net::SocketAddr {
         self.address
+    }
+    pub fn listener_role(&self) -> ListenerRole {
+        self.receive_control
+            .as_ref()
+            .map_or(ListenerRole::Listening, CaptureControl::role)
     }
     pub fn receive_status(&self) -> Option<SpoolSnapshot> {
         self.receive_stats.as_ref().map(|stats| stats.snapshot())

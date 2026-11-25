@@ -375,7 +375,7 @@ fn reconnect_replays_protected_history_and_clears_measured_files() {
     let unrelated = root.join("keep.txt");
     fs::write(&unrelated, b"keep").unwrap();
     let mut sessions = Sessions::default();
-    sessions.start(&root, "127.0.0.1:0", true).unwrap();
+    sessions.start(&root, "127.0.0.1:0", true, false).unwrap();
     let address = sessions.status()["address"].as_str().unwrap().to_owned();
     let mut first = TcpStream::connect(&address).unwrap();
     first.write_all(&frames()).unwrap();
@@ -415,7 +415,7 @@ fn reconnect_replays_protected_history_and_clears_measured_files() {
     assert_eq!(released, before - file_sizes(&root));
     assert!(sessions.status()["sessions"].as_array().unwrap().is_empty());
     assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
-    sessions.start(&root, &address, true).unwrap();
+    sessions.start(&root, &address, true, false).unwrap();
     let mut invalid = TcpStream::connect(&address).unwrap();
     invalid.write_all(b"bad").unwrap();
     drop(invalid);
