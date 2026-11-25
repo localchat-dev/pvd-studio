@@ -45,6 +45,7 @@ namespace PvdStudio.Editor.Tests
             SceneOverlay.Clear();
             SceneOverlay.MirrorX = false;
             SceneOverlay.Wireframe = false;
+            SceneOverlay.SurfaceOpacity = SceneOverlay.DefaultSurfaceOpacity;
             SceneOverlay.ShowInGameView = false;
         }
 
@@ -145,6 +146,46 @@ namespace PvdStudio.Editor.Tests
             Assert.AreSame(wireMaterial, renderer.sharedMaterial);
             SceneOverlay.Clear();
             Assert.IsTrue(wire == null && solid == null && wireMaterial == null && solidMaterial == null);
+        }
+
+        [Test]
+        public void SurfaceOpacityReusesGeometryAndLeavesQueriesAndWireframeVisible()
+        {
+            SceneOverlay.Show(Frame());
+            var shape = Shape;
+            var renderer = shape.GetComponent<MeshRenderer>();
+            var mesh = shape.GetComponent<MeshFilter>().sharedMesh;
+            var tint = renderer.sharedMaterial;
+            Assert.AreEqual("Hidden/PVD Studio/Overlay Surface", tint.shader.name);
+            Assert.AreEqual(0.16f, tint.color.a, 0.0001f);
+            SceneOverlay.ShowQueries(new[] { new QueryLine(Vector3.zero, Vector3.one, 0) });
+            var query = SceneOverlay.Root.transform.Find("PVD Sweeps and Overlaps").GetComponent<MeshRenderer>();
+
+            SceneOverlay.SurfaceOpacity = 0.63f;
+            Assert.AreSame(tint, renderer.sharedMaterial);
+            Assert.AreEqual(0.63f, tint.color.a, 0.0001f);
+            SceneOverlay.SurfaceOpacity = 1f;
+            var opaque = renderer.sharedMaterial;
+            var pipeline = GraphicsSettings.currentRenderPipeline;
+            var expected = pipeline != null && pipeline.defaultMaterial != null
+                ? pipeline.defaultMaterial.shader : Shader.Find("Standard");
+            Assert.AreSame(expected, opaque.shader);
+            Assert.AreSame(mesh, shape.GetComponent<MeshFilter>().sharedMesh);
+
+            SceneOverlay.SurfaceOpacity = 0f;
+            Assert.IsFalse(renderer.enabled);
+            Assert.IsTrue(query.enabled);
+            SceneOverlay.Wireframe = true;
+            Assert.IsTrue(renderer.enabled);
+            SceneOverlay.Wireframe = false;
+            Assert.IsFalse(renderer.enabled);
+            SceneOverlay.SurfaceOpacity = SceneOverlay.DefaultSurfaceOpacity;
+            Assert.IsTrue(renderer.enabled);
+            Assert.AreSame(tint, renderer.sharedMaterial);
+            SceneOverlay.SurfaceOpacity = 1f;
+            Assert.AreSame(opaque, renderer.sharedMaterial);
+            SceneOverlay.Clear();
+            Assert.IsTrue(tint == null && opaque == null && mesh == null);
         }
 
         [Test]
@@ -395,7 +436,6 @@ namespace PvdStudio.Editor.Tests
             {
                 SceneOverlay.Show(Frame());
                 SceneManager.MoveGameObjectToScene(SceneOverlay.Root, preview);
-                Shape.GetComponent<MeshRenderer>().sharedMaterial = material;
                 var cameraNode = new GameObject("Overlay test camera");
                 SceneManager.MoveGameObjectToScene(cameraNode, preview);
                 var camera = cameraNode.AddComponent<Camera>();
@@ -415,11 +455,27 @@ namespace PvdStudio.Editor.Tests
                     return pixels.GetPixel(16, 16);
                 }
 
-                Assert.IsTrue(Sample(CameraType.Game).b > 0.8f);
-                Assert.IsTrue(Sample(CameraType.SceneView).r > 0.8f);
-                Assert.IsTrue(Sample(CameraType.Game).b > 0.8f);
+                Assert.Less(Sample(CameraType.Game).g, 0.05f);
+                Color surface = Sample(CameraType.SceneView);
+                Assert.That(surface.g, Is.InRange(0.06f, 0.70f));
+                Assert.Greater(surface.b, 0.7f);
+                Assert.Less(Sample(CameraType.Game).g, 0.05f);
                 SceneOverlay.ShowInGameView = true;
-                Assert.IsTrue(Sample(CameraType.Game).r > 0.8f);
+                Assert.AreEqual(surface.g, Sample(CameraType.Game).g, 0.02f);
+                SceneOverlay.SurfaceOpacity = 0.75f;
+                Assert.Greater(Sample(CameraType.Game).g, surface.g + 0.08f);
+
+                var blocker = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                SceneManager.MoveGameObjectToScene(blocker, preview);
+                blocker.transform.position = new Vector3(5, 0, -2);
+                blocker.GetComponent<MeshRenderer>().sharedMaterial = material;
+                Color foreground = Sample(CameraType.Game);
+                Assert.Greater(foreground.r, 0.8f);
+                Assert.Less(foreground.g, 0.05f);
+                Object.DestroyImmediate(blocker);
+
+                SceneOverlay.SurfaceOpacity = 0f;
+                Assert.Less(Sample(CameraType.Game).g, 0.05f);
                 SceneOverlay.Wireframe = true;
                 Assert.IsTrue(Sample(CameraType.SceneView).r < 0.05f);
                 Assert.IsTrue(System.Array.Exists(pixels.GetPixels(), color => color.r > 0.1f));

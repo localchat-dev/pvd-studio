@@ -123,7 +123,7 @@ impl Drop for WorkerPermit {
 
 pub struct Job {
     kind: Kind,
-    result: Mutex<mpsc::Receiver<Message>>,
+    result: Mutex<mpsc::Receiver<(Message, Option<PathBuf>)>>,
     progress: Arc<Mutex<Progress>>,
     cancelled: Arc<AtomicBool>,
 }
@@ -196,14 +196,21 @@ impl Job {
                         export_loaded(&recording, &destination, kind, &worker_cancel, update)
                     }
                 };
-                let message = match result {
-                    Ok(message) => message,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                        Message::new("Recording export cancelled", "录制导出已取消")
-                    }
-                    Err(error) => Message::detail("Recording export failed", "录制导出失败", error),
+                let outcome = match result {
+                    Ok(message) => (
+                        message,
+                        matches!(kind, Kind::Retained { .. }).then_some(destination),
+                    ),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => (
+                        Message::new("Recording export cancelled", "录制导出已取消"),
+                        None,
+                    ),
+                    Err(error) => (
+                        Message::detail("Recording export failed", "录制导出失败", error),
+                        None,
+                    ),
                 };
-                let _ = sender.send(message);
+                let _ = sender.send(outcome);
                 context.request_repaint();
             })
             .map_err(|error| {
@@ -217,13 +224,16 @@ impl Job {
         })
     }
 
-    pub fn result(&self) -> Option<Message> {
+    pub fn result(&self) -> Option<(Message, Option<PathBuf>)> {
         match self.result.lock().ok()?.try_recv() {
-            Ok(message) => Some(message),
+            Ok(outcome) => Some(outcome),
             Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => Some(Message::new(
-                "The recording export worker stopped before returning a result.",
-                "录制导出线程未返回结果便已停止。",
+            Err(mpsc::TryRecvError::Disconnected) => Some((
+                Message::new(
+                    "The recording export worker stopped before returning a result.",
+                    "录制导出线程未返回结果便已停止。",
+                ),
+                None,
             )),
         }
     }
@@ -805,7 +815,11 @@ pub fn retained_controls(ui: &mut egui::Ui, studio: &mut crate::studio::Studio) 
                     studio.use_retained_range();
                 }
             });
-            ui.add(egui::TextEdit::singleline(&mut studio.retained_path).desired_width(ui.available_width()));
+            ui.add(
+                egui::TextEdit::singleline(&mut studio.retained_path)
+                    .hint_text(language.text("Name by recording and range", "按录制和帧范围自动命名"))
+                    .desired_width(ui.available_width()),
+            );
             ui.horizontal_wrapped(|ui| {
                 if ui.add_enabled(!studio.file_picker.is_busy(), egui::Button::new(language.text("Choose path…", "选择路径…"))).clicked() {
                     studio.pick_file(crate::file_picker::PickerKind::SaveRetainedCapture, ui.ctx().clone());

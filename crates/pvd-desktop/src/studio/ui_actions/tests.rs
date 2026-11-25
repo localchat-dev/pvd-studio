@@ -289,7 +289,7 @@ fn actual_close_and_clip_decisions_are_deferred_and_modal_blocks_other_actions()
     let mut app = app(&context);
     app.world_mut().resource_mut::<Studio>().clip_set.add(2, 5);
     let before = accepted(&app);
-    let _ = click(&mut app, &context, "Close", true);
+    let _ = click(&mut app, &context, "Close view", true);
     assert_eq!(accepted(&app), before);
     assert!(
         app.world()
@@ -324,7 +324,7 @@ fn actual_close_and_clip_decisions_are_deferred_and_modal_blocks_other_actions()
     );
     assert_eq!(accepted(&app), before);
     assert_eq!(app.world().resource::<Studio>().clip_set.clips.len(), 1);
-    let _ = click(&mut app, &context, "Close", false);
+    let _ = click(&mut app, &context, "Close view", false);
     app.update();
     let _ = click(&mut app, &context, "Discard and continue", true);
     assert_eq!(accepted(&app), before);
@@ -366,6 +366,30 @@ fn return_live_and_clip_jump_keep_scene_until_the_next_prepare() {
     app.update();
     assert_eq!(accepted(&app).0, 3);
     assert!(!app.world().resource::<Studio>().follow_live);
+}
+
+#[test]
+fn return_live_moves_between_the_timeline_and_the_toolbar() {
+    let context = egui::Context::default();
+    let mut app = app(&context);
+    publish_live_head(&mut app.world_mut().resource_mut::<Studio>());
+
+    let timeline_button = button(&mut app, &context, "Return to live");
+    assert!(timeline_button.y > 480.0);
+
+    let mut studio = app.world_mut().resource_mut::<Studio>();
+    let diagnostics = studio
+        .prefs
+        .dock
+        .find_tab(&crate::studio::Panel::Diagnostics)
+        .unwrap();
+    studio.prefs.dock.set_active_tab(diagnostics);
+    let toolbar_button = button(&mut app, &context, "Return to live");
+    assert!(toolbar_button.y < 160.0);
+    let _ = click(&mut app, &context, "Return to live", false);
+    app.update();
+    assert!(app.world().resource::<Studio>().follow_live);
+    assert_eq!(accepted(&app).0, 7);
 }
 
 #[test]
@@ -415,6 +439,7 @@ fn actual_open_and_dropped_file_start_only_at_prepare_and_shutdown_releases_jobs
     let mut app = app(&context);
     app.world_mut().resource_mut::<Studio>().path_input = path.to_string_lossy().into_owned();
     let before = accepted(&app);
+    let _ = click(&mut app, &context, "Path", false);
     let _ = click(&mut app, &context, "Open", true);
     assert_eq!(accepted(&app), before);
     assert!(app.world().resource::<Studio>().job.is_none());

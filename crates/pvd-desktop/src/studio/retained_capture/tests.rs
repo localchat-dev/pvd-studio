@@ -111,13 +111,43 @@ fn saving_all_uses_the_published_history_when_live_reception_is_ahead() {
 }
 
 #[test]
+fn retained_exports_name_the_source_and_keep_the_chosen_folder() {
+    let mut case = Case::new();
+    case.studio.live_session = Some(21);
+    case.studio.save_recording(case.context.clone());
+    case.wait(|studio| studio.recording_export.is_none());
+    assert!(case.root.join("retained.pvdcapture").is_file());
+    assert!(case.studio.retained_path.is_empty());
+
+    let full = case.studio.retained_range().unwrap();
+    let suggested = case.studio.retained_destination(full);
+    assert_eq!(suggested.parent(), Some(case.root.as_path()));
+    let filename = suggested.file_name().unwrap().to_str().unwrap();
+    assert!(filename.starts_with("desktop-session-21-"));
+    assert!(!filename.contains("-frames-"));
+
+    case.studio.live_session = None;
+    case.studio.capture_path = Some(case.root.join("场景 A.pvdcapture"));
+    case.studio.retained_first = 3;
+    case.studio.retained_last = 6;
+    case.studio.export_retained(case.context.clone());
+    case.wait(|studio| studio.recording_export.is_none());
+    let name = std::fs::read_dir(&case.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| name.starts_with("场景 A-"))
+        .unwrap();
+    assert!(name.ends_with("-frames-3-6.pvdcapture"));
+}
+
+#[test]
 fn timeline_save_button_preserves_tcp_history_without_a_complete_raw_stream() {
     for language in [Language::Chinese, Language::English] {
         for connected in [true, false] {
             let mut case = Case::new();
-            let output = case.root.join(&Studio::default().retained_path);
-            assert!(!output.parent().unwrap().exists());
-            case.studio.retained_path = output.display().to_string();
+            let destination = case.root.join("captures/retained.pvdcapture");
+            assert!(!destination.parent().unwrap().exists());
+            case.studio.retained_path = destination.display().to_string();
             case.studio.prefs.language = language;
             case.studio.live_connected = connected;
             case.studio.follow_live = connected;
@@ -183,11 +213,10 @@ fn timeline_save_button_preserves_tcp_history_without_a_complete_raw_stream() {
             assert_eq!(case.studio.live_connected, connected);
             assert_eq!(case.studio.follow_live, connected);
             case.wait(|studio| studio.recording_export.is_none());
-            let path = PathBuf::from(&case.studio.retained_path);
-            assert!(path.exists(), "{:?}", case.studio.notices);
+            assert!(destination.exists(), "{:?}", case.studio.notices);
             case.studio.clear_recording();
             case.live = None;
-            case.studio.open(path, case.context.clone());
+            case.studio.open(destination, case.context.clone());
             case.wait(|studio| studio.job.is_none() && studio.seeking.is_none());
             assert!(case.studio.is_project_capture());
             assert_eq!((case.studio.first_frame(), case.studio.count()), (0, 9));
@@ -231,11 +260,11 @@ fn tcp_history_without_raw_exports_and_real_open_preserves_absolute_range() {
     let mut case = Case::new();
     assert!(case.studio.bytes.is_none() && case.studio.capture_path.is_none());
     assert!(case.studio.can_export_retained());
+    let path = PathBuf::from(&case.studio.retained_path);
     case.studio.frame = 4;
     case.studio.export_retained(case.context.clone());
     assert_eq!(case.studio.frame, 4);
     case.wait(|studio| studio.recording_export.is_none());
-    let path = PathBuf::from(&case.studio.retained_path);
     assert!(path.exists(), "{:?}", case.studio.notices);
     case.studio.clear_recording();
     case.live = None;

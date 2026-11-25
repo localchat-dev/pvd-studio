@@ -70,6 +70,49 @@ impl Studio {
         }
     }
 
+    fn retained_destination(&self, range: CaptureRange) -> PathBuf {
+        if !self.retained_path.is_empty() {
+            return PathBuf::from(&self.retained_path);
+        }
+        let session = if let Some(selected) = self.temporary_recordings.selected {
+            self.temporary_recordings
+                .get(selected)
+                .map(|entry| entry.session)
+        } else {
+            self.live_session
+        };
+        let source = if let Some(session) = session {
+            format!("desktop-session-{session}")
+        } else if let Some(stem) = self.capture_path.as_deref().and_then(Path::file_stem) {
+            stem.to_string_lossy().chars().take(80).collect()
+        } else {
+            "pvd-recording".to_owned()
+        };
+        let stamp = capture_save_timestamp();
+        let suffix = if self
+            .retained_range()
+            .is_some_and(|available| range.first != available.first || range.last != available.last)
+        {
+            format!("-frames-{}-{}", range.first, range.last)
+        } else {
+            String::new()
+        };
+        self.retained_directory
+            .join(format!("{source}-{stamp}{suffix}.pvdcapture"))
+    }
+
+    pub(crate) fn pick_retained_path(&mut self, range: CaptureRange, context: egui::Context) {
+        let destination = self.retained_destination(range);
+        if let Err(error) = self.file_picker.request(
+            crate::file_picker::PickerKind::SaveRetainedCapture,
+            destination,
+            self.prefs.language,
+            context,
+        ) {
+            self.notice(error);
+        }
+    }
+
     pub fn export_retained(&mut self, context: egui::Context) {
         if !self.can_export_retained() {
             return;
@@ -87,7 +130,8 @@ impl Studio {
             ));
             return;
         }
-        if !Path::new(&self.retained_path)
+        let destination = self.retained_destination(CaptureRange { first, last });
+        if !destination
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("pvdcapture"))
         {
@@ -104,7 +148,7 @@ impl Studio {
         };
         match crate::recording_export::Job::start(
             source,
-            self.retained_path.clone().into(),
+            destination,
             crate::recording_export::Kind::Retained { first, last },
             context,
             &self.export_workers,
@@ -113,6 +157,30 @@ impl Studio {
             Err(error) => self.notice(error),
         }
     }
+}
+
+#[cfg(windows)]
+fn capture_save_timestamp() -> String {
+    let time = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}",
+        time.wYear,
+        time.wMonth,
+        time.wDay,
+        time.wHour,
+        time.wMinute,
+        time.wSecond,
+        time.wMilliseconds
+    )
+}
+
+#[cfg(not(windows))]
+fn capture_save_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
 }
 
 #[cfg(test)]

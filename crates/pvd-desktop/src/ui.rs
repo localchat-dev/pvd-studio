@@ -814,11 +814,7 @@ fn playback(ui: &mut egui::Ui, studio: &mut Studio) {
     let count = last.saturating_add(1);
     let history = studio.has_history() && studio.playback_bounds().is_some();
     ui.add_enabled_ui(studio.count() > 0 || (studio.viewing_temporary_recording() && studio.live_connected), |ui| {
-        if studio.live_session.is_some() && playback_status::live_button(ui, studio)
-            .on_hover_text(language.text("Follow the newest decoded frame; it may lag behind TCP reception. Pausing or seeking only pauses this view; reception and history continue.", "跟随最新解码帧，可能落后于 TCP 接收进度。暂停或跳帧只暂停显示，数据接收和历史存储继续。"))
-            .clicked() {
-            studio.request_ui_action(ui.ctx(), "playback-live", UiAction::ReturnLive);
-        }
+        ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(history, egui::Button::new("|<"))
             .on_hover_text(language.text("First frame", "首帧"))
@@ -868,23 +864,6 @@ fn playback(ui: &mut egui::Ui, studio: &mut Studio) {
         {
             studio.request_ui_action(ui.ctx(), "playback-last", UiAction::PauseAndSeek(last_index));
         }
-        let mut frame = studio.frame_ordinal(studio.frame);
-        ui.label(language.text("Frame", "帧"));
-        if ui
-            .add_enabled(history, egui::DragValue::new(&mut frame).range(first..=count.saturating_sub(1)).clamp_existing_to_range(false))
-            .on_hover_text(localized_format!(language, "Displayed frame; retained history: {first}–{}", "实际显示帧；可回放历史：{first}–{}", count.saturating_sub(1)))
-            .changed()
-            && let Some(target) = studio.frame_at_ordinal(frame)
-        {
-            studio.request_ui_action(ui.ctx(), "playback-frame", UiAction::PauseAndSeek(target));
-        }
-        ui.label(format!("/ {}", count.saturating_sub(1)));
-        if let Some(index) = studio.seeking {
-            let frame = studio.frame_ordinal(index);
-            ui.spinner();
-            ui.label(localized_format!(language, "Loading frame {frame}", "正在读取第 {frame} 帧"));
-            if ui.small_button(language.text("Cancel", "取消")).clicked() { studio.request_ui_action(ui.ctx(), "playback-cancel", UiAction::Pause); }
-        }
         if ui.checkbox(&mut studio.recorded_timing, language.text("Recorded timing", "录制速度"))
             .on_hover_text(language.text("Use recorded SDK frame timestamps in either direction. This is capture time, not a fixed simulation timestep.", "正放和倒放均使用录制的 SDK 帧时间戳间隔；这是捕获时序，不是固定仿真步长。"))
             .changed() { studio.last_step = std::time::Instant::now(); }
@@ -896,6 +875,34 @@ fn playback(ui: &mut egui::Ui, studio: &mut Studio) {
             .on_hover_text(language.text("Lower the frame rate for slow playback. At 1 fps, playback advances one frame per second; Left/Right steps manually.", "调低帧率可慢放。1 帧/秒表示每秒前进一帧；左右方向键可手动逐帧。"))
             .on_disabled_hover_text(language.text("Turn off Recorded timing to set a playback frame rate.", "取消“录制速度”后可设置播放帧率。"))
             .changed() { studio.last_step = std::time::Instant::now(); }
+        });
+        ui.horizontal_wrapped(|ui| {
+        let mode = studio.display_mode();
+        ui.colored_label(playback_status::color(mode), mode.label(language))
+            .on_hover_text(studio.display_detail(language));
+        let mut frame = studio.frame_ordinal(studio.frame);
+                ui.label(language.text("Displayed frame", "显示帧"));
+        if ui
+            .add_enabled(history, egui::DragValue::new(&mut frame).range(first..=count.saturating_sub(1)).clamp_existing_to_range(false))
+            .on_hover_text(localized_format!(language, "Displayed frame; retained history: {first}–{}", "实际显示帧；可回放历史：{first}–{}", count.saturating_sub(1)))
+            .changed()
+            && let Some(target) = studio.frame_at_ordinal(frame)
+        {
+            studio.request_ui_action(ui.ctx(), "playback-frame", UiAction::PauseAndSeek(target));
+        }
+        ui.label(format!("/ {}", count.saturating_sub(1)));
+        if studio.live_session.is_some() && playback_status::live_button(ui, studio)
+            .on_hover_text(language.text("Follow the newest decoded frame; it may lag behind TCP reception. Pausing or seeking only pauses this view; reception and history continue.", "跟随最新解码帧，可能落后于 TCP 接收进度。暂停或跳帧只暂停显示，数据接收和历史存储继续。"))
+            .clicked() {
+            studio.request_ui_action(ui.ctx(), "playback-live", UiAction::ReturnLive);
+        }
+        if let Some(index) = studio.seeking {
+            let frame = studio.frame_ordinal(index);
+            ui.spinner();
+            ui.label(localized_format!(language, "Loading frame {frame}", "正在读取第 {frame} 帧"));
+            if ui.small_button(language.text("Cancel", "取消")).clicked() { studio.request_ui_action(ui.ctx(), "playback-cancel", UiAction::Pause); }
+        }
+        });
     });
     if studio.live_session.is_some() && !history {
         ui.colored_label(
@@ -904,6 +911,17 @@ fn playback(ui: &mut egui::Ui, studio: &mut Studio) {
         )
         .on_hover_text(studio.history_unavailable_detail(language));
     }
+}
+
+fn timeline_has_playback(studio: &Studio) -> bool {
+    let dock = &studio.prefs.dock;
+    dock.find_tab(&Panel::Timeline)
+        .is_some_and(|(surface, node, tab)| {
+            surface.is_main()
+                && dock[surface][node]
+                    .get_leaf()
+                    .is_some_and(|leaf| leaf.active == tab && !leaf.collapsed)
+        })
 }
 
 struct Viewer<'a> {
@@ -1687,34 +1705,52 @@ impl Viewer<'_> {
     fn timeline(&mut self, ui: &mut egui::Ui) {
         let language = self.studio.prefs.language;
         ui.add_space(6.0);
+        if timeline_has_playback(self.studio) {
+            playback(ui, self.studio);
+            ui.add_space(4.0);
+        }
         let count = self.studio.count();
         let (first, last) = self.studio.playback_ordinal_bounds().unwrap_or((0, 0));
-        if count == 0 || self.studio.playback_bounds().is_none() {
-            ui.label(language.text("No frames", "暂无帧数据"));
-        } else {
-            let position = ui.label(localized_format!(
-                language,
-                "Frame {} / {}",
-                "帧 {} / {}",
-                self.studio.frame_ordinal(self.studio.frame),
-                last
-            ));
-            if let Some(info) = self
-                .studio
-                .timeline_recording()
-                .and_then(|recording| recording.frame_info(self.studio.frame))
-            {
-                position.on_hover_text(localized_format!(
+        let has_frames = count > 0 && self.studio.playback_bounds().is_some();
+        ui.horizontal(|ui| {
+            if has_frames {
+                let position = ui.label(localized_format!(
                     language,
-                    "Scene 0x{:016x} · SDK timestamp {}",
-                    "场景 0x{:016x} · SDK 时间戳 {}",
-                    info.scene_id,
-                    info.timestamp
+                    "Frame {} / {}",
+                    "帧 {} / {}",
+                    self.studio.frame_ordinal(self.studio.frame),
+                    last
                 ));
+                if let Some(info) = self
+                    .studio
+                    .timeline_recording()
+                    .and_then(|recording| recording.frame_info(self.studio.frame))
+                {
+                    position.on_hover_text(localized_format!(
+                        language,
+                        "Scene 0x{:016x} · SDK timestamp {}",
+                        "场景 0x{:016x} · SDK 时间戳 {}",
+                        info.scene_id,
+                        info.timestamp
+                    ));
+                }
+            } else {
+                ui.label(language.text("No frames", "暂无帧数据"));
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                settings_menu(
+                    ui,
+                    language.text("Save and export", "保存与导出"),
+                    |ui| {
+                        self.timeline_export(ui, count);
+                    },
+                );
+            });
+        });
+        if has_frames {
             let mut frame = self
                 .studio
-                .frame_ordinal(self.studio.frame)
+                .frame_ordinal(self.studio.seeking.unwrap_or(self.studio.frame))
                 .clamp(first, last);
             ui.spacing_mut().slider_width = (ui.available_width() - 12.0).max(50.0);
             if ui
@@ -1813,7 +1849,11 @@ impl Viewer<'_> {
                 ui.colored_label(egui::Color32::YELLOW, warning);
             }
         }
-        ui.add_space(5.0);
+        crate::recording_export::show_progress(ui, self.studio);
+    }
+
+    fn timeline_export(&mut self, ui: &mut egui::Ui, count: usize) {
+        let language = self.studio.prefs.language;
         recording_save_controls(ui, self.studio);
         if count == 0 {
             return;
@@ -1886,7 +1926,6 @@ impl Viewer<'_> {
                 },
             );
         });
-        crate::recording_export::show_progress(ui, self.studio);
     }
     fn diagnostics(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()

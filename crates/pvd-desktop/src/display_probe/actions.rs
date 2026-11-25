@@ -215,7 +215,7 @@ fn start_case(actions: &mut Actions, studio: &Studio, probe: &Probe) {
         1 => language.text("▶ Play", "▶ 播放").into(),
         2 => language.text("◀ Reverse", "◀ 倒放").into(),
         3 => studio.live_follow_label(language).into(),
-        4 => language.text("Close", "关闭").into(),
+        4 => studio.close_view_label(language).into(),
         _ => unreachable!(),
     };
     actions.point = None;

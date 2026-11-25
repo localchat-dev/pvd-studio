@@ -44,11 +44,11 @@ fn desktop_opens_packed_range_and_resaves_to_one_compatible_capture() {
 }
 
 fn open_live_export(case: &mut Case) -> PathBuf {
+    let path = PathBuf::from(&case.studio.retained_path);
     case.studio.export_retained(case.context.clone());
     case.wait(|studio| {
         studio.recording_export.is_none() && studio.export_workers.cancel_all_and_check_finished()
     });
-    let path = PathBuf::from(&case.studio.retained_path);
     assert!(path.exists(), "{:?}", case.studio.notices);
     case.studio.clear_recording();
     case.live = None;

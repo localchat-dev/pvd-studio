@@ -16,6 +16,7 @@ namespace PvdStudio.Editor
         [SerializeField] private bool autoSelect = true;
         [SerializeField] private bool mirrorX;
         [SerializeField] private bool wireframe;
+        [SerializeField, Range(0f, 1f)] private float surfaceOpacity = SceneOverlay.DefaultSurfaceOpacity;
         [SerializeField] private bool showInGameView;
         [SerializeField] private bool showPhysicsQueries = true;
         [SerializeField] private bool restorePaused;
@@ -23,6 +24,9 @@ namespace PvdStudio.Editor
         [SerializeField] private int playbackRate = 15;
         [SerializeField] private float cropRadius = DefaultCropRadius;
         [SerializeField] private bool cropEnabled;
+        [SerializeField] private bool listenerSettings;
+        [SerializeField] private bool viewSettings;
+        [SerializeField] private bool exportSettings;
         [SerializeField] private Transform cropTransform;
         [SerializeField] private long cropSession;
         [SerializeField] private ulong cropActor;
@@ -54,6 +58,12 @@ namespace PvdStudio.Editor
         private string queryError;
         private string cropUnavailable;
         private Vector2 scroll;
+        private GUIStyle section;
+        private GUIStyle badge;
+        private GUIStyle liveButton;
+        private bool darkSkin;
+        private bool? pendingFoldoutExpansion;
+        private bool foldoutLayoutReady;
 
         [MenuItem("Tools/PVD Studio")]
         private static void Open()
@@ -70,9 +80,11 @@ namespace PvdStudio.Editor
                 return;
             }
             owner = this;
+            minSize = new Vector2(275f, 150f);
             cursor = new PlaybackCursor();
             SceneOverlay.MirrorX = mirrorX;
             SceneOverlay.Wireframe = wireframe;
+            SceneOverlay.SurfaceOpacity = surfaceOpacity;
             SceneOverlay.ShowInGameView = showInGameView;
             if (!FrameCrop.IsRadiusValid(cropRadius)) cropRadius = DefaultCropRadius;
             displayed = -1;
@@ -90,6 +102,7 @@ namespace PvdStudio.Editor
             EditorApplication.delayCall -= CloseDuplicate;
             if (owner != this) return;
             owner = null;
+            pendingFoldoutExpansion = null;
             EditorApplication.update -= Tick;
             Selection.selectionChanged -= Repaint;
             if (cursor != null && !restorePaused)
@@ -205,6 +218,7 @@ namespace PvdStudio.Editor
                 string previousQueryError = queryError;
                 bool raysPreviouslyTruncated = raysTruncated;
                 bool queriesPreviouslyTruncated = queriesTruncated;
+                long previousDisplayed = displayed;
                 bool surfacesDisplayed = false;
                 try
                 {
@@ -232,7 +246,8 @@ namespace PvdStudio.Editor
                 if (surfacesDisplayed && completed.IncludesRays) DisplayRays(completed.Frame);
                 if (surfacesDisplayed && completed.IncludesQueries) DisplayQueries(completed.Frame, completed.QueryError);
                 if (previousError != frameError || previousRayError != rayError || previousQueryError != queryError ||
-                    raysPreviouslyTruncated != raysTruncated || queriesPreviouslyTruncated != queriesTruncated)
+                    raysPreviouslyTruncated != raysTruncated || queriesPreviouslyTruncated != queriesTruncated ||
+                    (!cursor.Live && direction == 0 && previousDisplayed != displayed))
                     Repaint();
             }
 
@@ -393,47 +408,169 @@ namespace PvdStudio.Editor
         private void OnGUI()
         {
             if (owner != this) return;
+            section ??= new GUIStyle { padding = new RectOffset(12, 12, 10, 10) };
+            badge ??= new GUIStyle(EditorStyles.boldLabel) {
+                alignment = TextAnchor.MiddleCenter, padding = new RectOffset(8, 8, 2, 2)
+            };
+            if (liveButton == null || darkSkin != EditorGUIUtility.isProSkin)
+            {
+                darkSkin = EditorGUIUtility.isProSkin;
+                liveButton = new GUIStyle(GUI.skin.button);
+                liveButton.normal.textColor = darkSkin ? new Color32(180, 218, 255, 255) : new Color32(32, 68, 106, 255);
+            }
+            if (Event.current.type == EventType.Layout)
+                foldoutLayoutReady = pendingFoldoutExpansion.HasValue;
+            float contentHeight = 0;
             scroll = EditorGUILayout.BeginScrollView(scroll);
-            bool listening = status != null && status.listening;
-            using (new EditorGUI.DisabledScope(listening))
+            float previousLabelWidth = EditorGUIUtility.labelWidth;
+            try
             {
-                address = EditorGUILayout.TextField("监听地址", address);
-                recordHistory = EditorGUILayout.Toggle("完整录制", recordHistory);
+                EditorGUIUtility.labelWidth = Mathf.Clamp(position.width * 0.3f, 78f, 115f);
+                DrawSections();
+                if (foldoutLayoutReady && pendingFoldoutExpansion.HasValue && Event.current.type == EventType.Repaint)
+                    contentHeight = GUILayoutUtility.GetLastRect().yMax;
             }
-            if (listening) EditorGUILayout.LabelField("正在监听", status.address);
-            if (GUILayout.Button(listening ? "停止监听" : "开始监听"))
-                Run(() => NativeViewer.Command(listening ? "stop" : "start", address, recordHistory: recordHistory));
-
-            if (status != null)
+            finally
             {
-                EditorGUILayout.Space();
-                DrawSelection();
+                EditorGUIUtility.labelWidth = previousLabelWidth;
+                EditorGUILayout.EndScrollView();
             }
-            DrawCrop();
-            if (status != null)
-            {
-                DrawExport();
-                EditorGUILayout.Space();
-                EditorGUILayout.LabelField("临时缓存", EditorUtility.FormatBytes(status.totalBytes));
-                EditorGUILayout.LabelField("可清理", EditorUtility.FormatBytes(status.clearableBytes));
-                // A completed session is protected once its first frame has been acquired.
-                using (new EditorGUI.DisabledScope(status.clearableBytes <= 0 || (sessionId != 0 && displayed < 0)))
-                {
-                    if (GUILayout.Button("清理可释放缓存"))
-                        Run(() => released = NativeViewer.Command("clear").released);
-                }
-                EditorGUILayout.LabelField("上次清理释放", EditorUtility.FormatBytes(released));
-            }
-            string error = commandError ?? pollError ?? frameError ?? rayError ?? queryError;
-            if (!string.IsNullOrEmpty(error)) EditorGUILayout.HelpBox(error, MessageType.Error);
-            if (!string.IsNullOrEmpty(status?.error) && status.error != error)
-                EditorGUILayout.HelpBox(status.error, MessageType.Warning);
-            if (frameError != null && !string.IsNullOrEmpty(status?.frameError))
-                EditorGUILayout.HelpBox(status.frameError, MessageType.Error);
-            EditorGUILayout.EndScrollView();
+            if (contentHeight > 0) FitFoldoutHeight(contentHeight);
         }
 
-        private void DrawSelection()
+        private bool SettingsFoldout(bool expanded, string title)
+        {
+            bool next = EditorGUILayout.Foldout(expanded, title, true);
+            if (next != expanded && !docked && !maximized)
+            {
+                pendingFoldoutExpansion = next;
+                foldoutLayoutReady = false;
+                Repaint();
+            }
+            return next;
+        }
+
+        private void FitFoldoutHeight(float contentHeight)
+        {
+            bool expanding = pendingFoldoutExpansion.Value;
+            pendingFoldoutExpansion = null;
+            if (docked || maximized) return;
+            var rect = position;
+            float height = Mathf.Clamp(Mathf.Ceil(contentHeight), minSize.y, maxSize.y);
+            if (expanding)
+            {
+                var desktop = UnityEditorInternal.InternalEditorUtility.GetBoundsOfDesktopAtPoint(rect.center);
+                float available = desktop.yMax - GUIUtility.GUIToScreenPoint(Vector2.zero).y;
+                height = Mathf.Min(height, available);
+                if (height <= rect.height) return;
+            }
+            else if (height >= rect.height) return;
+            rect.height = height;
+            position = rect;
+        }
+
+        private void DrawSections()
+        {
+            BeginSection();
+            ViewerSession selected = DrawConnection();
+            if (selected?.liveOnly == true) ShowFrameErrors();
+            ShowError(commandError);
+            EditorGUILayout.EndVertical();
+
+            if (selected?.liveOnly != true && (selected != null || status?.listening == true))
+            {
+                BeginSection(playback: true);
+                if (selected != null)
+                    DrawPlayback();
+                else
+                    EditorGUILayout.LabelField(autoSelect ? "等待会话" : "已关闭叠加视图",
+                        Receiving ? "接收持续进行" : "等待发送端连接");
+                EditorGUILayout.EndVertical();
+            }
+
+            BeginSection();
+            if (selected != null) DrawOverlayOptions(selected);
+            viewSettings = SettingsFoldout(viewSettings, cropEnabled ? "视图与裁切设置（裁切中）" : "视图与裁切设置");
+            if (viewSettings)
+            {
+                if (sessionId != 0) DrawViewSettings();
+                DrawCrop();
+            }
+            else if (!string.IsNullOrEmpty(cropUnavailable))
+                EditorGUILayout.HelpBox(cropUnavailable, MessageType.Warning);
+            EditorGUILayout.EndVertical();
+
+            if (status != null)
+            {
+                BeginSection();
+                exportSettings = SettingsFoldout(exportSettings, "导出与临时缓存");
+                if (exportSettings)
+                {
+                    DrawExport();
+                    DrawCache();
+                }
+                DrawExportStatus();
+                EditorGUILayout.EndVertical();
+            }
+        }
+
+        private bool Receiving => status?.listening == true && status.sessions != null &&
+            Array.Exists(status.sessions, session => session.active);
+
+        private void BeginSection(bool playback = false)
+        {
+            Rect rect = EditorGUILayout.BeginVertical(section);
+            if (Event.current.type != EventType.Repaint) return;
+            bool dark = EditorGUIUtility.isProSkin;
+            if (playback)
+                EditorGUI.DrawRect(rect, dark ? new Color32(48, 51, 52, 255) : new Color32(205, 214, 218, 255));
+            EditorGUI.DrawRect(new Rect(rect.x, rect.yMax - 1, rect.width, 1),
+                dark ? new Color32(81, 81, 81, 255) : new Color32(155, 160, 162, 255));
+        }
+
+        private ViewerSession DrawConnection()
+        {
+            bool listening = status?.listening == true;
+            bool receiving = Receiving;
+            EditorGUILayout.BeginHorizontal();
+            Rect dot = GUILayoutUtility.GetRect(10, 23, GUILayout.ExpandWidth(false));
+            Color32 stateColor = !listening ? new Color32(132, 132, 132, 255) : receiving
+                ? (EditorGUIUtility.isProSkin ? new Color32(162, 217, 182, 255) : new Color32(34, 105, 66, 255))
+                : (EditorGUIUtility.isProSkin ? new Color32(180, 218, 255, 255) : new Color32(47, 93, 138, 255));
+            if (Event.current.type == EventType.Repaint)
+                GUI.DrawTexture(new Rect(dot.center.x - 3.5f, dot.center.y - 3.5f, 7f, 7f), Texture2D.whiteTexture,
+                    ScaleMode.StretchToFill, true, 0, stateColor, 0, 3.5f);
+            var tcp = receiving ? "TCP · 接收中" : listening ? "TCP · 监听中" : "TCP · 未监听";
+            GUILayout.Label(new GUIContent(tcp, listening ? status.address : address), EditorStyles.boldLabel);
+            if (GUILayout.Button(listening ? "停止监听" : "开始监听", GUILayout.Height(23), GUILayout.ExpandWidth(false)))
+                Run(() => NativeViewer.Command(listening ? "stop" : "start", address, recordHistory: recordHistory));
+            EditorGUILayout.EndHorizontal();
+            GUILayout.Space(5);
+            ViewerSession selected = status != null ? DrawSession() : null;
+            GUILayout.Space(4);
+            listenerSettings = SettingsFoldout(listenerSettings, "监听设置");
+            if (listenerSettings)
+            {
+                using (new EditorGUI.DisabledScope(listening))
+                {
+                    address = EditorGUILayout.TextField("监听地址", address);
+                    recordHistory = EditorGUILayout.ToggleLeft(
+                        new GUIContent("完整录制", "保留历史，支持逐帧回看、正倒放和导出。"), recordHistory);
+                }
+                if (listening) EditorGUILayout.LabelField("实际监听", status.address);
+            }
+            ShowError(pollError);
+            if (!string.IsNullOrEmpty(status?.error) && status.error != pollError && status.error != commandError)
+                EditorGUILayout.HelpBox(status.error, MessageType.Warning);
+            return selected;
+        }
+
+        private static void ShowError(string error)
+        {
+            if (!string.IsNullOrEmpty(error)) EditorGUILayout.HelpBox(error, MessageType.Error);
+        }
+
+        private ViewerSession DrawSession()
         {
             var sessions = status.sessions ?? Array.Empty<ViewerSession>();
             var names = new string[sessions.Length + 1];
@@ -442,11 +579,24 @@ namespace PvdStudio.Editor
             for (int i = 0; i < sessions.Length; i++)
             {
                 var s = sessions[i];
-                string mode = s.liveOnly ? "仅实时" : "完整录制";
-                names[i + 1] = $"会话 {s.id} · {mode} · {(s.active ? "接收中" : "已结束")} · {s.frames} 帧";
+                names[i + 1] = s.liveOnly && s.active ? $"会话 {s.id} · 仅实时" :
+                    $"会话 {s.id} · {(s.liveOnly ? "仅实时" : "完整录制")} · {(s.active ? "接收中" : "已结束")} · {s.frames} 帧";
                 if (s.id == sessionId) current = i + 1;
             }
+            var selected = current == 0 ? null : sessions[current - 1];
+            EditorGUILayout.BeginHorizontal();
+            float labelWidth = EditorGUIUtility.labelWidth;
+            EditorGUIUtility.labelWidth = 34f;
             int choice = EditorGUILayout.Popup("会话", current, names);
+            EditorGUIUtility.labelWidth = labelWidth;
+            if (selected?.liveOnly == true)
+            {
+                GUILayout.Space(5);
+                string frame = displayed >= 0 ? $"显示帧 {displayed}" : selected.frames == 0 ? "等待首帧" : "等待画面";
+                var details = new GUIContent(frame, $"已接收 {selected.frames} 帧。需要回放或导出时，在开始监听前勾选「完整录制」。");
+                GUILayout.Label(details, EditorStyles.miniLabel, GUILayout.ExpandWidth(false));
+            }
+            EditorGUILayout.EndHorizontal();
             if (choice != current)
             {
                 Run(() =>
@@ -457,11 +607,20 @@ namespace PvdStudio.Editor
                     if (chosen != null && !selectedActive && !selectedLiveOnly) cursor.Pause();
                     autoSelect = selectedLiveOnly;
                 });
-                return;
+                return null;
             }
-            if (current == 0) return;
+            return selected;
+        }
 
-            var rooms = sessions[current - 1].rooms ?? Array.Empty<ViewerRoom>();
+        private void DrawOverlayOptions(ViewerSession selected)
+        {
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.Label("叠加显示", EditorStyles.boldLabel);
+            if (GUILayout.Button("关闭当前视图", EditorStyles.miniButton, GUILayout.ExpandWidth(false)))
+                Run(() => { Select(0); autoSelect = false; });
+            EditorGUILayout.EndHorizontal();
+            GUILayout.Space(5);
+            var rooms = selected.rooms ?? Array.Empty<ViewerRoom>();
             var labels = new string[rooms.Length + 1];
             labels[0] = "全部物理场景";
             int roomIndex = 0;
@@ -479,9 +638,18 @@ namespace PvdStudio.Editor
             bool showWireframe = EditorGUILayout.Popup("显示模式", wireframe ? 1 : 0, DisplayModes) == 1;
             if (showWireframe != wireframe)
                 Run(() => { SceneOverlay.Wireframe = showWireframe; wireframe = showWireframe; });
-            showInGameView = EditorGUILayout.Toggle("在 Game 视图显示", showInGameView);
-            SceneOverlay.ShowInGameView = showInGameView;
-            bool drawQueries = EditorGUILayout.Toggle("显示物理查询", showPhysicsQueries);
+            if (!wireframe)
+            {
+                EditorGUILayout.BeginHorizontal();
+                int currentPercent = Mathf.RoundToInt(surfaceOpacity * 100f);
+                int percent = EditorGUILayout.IntSlider("不透明度 (%)", currentPercent, 0, 100);
+                float opacity = percent == currentPercent ? surfaceOpacity : percent / 100f;
+                if (GUILayout.Button("原始实心", GUILayout.ExpandWidth(false))) opacity = 1f;
+                if (opacity != surfaceOpacity)
+                    Run(() => { SceneOverlay.SurfaceOpacity = opacity; surfaceOpacity = opacity; });
+                EditorGUILayout.EndHorizontal();
+            }
+            bool drawQueries = EditorGUILayout.ToggleLeft("显示物理查询", showPhysicsQueries);
             if (drawQueries != showPhysicsQueries)
             {
                 showPhysicsQueries = drawQueries;
@@ -491,16 +659,22 @@ namespace PvdStudio.Editor
                 EditorGUILayout.HelpBox("当前帧的物理射线可能未完整显示。", MessageType.Info);
             if (queriesTruncated)
                 EditorGUILayout.HelpBox("当前帧的形状查询可能未完整显示。", MessageType.Info);
-            bool useMirror = EditorGUILayout.Toggle("镜像 X", mirrorX);
+            ShowError(rayError);
+            if (queryError != rayError) ShowError(queryError);
+            GUILayout.Space(4);
+        }
+
+        private void DrawViewSettings()
+        {
+            showInGameView = EditorGUILayout.ToggleLeft("在 Game 视图显示", showInGameView);
+            SceneOverlay.ShowInGameView = showInGameView;
+            bool useMirror = EditorGUILayout.ToggleLeft("镜像 X", mirrorX);
             if (useMirror != mirrorX)
             {
                 mirrorX = useMirror;
                 SceneOverlay.MirrorX = mirrorX;
                 if (cropEnabled && cropSession == 0) RefreshFrame();
             }
-            if (cursor.Count > 0 && !selectedLiveOnly) DrawTimeline();
-            if (GUILayout.Button("关闭当前视图"))
-                Run(() => { Select(0); autoSelect = false; });
         }
 
         private void DrawCrop()
@@ -567,11 +741,17 @@ namespace PvdStudio.Editor
                 if (GUILayout.Button("导出选中会话（.pvdcapture）"))
                 {
                     long id = sessionId;
-                    string path = EditorUtility.SaveFilePanel("导出选中会话的全部可回放帧", "", $"session-{id}", "pvdcapture");
+                    string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss-fff", System.Globalization.CultureInfo.InvariantCulture);
+                    string path = EditorUtility.SaveFilePanel("导出选中会话的全部可回放帧", "", $"unity-session-{id}-{stamp}", "pvdcapture");
                     if (!string.IsNullOrEmpty(path))
                         Run(() => NativeViewer.Command("export", session: id, path: path));
                 }
             }
+        }
+
+        private void DrawExportStatus()
+        {
+            var export = status.export;
             if (export == null || export.session == 0) return;
             if (export.running)
                 EditorGUILayout.LabelField($"正在导出会话 {export.session}", export.path);
@@ -581,10 +761,52 @@ namespace PvdStudio.Editor
                 EditorGUILayout.HelpBox($"已导出会话 {export.session} · {export.frames} 帧 · {EditorUtility.FormatBytes(export.bytes)}\n{export.path}", MessageType.Info);
         }
 
-        private void DrawTimeline()
+        private void DrawCache()
         {
+            EditorGUILayout.LabelField("临时缓存", EditorUtility.FormatBytes(status.totalBytes));
+            EditorGUILayout.LabelField("可清理", EditorUtility.FormatBytes(status.clearableBytes));
+            // A completed session is protected once its first frame has been acquired.
+            using (new EditorGUI.DisabledScope(status.clearableBytes <= 0 || (sessionId != 0 && displayed < 0)))
+            {
+                if (GUILayout.Button("清理可释放缓存"))
+                    Run(() => released = NativeViewer.Command("clear").released);
+            }
+            EditorGUILayout.LabelField("上次清理释放", EditorUtility.FormatBytes(released));
+        }
+
+        private void ShowFrameErrors()
+        {
+            ShowError(frameError);
+            if (frameError != null && status.frameError != frameError) ShowError(status.frameError);
+        }
+
+        private void DrawPlayback()
+        {
+            bool hasHistory = cursor.Count > 0;
+            bool locating = hasHistory && !cursor.Live && displayed != cursor.Frame && frameError == null && cropUnavailable == null;
+            string mode = cursor.Count == 0 ? "等待完整帧" : cursor.Live ? (selectedActive ? "跟随实时" : "会话末帧") :
+                locating && direction == 0 ? "正在定位" : direction < 0 ? "倒放" : direction > 0 ? "正放" : "已暂停";
+            EditorGUILayout.BeginHorizontal();
+            DrawModeBadge(mode, cursor.Live && selectedActive && cursor.Count > 0, direction != 0);
+            GUILayout.Label(displayed < 0 ? "等待画面" : $"显示帧 {displayed}");
+            if (hasHistory && !cursor.Live && GUILayout.Button("返回实时", liveButton, GUILayout.Height(23), GUILayout.ExpandWidth(false)))
+            {
+                ChangePlaybackTarget();
+                cursor.ResumeLive();
+            }
+            EditorGUILayout.EndHorizontal();
+            ShowFrameErrors();
+            if (!hasHistory) return;
+
+            GUILayout.Space(4);
+            if (locating)
+            {
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.Label($"目标帧 {cursor.Frame}");
+                if (GUILayout.Button("取消定位", GUILayout.ExpandWidth(false))) PauseAtDisplay();
+                EditorGUILayout.EndHorizontal();
+            }
             long last = cursor.Count - 1;
-            EditorGUILayout.LabelField("回放", $"{cursor.Frame + 1} / {cursor.Count}  {(cursor.Live ? "实时" : direction == 0 ? "已暂停" : "播放中")}");
             using (new EditorGUI.DisabledScope(last == 0))
             {
                 EditorGUI.BeginChangeCheck();
@@ -596,21 +818,61 @@ namespace PvdStudio.Editor
                 }
             }
             EditorGUILayout.BeginHorizontal();
-            if (GUILayout.Button("上一帧")) { ChangePlaybackTarget(); cursor.Step(-1); }
-            if (GUILayout.Button("暂停"))
-            {
-                ChangePlaybackTarget();
-                cursor.Seek(displayed >= 0 ? displayed : cursor.Frame);
-            }
-            if (GUILayout.Button("下一帧")) { ChangePlaybackTarget(); cursor.Step(1); }
-            if (GUILayout.Button("返回实时")) { ChangePlaybackTarget(); cursor.ResumeLive(); }
+            GUILayout.Label("0", EditorStyles.miniLabel);
+            GUILayout.FlexibleSpace();
+            GUILayout.Label(last.ToString(), EditorStyles.miniLabel, GUILayout.ExpandWidth(false));
             EditorGUILayout.EndHorizontal();
-
-            playbackRate = EditorGUILayout.IntSlider("回放帧率", playbackRate, 1, 60);
+            GUILayout.Space(4);
+            bool compact = position.width < 355;
             EditorGUILayout.BeginHorizontal();
-            if (GUILayout.Button("倒放")) BeginPlayback(-1);
-            if (GUILayout.Button("正放")) BeginPlayback(1);
+            if (GUILayout.Button(new GUIContent("‹", "上一帧"), GUILayout.Width(26), GUILayout.Height(23)))
+            { ChangePlaybackTarget(); cursor.Step(-1); }
+            if (TransportButton("倒放", direction < 0)) BeginPlayback(-1);
+            if (TransportButton("暂停", !cursor.Live && direction == 0 && !locating)) PauseAtDisplay();
+            if (TransportButton("正放", direction > 0)) BeginPlayback(1);
+            if (GUILayout.Button(new GUIContent("›", "下一帧"), GUILayout.Width(26), GUILayout.Height(23)))
+            { ChangePlaybackTarget(); cursor.Step(1); }
+            if (compact)
+            {
+                EditorGUILayout.EndHorizontal();
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+            }
+            GUILayout.Space(4);
+            playbackRate = Mathf.Clamp(EditorGUILayout.DelayedIntField(playbackRate, GUILayout.Width(38)), 1, 60);
+            GUILayout.Label(new GUIContent("帧/秒", "回放帧率，1 到 60 帧/秒"), EditorStyles.miniLabel, GUILayout.ExpandWidth(false));
             EditorGUILayout.EndHorizontal();
+            GUILayout.Space(4);
+            GUILayout.Label(selectedActive ? (cursor.Live ? "跟随最新完整帧" : "接收持续进行") : "会话已结束 · 可回放和导出",
+                EditorStyles.miniLabel);
+        }
+
+        private void DrawModeBadge(string mode, bool live, bool playing)
+        {
+            bool dark = EditorGUIUtility.isProSkin;
+            Color32 background = live ? (dark ? new Color32(48, 72, 62, 255) : new Color32(203, 230, 211, 255))
+                : playing ? (dark ? new Color32(53, 72, 89, 255) : new Color32(203, 225, 244, 255))
+                : (dark ? new Color32(73, 64, 55, 255) : new Color32(239, 220, 190, 255));
+            badge.normal.textColor = live ? (dark ? new Color32(162, 217, 182, 255) : new Color32(31, 83, 54, 255))
+                : playing ? (dark ? new Color32(180, 218, 255, 255) : new Color32(36, 73, 110, 255))
+                : (dark ? new Color32(242, 206, 154, 255) : new Color32(101, 70, 28, 255));
+            var text = new GUIContent(mode);
+            Rect rect = GUILayoutUtility.GetRect(text, badge, GUILayout.Height(23), GUILayout.ExpandWidth(false));
+            if (Event.current.type == EventType.Repaint)
+                GUI.DrawTexture(rect, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0, background, 0, 4);
+            GUI.Label(rect, text, badge);
+            GUILayout.Space(5);
+        }
+
+        private static bool TransportButton(string text, bool active)
+        {
+            return GUILayout.Toggle(active, text, GUI.skin.button, GUILayout.Height(23)) != active;
+        }
+
+        private void PauseAtDisplay()
+        {
+            ChangePlaybackTarget();
+            cursor.Seek(displayed >= 0 ? displayed : cursor.Frame);
         }
 
         private void BeginPlayback(int value)

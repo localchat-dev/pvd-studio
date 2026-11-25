@@ -1,7 +1,7 @@
 use super::*;
 use crate::studio::DisplayMode;
 
-fn color(mode: DisplayMode) -> egui::Color32 {
+pub(super) fn color(mode: DisplayMode) -> egui::Color32 {
     match mode {
         DisplayMode::Live => egui::Color32::from_rgb(112, 207, 158),
         DisplayMode::Paused | DisplayMode::Waiting | DisplayMode::Seeking => {

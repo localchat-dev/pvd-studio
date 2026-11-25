@@ -98,8 +98,8 @@ fn controls(ui: &mut egui::Ui, language: Language) {
         }
     });
     ui.label(language.text(
-        "For slow motion, pause live follow, turn off Recorded timing, then lower FPS and play forward or reverse. Pausing keeps TCP reception running. Use Return to live to follow incoming frames.",
-        "慢放：暂停实时跟随，关闭“录制速度”，降低帧率后正放或倒放。暂停时 TCP 继续接收；点击“返回实时”跟随新帧。",
+        "Playback controls are in Timeline, or in the toolbar when the Timeline is not active. Turn off Recorded timing and lower FPS to play slowly. Pausing keeps TCP reception running. Return to live follows the newest decoded frame.",
+        "时间轴提供回放控制，切到其它面板时可在顶部操作。关闭“录制速度”并降低帧率可慢放。暂停时继续接收 TCP 数据。点击“返回实时”跟随最新解码帧。",
     ));
     ui.add_space(8.0);
     ui.strong(language.text("Camera", "相机"));
@@ -126,8 +126,8 @@ fn controls(ui: &mut egui::Ui, language: Language) {
         "在“设置”中配置 TCP 后开始监听，默认端口 5425。发送端填写调试机可达的 IP 地址。",
     ));
     ui.label(language.text(
-        "Save capture preserves the available playback history. Enable Save incoming recordings before listening when a complete raw stream is needed. History capacity and recording directories are in Settings.",
-        "“保存录制”保存当前可读取的历史。需要完整原始流时，在监听前启用“自动保存录制”。历史容量和录制目录均在“设置”中配置。",
+        "Timeline > Save and export saves the available playback history. Enable Save incoming recordings before listening to keep a complete raw stream. Configure history capacity and recording directories in Settings.",
+        "时间轴的“保存与导出”可以保存当前可读取的历史。需要完整原始流时，在监听前启用“自动保存录制”。历史容量和录制目录可在“设置”中配置。",
     ));
     ui.add_space(8.0);
     ui.strong(language.text("Panels", "面板"));

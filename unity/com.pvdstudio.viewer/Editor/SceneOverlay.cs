@@ -223,6 +223,7 @@ namespace PvdStudio.Editor
         private static readonly Dictionary<SurfaceGeometry, SharedMesh> Meshes = new Dictionary<SurfaceGeometry, SharedMesh>();
         private static readonly Stack<bool> CameraVisibility = new Stack<bool>();
         private static readonly Material[] Materials = new Material[Colors.Length];
+        private static readonly Material[] OpaqueMaterials = new Material[Colors.Length];
         private static readonly Material[] WireMaterials = new Material[Colors.Length];
         private static readonly List<ulong> RemovedRooms = new List<ulong>();
         private static readonly List<(ulong, uint)> RemovedActors = new List<(ulong, uint)>();
@@ -322,6 +323,33 @@ namespace PvdStudio.Editor
         }
 
         private static bool wireframe;
+        internal const float DefaultSurfaceOpacity = 0.16f;
+        private static float surfaceOpacity = DefaultSurfaceOpacity;
+        internal static float SurfaceOpacity
+        {
+            get => surfaceOpacity;
+            set
+            {
+                float opacity = float.IsNaN(value) ? DefaultSurfaceOpacity : Mathf.Clamp01(value);
+                if (surfaceOpacity == opacity) return;
+                bool changeRenderers = (surfaceOpacity == 1f) != (opacity == 1f)
+                    || (surfaceOpacity == 0f) != (opacity == 0f);
+                surfaceOpacity = opacity;
+                for (int i = 0; i < Materials.Length; i++)
+                    if (Materials[i] != null) Materials[i].color = SurfaceTint(i);
+                if (wireframe) return;
+                if (changeRenderers) ApplyShapeAppearance(false);
+                RepaintViews();
+            }
+        }
+
+        private static Color SurfaceTint(int state)
+        {
+            var color = Colors[state];
+            color.a = surfaceOpacity;
+            return color;
+        }
+
         internal static bool Wireframe
         {
             get => wireframe;
@@ -330,23 +358,26 @@ namespace PvdStudio.Editor
                 if (wireframe == value) return;
                 // Build the requested variants before replacing anything in the visible frame.
                 foreach (var shared in Meshes.Values) shared.GetMesh(value);
-                var materials = value ? WireMaterials : Materials;
-                foreach (var shape in Shapes.Values)
-                    if (materials[shape.State] == null) StateMaterial(shape.State, value);
-
                 wireframe = value;
-                foreach (var shape in Shapes.Values)
-                {
-                    if (shape.Filter == null || shape.Renderer == null || shape.Surface == null)
-                    {
-                        lostNode = true;
-                        continue;
-                    }
-                    shape.Filter.sharedMesh = shape.Surface.GetMesh(value);
-                    shape.Material = materials[shape.State];
-                    shape.Renderer.sharedMaterial = shape.Material;
-                }
+                ApplyShapeAppearance(true);
                 RepaintViews();
+            }
+        }
+
+        private static Material[] ActiveMaterials => wireframe ? WireMaterials
+            : surfaceOpacity == 1f ? OpaqueMaterials : Materials;
+
+        private static void ApplyShapeAppearance(bool updateMesh)
+        {
+            foreach (var shape in Shapes.Values)
+            {
+                if (shape.Filter == null || shape.Renderer == null || shape.Surface == null)
+                {
+                    lostNode = true;
+                    continue;
+                }
+                if (updateMesh) shape.Filter.sharedMesh = shape.Surface.GetMesh(wireframe);
+                ApplyShapeMaterial(shape);
             }
         }
 
@@ -446,12 +477,11 @@ namespace PvdStudio.Editor
                     SetGeometry(shape, record.Geometry);
                     changed = true;
                 }
-                var material = (wireframe ? WireMaterials : Materials)[record.State];
+                var material = ActiveMaterials[record.State];
                 if (material == null || !ReferenceEquals(shape.Material, material))
                 {
                     shape.State = record.State;
-                    shape.Material = StateMaterial(record.State, wireframe);
-                    shape.Renderer.sharedMaterial = shape.Material;
+                    ApplyShapeMaterial(shape);
                     changed = true;
                 }
             }
@@ -615,24 +645,35 @@ namespace PvdStudio.Editor
             shared.DestroyMeshes();
         }
 
-        private static Material StateMaterial(byte state, bool wire)
+        private static void ApplyShapeMaterial(Shape shape)
         {
-            var cache = wire ? WireMaterials : Materials;
+            shape.Material = StateMaterial(shape.State);
+            shape.Renderer.sharedMaterial = shape.Material;
+            shape.Renderer.enabled = wireframe || surfaceOpacity > 0f;
+        }
+
+        private static Material StateMaterial(byte state)
+        {
+            var cache = ActiveMaterials;
             if (cache[state] != null) return cache[state];
             var pipeline = GraphicsSettings.currentRenderPipeline;
             Material material;
-            if (wire) material = CreateWireMaterial(pipeline);
+            if (wireframe) material = CreateWireMaterial(pipeline);
+            else if (surfaceOpacity < 1f) material = new Material(Shader.Find("Hidden/PVD Studio/Overlay Surface"));
             else if (pipeline != null && pipeline.defaultMaterial != null) material = new Material(pipeline.defaultMaterial);
             else material = new Material(Shader.Find("Standard"));
             material.name = "PVD " + new[] { "Static", "Awake", "Sleeping" }[state];
             material.hideFlags = HideFlags.HideAndDontSave;
-            material.color = Colors[state];
+            material.color = wireframe ? Colors[state] : SurfaceTint(state);
             material.enableInstancing = true;
             return cache[state] = material;
         }
 
         private static Material CreateWireMaterial(RenderPipelineAsset pipeline)
         {
+            var overlay = Shader.Find("Hidden/PVD Studio/Overlay Wire");
+            if (SystemInfo.supportsGeometryShaders && overlay != null && overlay.isSupported)
+                return new Material(overlay);
             if (pipeline != null)
             {
                 Shader shader = null;
@@ -681,12 +722,7 @@ namespace PvdStudio.Editor
         private static void RefreshMaterials()
         {
             ClearMaterials();
-            foreach (var shape in Shapes.Values)
-            {
-                if (shape.Renderer == null) continue;
-                shape.Material = StateMaterial(shape.State, wireframe);
-                shape.Renderer.sharedMaterial = shape.Material;
-            }
+            ApplyShapeAppearance(false);
             if (rays != null && rays.Exists) rays.RefreshMaterials();
             if (queries != null && queries.Exists) queries.RefreshMaterials();
             RepaintViews();
@@ -791,6 +827,8 @@ namespace PvdStudio.Editor
             {
                 if (Materials[i] != null) Object.DestroyImmediate(Materials[i]);
                 Materials[i] = null;
+                if (OpaqueMaterials[i] != null) Object.DestroyImmediate(OpaqueMaterials[i]);
+                OpaqueMaterials[i] = null;
                 if (WireMaterials[i] != null) Object.DestroyImmediate(WireMaterials[i]);
                 WireMaterials[i] = null;
             }

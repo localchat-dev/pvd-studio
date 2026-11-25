@@ -10,30 +10,34 @@ pub(super) fn show(
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("PVD STUDIO").size(17.0).strong());
         ui.add_space(8.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut studio.path_input)
-                .hint_text(language.text("Open or drop a capture", "打开或拖入录制文件"))
-                .desired_width((ui.available_width() - 520.0).max(120.0)),
-        );
-        if ui.button(language.text("Open", "打开")).clicked() {
-            if studio.path_input.trim().is_empty() {
-                studio.pick_file(PickerKind::OpenCapture, ui.ctx().clone());
-            } else {
-                let path = PathBuf::from(&studio.path_input);
-                studio.request_ui_action(ui.ctx(), "toolbar-open", UiAction::Open(path));
-            }
-        }
         if ui
-            .add_enabled(!studio.file_picker.is_busy(), egui::Button::new("…"))
-            .on_hover_text(language.text("Browse captures", "选择录制文件"))
+            .add_enabled(
+                !studio.file_picker.is_busy(),
+                egui::Button::new(language.text("Open capture…", "打开录制…")),
+            )
+            .on_hover_text(language.text("Browse or drop a capture", "选择或拖入录制文件"))
             .clicked()
         {
             studio.pick_file(PickerKind::OpenCapture, ui.ctx().clone());
         }
+        settings_menu(ui, language.text("Path", "路径"), |ui| {
+            let path = ui.add(
+                egui::TextEdit::singleline(&mut studio.path_input)
+                    .hint_text(language.text("Capture path", "录制路径"))
+                    .desired_width(300.0),
+            );
+            let ready = !studio.path_input.trim().is_empty() && !studio.file_picker.is_busy();
+            let open = ui.add_enabled(ready, egui::Button::new(language.text("Open", "打开")));
+            if ready && (open.clicked() || path.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))) {
+                let path = PathBuf::from(&studio.path_input);
+                studio.request_ui_action(ui.ctx(), "toolbar-open", UiAction::Open(path));
+                ui.close();
+            }
+        });
         if ui
             .add_enabled(
                 studio.recording.is_some() || studio.bytes.is_some() || studio.live_connected,
-                egui::Button::new(language.text("Close", "关闭")),
+                egui::Button::new(studio.close_view_label(language)),
             )
             .on_hover_text(if studio.temporary_recordings.selected.is_some() {
                 language.text(
@@ -55,6 +59,8 @@ pub(super) fn show(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             help::menu(ui, language);
             settings_menu(ui, language.text("Settings", "设置"), |ui| {
+                language_settings(ui, &mut studio.prefs.language);
+                ui.separator();
                 egui::ScrollArea::vertical()
                     .max_height(600.0)
                     .show(ui, |ui| {
@@ -87,7 +93,6 @@ pub(super) fn show(
     });
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
-        playback(ui, studio);
         frame_sources::show(ui, studio);
         ui.separator();
         if ui.button("NavMesh").clicked() {
@@ -101,6 +106,9 @@ pub(super) fn show(
         ui.add(egui::Label::new(egui::RichText::new(name).small().color(MUTED)).truncate())
             .on_hover_text(source);
     });
+    if !timeline_has_playback(studio) {
+        playback(ui, studio);
+    }
     ui.add_space(4.0);
 }
 
@@ -160,6 +168,21 @@ fn connection(ui: &mut egui::Ui, studio: &Studio) {
     };
     ui.add(egui::Label::new(egui::RichText::new(label).small().color(color)).truncate())
         .on_hover_text(detail);
+}
+
+fn language_settings(ui: &mut egui::Ui, language: &mut Language) {
+    ui.horizontal(|ui| {
+        ui.label(language.text("Language", "语言"));
+        for option in [Language::Chinese, Language::English] {
+            if ui
+                .selectable_value(language, option, option.label())
+                .changed()
+            {
+                ui.close();
+                ui.ctx().request_repaint();
+            }
+        }
+    });
 }
 
 fn settings(ui: &mut egui::Ui, studio: &mut Studio) {
@@ -261,20 +284,77 @@ fn settings(ui: &mut egui::Ui, studio: &mut Studio) {
             }
         }
     });
-    ui.horizontal(|ui| {
-        ui.label(language.text("Language", "语言"));
-        egui::ComboBox::from_id_salt("interface-language")
-            .selected_text(studio.prefs.language.label())
-            .show_ui(ui, |ui| {
-                for option in [Language::Chinese, Language::English] {
-                    ui.selectable_value(&mut studio.prefs.language, option, option.label());
-                }
-            });
-        if ui
-            .button(language.text("Reset layout", "重置布局"))
-            .clicked()
-        {
-            studio.prefs.dock = Preferences::default().dock;
+    if ui
+        .button(language.text("Reset layout", "重置布局"))
+        .clicked()
+    {
+        studio.prefs.dock = Preferences::default().dock;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn label_position(output: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
+        output.shapes.iter().find_map(|shape| {
+            let egui::epaint::Shape::Text(text) = &shape.shape else {
+                return None;
+            };
+            let point = text.galley.rect.translate(text.pos.to_vec2()).center();
+            (text.galley.text() == label && shape.clip_rect.contains(point)).then_some(point)
+        })
+    }
+
+    #[test]
+    fn settings_switches_both_languages_by_pointer() {
+        let context = egui::Context::default();
+        super::super::configure(&context);
+        let mut studio = Studio::default();
+        let mut navmesh = crate::navmesh::NavMeshOverlay::default();
+        let mut draw = |studio: &mut Studio, events| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1024.0, 720.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        show(ui, studio, &mut navmesh);
+                    });
+                },
+            )
+        };
+        let mut click = |studio: &mut Studio, label| {
+            let output = draw(studio, vec![]);
+            let pos = label_position(&output, label)
+                .unwrap_or_else(|| panic!("missing visible button {label}"));
+            let _ = draw(studio, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                let _ = draw(
+                    studio,
+                    vec![egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        modifiers: egui::Modifiers::NONE,
+                        pressed,
+                        pos,
+                    }],
+                );
+            }
+        };
+        studio.prefs.language = Language::Chinese;
+        for target in [Language::English, Language::Chinese] {
+            let menu = studio.prefs.language.text("Settings", "设置");
+            click(&mut studio, menu);
+            click(&mut studio, target.label());
+            assert_eq!(studio.prefs.language, target);
         }
-    });
+        let output = draw(&mut studio, vec![]);
+        assert!(label_position(&output, "设置").is_some());
+        assert!(label_position(&output, "English").is_none());
+    }
 }

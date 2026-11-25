@@ -94,12 +94,15 @@ pub(crate) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
         } else {
             &mut studio.export_path
         };
-        ui.add(egui::TextEdit::singleline(path).desired_width(width))
-            .on_hover_text(if history {
-                language.text("Project capture (.pvdcapture)", "项目捕获（.pvdcapture）")
-            } else {
-                language.text("SDK stream (.pvdstream)", "SDK 原始流（.pvdstream）")
-            });
+        let mut edit = egui::TextEdit::singleline(path).desired_width(width);
+        if history {
+            edit = edit.hint_text(language.text("Name by recording", "按录制自动命名"));
+        }
+        ui.add(edit).on_hover_text(if history {
+            language.text("Project capture (.pvdcapture)", "项目捕获（.pvdcapture）")
+        } else {
+            language.text("SDK stream (.pvdstream)", "SDK 原始流（.pvdstream）")
+        });
         if ui
             .add_enabled(
                 enabled && !studio.file_picker.is_busy(),
@@ -108,14 +111,13 @@ pub(crate) fn show(ui: &mut egui::Ui, studio: &mut Studio) {
             .on_hover_text(language.text("Choose recording path", "选择录制保存位置"))
             .clicked()
         {
-            studio.pick_file(
-                if history {
-                    PickerKind::SaveRetainedCapture
-                } else {
-                    PickerKind::SaveCapture
-                },
-                ui.ctx().clone(),
-            );
+            if history {
+                if let Some(range) = studio.retained_range() {
+                    studio.pick_retained_path(range, ui.ctx().clone());
+                }
+            } else {
+                studio.pick_file(PickerKind::SaveCapture, ui.ctx().clone());
+            }
         }
         if ui
             .add_enabled(

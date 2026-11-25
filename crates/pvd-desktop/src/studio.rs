@@ -557,6 +557,7 @@ pub struct Studio {
     pub analysis_export_path: String,
     pub requested_panel: Option<Panel>,
     pub retained_path: String,
+    retained_directory: PathBuf,
     pub retained_first: usize,
     pub retained_last: usize,
     capture_epoch: Arc<AtomicU64>,
@@ -685,7 +686,8 @@ impl Studio {
             curve_export_path: "property.csv".into(),
             analysis_export_path: "analysis.csv".into(),
             requested_panel: None,
-            retained_path: "captures/capture.pvdcapture".into(),
+            retained_path: String::new(),
+            retained_directory: "captures".into(),
             retained_first: 0,
             retained_last: 0,
             capture_epoch: Arc::new(AtomicU64::new(0)),
@@ -712,7 +714,15 @@ impl Studio {
             PickerKind::SaveRepx => &self.repx_path,
             PickerKind::SaveCsv => &self.curve_export_path,
             PickerKind::SaveAnalysisCsv => &self.analysis_export_path,
-            PickerKind::SaveRetainedCapture => &self.retained_path,
+            PickerKind::SaveRetainedCapture => {
+                return self.pick_retained_path(
+                    pvd_core::capture::CaptureRange {
+                        first: self.retained_first,
+                        last: self.retained_last,
+                    },
+                    context,
+                );
+            }
             PickerKind::RecordingDirectory => &self.prefs.capture_directory,
         };
         if let Err(error) = self
@@ -1394,8 +1404,20 @@ impl Studio {
             self.save_job = None;
             self.notice(result);
         }
-        if let Some(message) = self.recording_export.as_ref().and_then(|job| job.result()) {
+        if let Some((message, destination)) =
+            self.recording_export.as_ref().and_then(|job| job.result())
+        {
             self.recording_export = None;
+            if let Some(path) = destination
+                && Path::new(&self.retained_path) == path
+            {
+                self.retained_directory = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."))
+                    .to_owned();
+                self.retained_path.clear();
+            }
             self.notice(message);
         }
         if self.recording_export.is_some() {
@@ -2829,6 +2851,14 @@ impl Studio {
             detail.push_str(&format!("\n{scope}: {error}"));
         }
         detail
+    }
+
+    pub(crate) fn close_view_label(&self, language: Language) -> &'static str {
+        if self.temporary_recordings.selected.is_none() && self.live_connected {
+            language.text("Disconnect", "断开连接")
+        } else {
+            language.text("Close view", "关闭视图")
+        }
     }
 
     pub fn live_follow_label(&self, language: Language) -> &'static str {
