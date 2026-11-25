@@ -1,7 +1,7 @@
 {
   "name": "com.pvdstudio.viewer",
   "displayName": "PVD Studio Viewer",
-  "version": "0.2.14",
+  "version": "0.2.15",
   "unity": "2022.3",
   "description": "Inspect live and recorded PhysX collision surfaces and scene queries in the Windows Unity Editor."
 }

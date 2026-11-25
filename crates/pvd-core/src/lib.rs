@@ -15,7 +15,9 @@ pub mod frame_sources;
 mod history;
 pub mod joint_geometry;
 mod latest_scene;
-pub use latest_scene::{LatestScene, LatestSceneFrame, LatestSceneReader};
+pub use latest_scene::{
+    LatestScene, LatestSceneFrame, LatestSceneReader, LatestSceneUpdate, LatestSceneView,
+};
 pub mod live;
 mod mesh;
 #[cfg(test)]
@@ -1246,7 +1248,7 @@ impl RecordingBuilder {
             .saturating_sub(self.draw_history_bytes());
         if let Some(validation) = &mut self.validation {
             if let Some(publisher) = &mut self.latest_scene {
-                publisher.track(&action);
+                publisher.track(&action, &self.state);
             }
             return validation.apply(action, &mut self.state, state_limit);
         }

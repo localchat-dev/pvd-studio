@@ -26,7 +26,7 @@
 
 「在 Game 视图显示」默认关闭。勾选后，编辑器中的游戏相机会绘制同一帧的 PVD 形状，沿用所选的面或线框模式。两个视图共享同一组对象和网格。游戏相机按自身的层遮罩和视野绘制，包括输出到 RenderTexture 的游戏相机。取消勾选即可恢复只在 Scene 视图查看。
 
-实时显示在后台读取选定帧。显示任务空闲后直接追到最新已发布帧。仅实时查看使用内存队列和最新场景状态，取消逐帧录制的写盘和封存开销。完整录制通过增量回放更新相邻帧，可暂停后移动裁切中心或拖动时间轴查看中间帧。
+实时显示在后台读取选定帧。显示任务空闲后直接追到最新已发布帧。仅实时查看使用内存队列和最新场景状态。显示任务同步最新完整帧后，在自己的场景视图上裁切和生成显示数据。新增引用按增量同步，移除引用时共用接收线程已更新的列表。完整录制通过增量回放更新相邻帧，可暂停后移动裁切中心或拖动时间轴查看中间帧。
 
 内置渲染管线通过相机回调切换根节点 LODGroup 的可见级别。组成员只在形状增删或组件重建时更新。SRP 使用 `beginCameraRendering` 和 `endCameraRendering`，自行实现的 SRP 需要触发这对回调才能在 Scene 视图显示表面。
 
@@ -65,15 +65,15 @@
 Rust 库的会话和表面帧测试通过 `cargo test --locked -p pvd-unity` 运行。对构建出的包执行以下命令，可验证压缩包内容、实际 DLL 加载、UTF-8 路径、TCP 接收、刚体世界位姿与形状局部位姿、物理场景归属、形状销毁与身份复用、倒序定位及缓存清理。参数也可以是展开的 DLL 路径。
 
 ```powershell
-python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.14.tgz --idle
-python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.14.tgz --live-only
-python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.14.tgz --measure
-python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.14.tgz --focus
-python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.14.tgz --rays
-python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.14.tgz --queries
-python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.14.tgz --display
-python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.14.tgz --long-live
-python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.14.tgz --portable --output <新文件.pvdcapture>
+python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.15.tgz --idle
+python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.15.tgz --live-only
+python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.15.tgz --measure
+python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.15.tgz --focus
+python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.15.tgz --rays
+python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.15.tgz --queries
+python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.15.tgz --display
+python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.15.tgz --long-live
+python tools/verify-unity.py <分发目录>/com.pvdstudio.viewer-0.2.15.tgz --portable --output <新文件.pvdcapture>
 ```
 
 `--idle` 在已连接的实时模式和完整录制模式下检测空闲接收的 CPU 用量，再检查继续收帧和停止监听时关闭连接。

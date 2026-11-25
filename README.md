@@ -32,7 +32,17 @@ After startup, open a capture file or click "Listen". The default bind is `0.0.0
 
 Captures and the SDK are not distributed with the source. Test inputs can be generated following the [SDK producer instructions](tools/physx-sample/README.md); desktop operation is covered in the [Windows usage notes](docs/distribution.md).
 
-The Scene view of the Windows Unity Editor can also receive and play back sessions; install and cache locations are described with the [Unity plugin](docs/unity.md).
+## Package the Unity plugin
+
+The plugin receives and plays back PVD sessions in the Scene view of the Windows Unity Editor. On a build machine with Rust and the Windows MSVC toolchain, run this command from the repository root.
+
+```powershell
+./tools/package-unity.ps1
+```
+
+The script builds `pvd_unity.dll` for Windows x64 and creates `output/unity/<timestamp>/com.pvdstudio.viewer-<version>.tgz`. The unpacked `package/` directory sits alongside the archive. Use `-OutputDirectory` to choose a different output directory.
+
+In Unity's Package Manager, choose **Add package from tarball** and open the generated `.tgz`. Rust is required only on the build machine. For installation, listening, and cache details, see the [Unity plugin guide](docs/unity.md).
 
 ## Files and storage
 

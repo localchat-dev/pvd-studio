@@ -30,7 +30,17 @@ cargo run --locked -p pvd-desktop -- --language en
 
 捕获和 SDK 不随源码提供。测试输入可按 [SDK 生产器说明](tools/physx-sample/README.md)生成；桌面操作见 [Windows 使用说明](docs/distribution.md)。
 
-Windows Unity 编辑器的 Scene 视图也可以接收和回放会话，安装与缓存位置见 [Unity 插件](docs/unity.md)。
+## Unity 插件打包
+
+插件可在 Windows Unity 编辑器的 Scene 视图中接收和回放 PVD 会话。在配置好 Rust 和 Windows MSVC 工具链的构建机上，从仓库根目录运行以下命令。
+
+```powershell
+./tools/package-unity.ps1
+```
+
+脚本构建 Windows x64 的 `pvd_unity.dll`，并生成 `output/unity/<时间戳>/com.pvdstudio.viewer-<版本>.tgz`。同一目录下的 `package/` 是展开的包。可通过 `-OutputDirectory` 指定产物目录。
+
+在 Unity 的 Package Manager 中选择 **Add package from tarball**，打开生成的 `.tgz`。使用设备无需安装 Rust。安装、监听和缓存说明见 [Unity 插件](docs/unity.md)。
 
 ## 文件与存储
 

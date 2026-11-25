@@ -336,45 +336,47 @@ fn event_group(events: Vec<Vec<u8>>, stamp: u64) -> Vec<u8> {
 
 #[test]
 fn focused_latest_frames_keep_the_index_and_update_movement_and_rooms_across_skipped_frames() {
-    let mut latest = pvd_core::LatestScene::default();
-    latest.feed(&shared_shape_stream(32)).unwrap();
+    use pvd_core::{LatestScene, LatestSceneView};
+
+    let mut producer = LatestScene::default();
+    producer.feed(&shared_shape_stream(32)).unwrap();
+    let reader = producer.reader();
+    let mut view = LatestSceneView::default();
     let mut cache = FrameCache::default();
-    let visible = |cache: &mut FrameCache, frame: &LatestSceneFrame, x| {
+    let visible = |cache: &mut FrameCache, view: &LatestSceneView, x| {
         let region = RenderRegion::new([x, 0., 0.], 1.).unwrap();
         let (_, rooms) = cache
-            .render(&frame.scene, &frame.rooms, (1, 2), 0, Some(region))
+            .render(view.scene(), view.rooms(), (1, 2), 0, Some(region))
             .unwrap();
         rooms.into_keys().collect::<Vec<_>>()
     };
-    let first = latest.latest().unwrap();
-    cache.sync_latest(1, &first, None);
-    assert_eq!(visible(&mut cache, &first, 0.), [30, 40]);
-    let previous = first.index;
+    let first = reader.sync_view(&mut view, None).unwrap();
+    cache.sync_latest(1, view.scene(), first.changes);
+    assert_eq!(visible(&mut cache, &view, 0.), [30, 40]);
     let revision = cache.rooms.scope.revision();
-    drop(first);
 
     let pose: Vec<_> = [0f32, 0., 0., 1., 100., 0., 0.]
         .into_iter()
         .flat_map(f32::to_le_bytes)
         .collect();
     for (stamp, actor) in [(2, 30), (3, 40)] {
-        latest
+        producer
             .feed(&event_group(
                 vec![property_event(actor, 15, 16, &pose), scene_frame(stamp)],
                 stamp,
             ))
             .unwrap();
     }
-    let moved = latest.latest().unwrap();
-    cache.sync_latest(1, &moved, Some(previous));
+    assert_eq!(visible(&mut cache, &view, 0.), [30, 40]);
+    assert!(visible(&mut cache, &view, 100.).is_empty());
+    let moved = reader.sync_view(&mut view, None).unwrap();
+    cache.sync_latest(1, view.scene(), moved.changes);
     assert!(cache.spatial.is_some());
     assert_eq!(cache.rooms.scope.revision(), revision);
-    assert!(visible(&mut cache, &moved, 0.).is_empty());
-    assert_eq!(visible(&mut cache, &moved, 100.), [30, 40]);
-    let previous = moved.index;
-    drop(moved);
+    assert!(visible(&mut cache, &view, 0.).is_empty());
+    assert_eq!(visible(&mut cache, &view, 100.), [30, 40]);
 
-    latest
+    producer
         .feed(&event_group(
             vec![
                 property_event(20, 14, 9, &0u64.to_le_bytes()),
@@ -384,10 +386,11 @@ fn focused_latest_frames_keep_the_index_and_update_movement_and_rooms_across_ski
             4,
         ))
         .unwrap();
-    let edited = latest.latest().unwrap();
-    cache.sync_latest(1, &edited, Some(previous));
+    assert_eq!(visible(&mut cache, &view, 100.), [30, 40]);
+    let edited = reader.sync_view(&mut view, None).unwrap();
+    cache.sync_latest(1, view.scene(), edited.changes);
     assert!(cache.spatial.is_some());
-    assert_eq!(visible(&mut cache, &edited, 100.), [40]);
+    assert_eq!(visible(&mut cache, &view, 100.), [40]);
     assert_ne!(cache.rooms.scope.revision(), revision);
 }
 

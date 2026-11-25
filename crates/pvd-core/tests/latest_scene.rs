@@ -1,4 +1,4 @@
-use pvd_core::{LatestScene, Value, frame_sources::FrameObject};
+use pvd_core::{LatestScene, LatestSceneView, Value, frame_sources::FrameObject};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -23,6 +23,7 @@ fn initialization() -> Vec<u8> {
         "values",
         "SceneQueries.Raycasts",
         "PvdRaycast",
+        "ObjectRef",
     ]
     .into_iter()
     .enumerate()
@@ -66,6 +67,26 @@ fn reference(target: u64) -> Vec<u8> {
     event.extend(SCENE.to_le_bytes());
     event.extend(5u32.to_le_bytes());
     event.extend(target.to_le_bytes());
+    event
+}
+
+fn remove_reference(target: u64) -> Vec<u8> {
+    let mut event = reference(target);
+    event[0] = 17;
+    event
+}
+
+fn set_references(targets: &[u64]) -> Vec<u8> {
+    let mut event = vec![7];
+    event.extend(SCENE.to_le_bytes());
+    event.extend(5u32.to_le_bytes());
+    event.extend(1u32.to_le_bytes());
+    event.extend(10u32.to_le_bytes());
+    event.extend((targets.len() as u32).to_le_bytes());
+    event.extend((size_of_val(targets) as u32).to_le_bytes());
+    for target in targets {
+        event.extend(target.to_le_bytes());
+    }
     event
 }
 
@@ -262,6 +283,238 @@ fn changes_coalesce_across_recent_frames_and_expire() {
     let frame = live.latest().unwrap();
     assert_eq!(frame.changes_since(0), None);
     assert_eq!(frame.changes_since(3), Some((vec![], false)));
+}
+
+#[test]
+fn publishing_relative_reference_appends_reuses_the_array_after_the_initial_split() {
+    let mut live = LatestScene::default();
+    let reader = live.reader();
+    let mut view = LatestSceneView::default();
+    live.feed(&initialization()).unwrap();
+    let mut events: Vec<_> = (100..8_292).map(reference).collect();
+    events.push(frame(0));
+    live.feed(&group(&events)).unwrap();
+    reader.sync_view(&mut view, None).unwrap();
+    live.feed(&group(&[reference(8_292), frame(1)])).unwrap();
+    reader.sync_view(&mut view, None).unwrap();
+
+    let references = |scene: &pvd_core::SceneState| -> *const Vec<Value> {
+        let Value::Array(values) = &scene.objects[&SCENE].properties["RigidDynamics"] else {
+            panic!("expected reference array");
+        };
+        Arc::as_ptr(values)
+    };
+    let committed = references(&live.latest().unwrap().scene);
+    let displayed = references(view.scene());
+    for (index, target) in (8_293..8_325).enumerate() {
+        live.feed(&group(&[reference(target), frame(index as u64 + 2)]))
+            .unwrap();
+        reader.sync_view(&mut view, None).unwrap();
+        let snapshot = live.latest().unwrap();
+        let Value::Array(values) = &snapshot.scene.objects[&SCENE].properties["RigidDynamics"]
+        else {
+            panic!("expected reference array");
+        };
+        assert_eq!(values.last(), Some(&Value::Ref(target)));
+        assert_eq!(Arc::as_ptr(values), committed);
+        assert_eq!(references(view.scene()), displayed);
+        assert_eq!(view.scene(), &snapshot.scene);
+    }
+}
+
+#[test]
+fn publishing_reference_removals_shares_the_resulting_array() {
+    let mut live = LatestScene::default();
+    let reader = live.reader();
+    let mut view = LatestSceneView::default();
+    live.feed(&initialization()).unwrap();
+    live.feed(&group(&[reference(7), reference(8), frame(0)]))
+        .unwrap();
+    reader.sync_view(&mut view, None).unwrap();
+    live.feed(&group(&[reference(9), frame(1)])).unwrap();
+    reader.sync_view(&mut view, None).unwrap();
+    live.feed(&group(&[
+        remove_reference(7),
+        reference(7),
+        remove_reference(8),
+        frame(2),
+    ]))
+    .unwrap();
+    reader.sync_view(&mut view, None).unwrap();
+    let published = live.latest().unwrap();
+    let Value::Array(visible) = &view.scene().objects[&SCENE].properties["RigidDynamics"] else {
+        panic!("expected reference array");
+    };
+    let Value::Array(latest) = &published.scene.objects[&SCENE].properties["RigidDynamics"] else {
+        panic!("expected reference array");
+    };
+    assert_eq!(
+        visible.as_slice(),
+        &[Value::Ref(ACTOR), Value::Ref(9), Value::Ref(7)]
+    );
+    assert!(Arc::ptr_eq(visible, latest));
+}
+
+#[test]
+fn reference_edits_catch_up_across_absolute_assignment_of_the_same_property() {
+    let mut live = LatestScene::default();
+    let reader = live.reader();
+    let mut view = LatestSceneView::default();
+    live.feed(&initialization()).unwrap();
+    live.feed(&group(&[frame(0)])).unwrap();
+    reader.sync_view(&mut view, None).unwrap();
+
+    live.feed(&group(&[
+        reference(9),
+        frame(1),
+        set_references(&[ACTOR, ACTOR]),
+        frame(2),
+        remove_reference(ACTOR),
+        reference(8),
+        reference(9),
+        frame(3),
+    ]))
+    .unwrap();
+    let update = reader.sync_view(&mut view, None).unwrap();
+    assert_eq!(update.changes, Some((vec![SCENE], true)));
+    assert_eq!(view.scene(), &live.latest().unwrap().scene);
+    assert_eq!(
+        view.scene().objects[&SCENE].properties["RigidDynamics"],
+        Value::Array(vec![Value::Ref(8), Value::Ref(9)].into())
+    );
+
+    live.feed(&group(&[set_references(&[ACTOR]), frame(4)]))
+        .unwrap();
+    reader.sync_view(&mut view, None).unwrap();
+    live.feed(&group(&[reference(9), create(3, 9), frame(5)]))
+        .unwrap();
+    reader.sync_view(&mut view, None).unwrap();
+    assert_eq!(view.scene(), &live.latest().unwrap().scene);
+    assert_eq!(
+        view.scene().objects[&SCENE].properties["RigidDynamics"],
+        Value::Ref(ACTOR)
+    );
+    assert!(
+        view.scene()
+            .resolve_reference(SCENE, "RigidDynamics", 9)
+            .is_some()
+    );
+}
+
+#[test]
+fn view_catches_up_across_reference_rebinding_replacement_and_expired_changes() {
+    let mut live = LatestScene::default();
+    let reader = live.reader();
+    let mut view = LatestSceneView::default();
+    assert!(reader.sync_view(&mut view, None).is_err());
+    live.feed(&initialization()).unwrap();
+    live.feed(&group(&[
+        frame(0),
+        destroy(ACTOR),
+        create(3, ACTOR),
+        frame(1),
+    ]))
+    .unwrap();
+    let update = reader.sync_view(&mut view, None).unwrap();
+    assert_eq!(update.index, 1);
+    assert_eq!(update.changes, None);
+    assert_eq!(view.scene(), &live.latest().unwrap().scene);
+    assert!(
+        view.scene()
+            .resolve_reference(SCENE, "RigidDynamics", ACTOR)
+            .is_none()
+    );
+
+    let forward = 3;
+    live.feed(&group(&[
+        reference(forward),
+        reference(ACTOR),
+        reference(ACTOR),
+        begin_values(),
+        append_value(3),
+        vec![10],
+        frame(2),
+        create(3, forward),
+        remove_reference(ACTOR),
+        reference(ACTOR),
+        begin_values(),
+        append_value(7),
+        vec![10],
+        frame(3),
+    ]))
+    .unwrap();
+    let update = reader.sync_view(&mut view, None).unwrap();
+    assert_eq!(update.index, 3);
+    assert_eq!(update.changes, Some((vec![SCENE, ACTOR, forward], true)));
+    assert_eq!(view.scene(), &live.latest().unwrap().scene);
+    let membership = &view.scene().objects[&SCENE].properties["RigidDynamics"];
+    assert_eq!(
+        membership,
+        &Value::Array(vec![Value::Ref(forward), Value::Ref(ACTOR)].into())
+    );
+    assert_eq!(
+        view.scene()
+            .resolve_reference(SCENE, "RigidDynamics", ACTOR)
+            .unwrap()
+            .generation,
+        1
+    );
+    assert_eq!(
+        view.scene()
+            .resolve_reference(SCENE, "RigidDynamics", forward)
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        view.scene().objects[&ACTOR].properties["values"],
+        Value::U64(7)
+    );
+    assert_eq!(
+        reader.sync_view(&mut view, None).unwrap().changes,
+        Some((vec![], false))
+    );
+
+    for index in 4..13 {
+        live.feed(&group(&[reference(index + 10), frame(index)]))
+            .unwrap();
+    }
+    let update = reader.sync_view(&mut view, None).unwrap();
+    assert_eq!(update.index, 12);
+    assert_eq!(update.changes, None);
+    assert_eq!(view.scene(), &live.latest().unwrap().scene);
+    assert_eq!(
+        view.rooms().iter().collect::<Vec<_>>(),
+        live.latest().unwrap().rooms.iter().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_reader_can_use_its_view_while_the_producer_publishes() {
+    let mut live = LatestScene::default();
+    let reader = live.reader();
+    let mut view = LatestSceneView::default();
+    live.feed(&initialization()).unwrap();
+    live.feed(&group(&[frame(0)])).unwrap();
+    reader.sync_view(&mut view, None).unwrap();
+
+    let visible = &view.scene().objects[&SCENE].properties["RigidDynamics"];
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let producer = std::thread::spawn(move || {
+        live.feed(&group(&[reference(4), frame(1)])).unwrap();
+        sender.send(live.summary().unwrap().0).unwrap();
+    });
+    assert_eq!(
+        receiver.recv_timeout(std::time::Duration::from_secs(5)),
+        Ok(1)
+    );
+    assert_eq!(visible, &Value::Array(vec![Value::Ref(ACTOR)].into()));
+    producer.join().unwrap();
+    assert_eq!(reader.sync_view(&mut view, None).unwrap().index, 1);
+    assert_eq!(
+        view.scene().objects[&SCENE].properties["RigidDynamics"],
+        Value::Array(vec![Value::Ref(ACTOR), Value::Ref(4)].into())
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use crate::geometry::{FocusRequest, FrameCache, ResourceCache};
 use pvd_core::{
-    LatestSceneFrame, LatestSceneReader, LiveRecording, Recording, SceneState,
+    LatestSceneReader, LatestSceneView, LiveRecording, Recording, SceneState,
     live::{HistoryConfig, ReplayCursor, SceneUpdate},
     rooms::RoomDirectory,
 };
@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs, io,
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, Weak,
@@ -96,7 +95,7 @@ struct FrameWorkspace {
     scene: SceneState,
     session: Option<u64>,
     restored: Option<(Weak<Recording>, usize)>,
-    latest_index: Option<usize>,
+    latest: LatestSceneView,
 }
 
 pub struct FrameJob {
@@ -219,11 +218,6 @@ impl FrameWorkspace {
         self.restored = Some((snapshot, index));
         Ok(())
     }
-
-    fn seek_latest(&mut self, id: u64, frame: &LatestSceneFrame) {
-        self.geometry.sync_latest(id, frame, self.latest_index);
-        self.latest_index = Some(frame.index);
-    }
 }
 
 impl FrameJob {
@@ -305,23 +299,19 @@ impl FrameJob {
                 encode(scene, &snapshot.recording.rooms, geometry)
             }
             FrameSource::Live { reader, .. } => {
-                let reader = reader.upgrade().ok_or("live session disconnected")?;
-                // Unwind only after releasing the shared producer slot.
-                let encoded = reader.with_latest(|frame| {
-                    catch_unwind(AssertUnwindSafe(|| {
-                        check_current()?;
-                        let frame = frame.ok_or("live session has no completed frame")?;
-                        if index != u64::MAX && index != frame.index as u64 {
-                            return Err("live session only has its latest completed frame".into());
-                        }
-                        work.seek_latest(self.id, frame);
-                        encode(&frame.scene, &frame.rooms, &mut work.geometry)
-                    }))
-                });
-                match encoded {
-                    Ok(result) => result,
-                    Err(panic) => resume_unwind(panic),
-                }
+                let expected = (index != u64::MAX)
+                    .then(|| usize::try_from(index))
+                    .transpose()
+                    .map_err(|_| "frame index overflow")?;
+                let FrameWorkspace {
+                    latest, geometry, ..
+                } = &mut *work;
+                let update = reader
+                    .upgrade()
+                    .ok_or("live session disconnected")?
+                    .sync_view(latest, expected)?;
+                geometry.sync_latest(self.id, latest.scene(), update.changes);
+                encode(latest.scene(), latest.rooms(), geometry)
             }
         })();
         if result.is_err() {

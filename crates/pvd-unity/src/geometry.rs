@@ -2,8 +2,8 @@ mod resources;
 pub use resources::{ResourceCache, append_queries, append_rays};
 
 use pvd_core::{
-    DisplaySpatialIndex, Geometry, LatestSceneFrame, MeshCache, Object, RenderObject, RenderRegion,
-    RenderScene, SceneState, Value,
+    DisplaySpatialIndex, Geometry, MeshCache, Object, RenderObject, RenderRegion, RenderScene,
+    SceneState, Value,
     live::SceneUpdate,
     room_scope::{RoomScope, scene_for_object},
     rooms::RoomDirectory,
@@ -122,22 +122,13 @@ impl FrameCache {
     pub fn sync_latest(
         &mut self,
         session_id: u64,
-        frame: &LatestSceneFrame,
-        previous: Option<usize>,
+        state: &SceneState,
+        changes: Option<(Vec<u64>, bool)>,
     ) {
-        if previous != Some(frame.index) {
-            if let Some((objects, rooms_changed)) =
-                previous.and_then(|index| frame.changes_since(index))
-            {
-                self.sync_spatial_for_update(
-                    session_id,
-                    &frame.scene,
-                    Some(&objects),
-                    rooms_changed,
-                );
-            } else {
-                self.sync_spatial(session_id, &frame.scene, None);
-            }
+        if let Some((objects, rooms_changed)) = changes {
+            self.sync_spatial_for_update(session_id, state, Some(&objects), rooms_changed);
+        } else {
+            self.sync_spatial(session_id, state, None);
         }
     }
 
