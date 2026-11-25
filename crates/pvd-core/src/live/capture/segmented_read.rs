@@ -196,7 +196,7 @@ impl Assembly {
         self.sources
             .append_capture_part(&member.frame_sources, cancelled)?;
         self.archive
-            .publish(part.location.clone(), &report, restore_from)?;
+            .publish(part.location.clone(), &report, restore_from, None)?;
         if let Some(recording) = &mut self.recording {
             if recording.header != member.header
                 || recording.classes != member.classes

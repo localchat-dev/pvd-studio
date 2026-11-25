@@ -1,5 +1,6 @@
 //! Append-only complete-session banks, independent of the rolling writer cache.
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_BANKS: usize = 4096;
 const BANK_INDEX_BYTES: usize = 128 << 20;
@@ -31,6 +32,7 @@ struct Bank {
     location: BankLocation,
     bytes: u64,
     digest: [u8; 32],
+    admission: Option<capture::BankAdmission>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,8 +84,105 @@ impl BankLocation {
 struct Directory {
     banks: Vec<Bank>,
     bytes: u64,
-    // A single open bank bounds its resource directory and analysis caches.
     cached: Option<(usize, Arc<crate::Recording>)>,
+    prepared: Option<PreparedBank>,
+}
+
+#[derive(Debug)]
+struct PreparedBank {
+    index: usize,
+    recording: Arc<crate::Recording>,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+pub struct ReplayLookahead {
+    directory: Weak<Mutex<Directory>>,
+    index: usize,
+    frame: usize,
+}
+
+impl ReplayLookahead {
+    pub fn frame(&self) -> usize {
+        self.frame
+    }
+
+    pub fn same_bank(&self, other: &Self) -> bool {
+        self.index == other.index && Weak::ptr_eq(&self.directory, &other.directory)
+    }
+
+    pub fn prepare(
+        &self,
+        recording: &crate::Recording,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<bool, Error> {
+        let Some(archive) = recording
+            .disk
+            .as_ref()
+            .and_then(|disk| disk.archive.as_ref())
+        else {
+            return Ok(false);
+        };
+        if !self.directory.ptr_eq(&Arc::downgrade(&archive.directory)) {
+            return Ok(false);
+        }
+        let Ok(_opening) = archive.opening.try_lock() else {
+            return Ok(false);
+        };
+        let (bank, budget, discarded) = {
+            let mut directory = archive
+                .directory
+                .lock()
+                .map_err(|_| error("complete-session bank lock poisoned"))?;
+            if directory
+                .cached
+                .as_ref()
+                .is_some_and(|(index, _)| *index == self.index)
+            {
+                return Ok(false);
+            }
+            let resident = directory
+                .cached
+                .as_ref()
+                .and_then(|(index, _)| directory.banks[*index].admission)
+                .map_or(0, |admission| admission.index_bytes);
+            let budget = archive.index_limit.saturating_sub(resident);
+            let bank = &directory.banks[self.index];
+            if bank
+                .admission
+                .is_none_or(|admission| admission.index_bytes > budget)
+            {
+                return Ok(false);
+            }
+            (bank.clone(), budget, directory.prepared.take())
+        };
+        drop(discarded);
+        let mut is_cancelled = || cancelled.load(Ordering::Acquire);
+        check_replay_cancelled(&mut is_cancelled)?;
+        let recording = archive.read_bank(&bank, budget, &mut is_cancelled)?;
+        let mut directory = archive
+            .directory
+            .lock()
+            .map_err(|_| error("complete-session bank lock poisoned"))?;
+        check_replay_cancelled(&mut is_cancelled)?;
+        directory.prepared = Some(PreparedBank {
+            index: self.index,
+            recording,
+            cancelled,
+        });
+        Ok(true)
+    }
+
+    pub fn cancel(&self, cancelled: &Arc<AtomicBool>) -> Option<Arc<crate::Recording>> {
+        cancelled.store(true, Ordering::Release);
+        self.directory
+            .upgrade()?
+            .lock()
+            .ok()?
+            .prepared
+            .take_if(|bank| bank.index == self.index && Arc::ptr_eq(&bank.cancelled, cancelled))
+            .map(|bank| bank.recording)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +191,7 @@ pub(super) struct ArchiveReader {
     pub(super) index_limit: usize,
     directory: Arc<Mutex<Directory>>,
     transition: Arc<std::sync::RwLock<()>>,
+    opening: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +222,7 @@ impl ArchiveReader {
             index_limit,
             directory: Arc::new(Mutex::new(Directory::default())),
             transition: Arc::new(std::sync::RwLock::new(())),
+            opening: Arc::new(Mutex::new(())),
         }
     }
 
@@ -157,6 +258,11 @@ impl ArchiveReader {
         (bank.first <= frame).then(|| (index, bank.clone()))
     }
 
+    pub(super) fn shares_resource_ids(&self, other: &Self) -> bool {
+        matches!(&self.source, ArchiveSource::Temporary(_))
+            && Arc::ptr_eq(&self.directory, &other.directory)
+    }
+
     pub(super) fn contains(&self, frame: usize) -> bool {
         let Ok(directory) = self.directory.lock() else {
             return false;
@@ -185,19 +291,65 @@ impl ArchiveReader {
             return Ok(None);
         };
         check_replay_cancelled(cancelled)?;
-        {
-            let directory = self
-                .directory
-                .lock()
-                .map_err(|_| error("complete-session bank lock poisoned"))?;
-            if let Some((cached_index, recording)) = &directory.cached
-                && *cached_index == index
-            {
-                return Ok(Some(recording.clone()));
-            }
+        if let Some(cached) = self.cached(index)? {
+            return Ok(Some(cached));
         }
+        // Cached reads continue while another bank is opening.
+        let _opening = self
+            .opening
+            .lock()
+            .map_err(|_| error("bank open lock poisoned"))?;
+        check_replay_cancelled(cancelled)?;
+        if let Some(cached) = self.cached(index)? {
+            return Ok(Some(cached));
+        }
+        let discarded = self
+            .directory
+            .lock()
+            .map_err(|_| error("complete-session bank lock poisoned"))?
+            .prepared
+            .take();
+        drop(discarded);
+        let recording = self.read_bank(&bank, self.index_limit, cancelled)?;
+        check_replay_cancelled(cancelled)?;
+        self.directory
+            .lock()
+            .map_err(|_| error("complete-session bank lock poisoned"))?
+            .cached = Some((index, recording.clone()));
+        Ok(Some(recording))
+    }
+
+    fn cached(&self, index: usize) -> Result<Option<Arc<crate::Recording>>, Error> {
+        let mut directory = self
+            .directory
+            .lock()
+            .map_err(|_| error("complete-session bank lock poisoned"))?;
+        let cancelled = directory
+            .prepared
+            .take_if(|bank| bank.cancelled.load(Ordering::Acquire));
+        let recording = if let Some((cached_index, recording)) = &directory.cached
+            && *cached_index == index
+        {
+            Some(recording.clone())
+        } else if let Some(bank) = directory.prepared.take_if(|bank| bank.index == index) {
+            directory.cached = Some((index, bank.recording.clone()));
+            Some(bank.recording)
+        } else {
+            None
+        };
+        drop(directory);
+        drop(cancelled);
+        Ok(recording)
+    }
+
+    fn read_bank(
+        &self,
+        bank: &Bank,
+        index_bytes: usize,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Arc<crate::Recording>, Error> {
         let limits = capture::CaptureLimits {
-            index_bytes: self.index_limit,
+            index_bytes,
             output_bytes: bank.bytes.max(4096),
             ..match &self.source {
                 ArchiveSource::Temporary(_) => capture::CaptureLimits::default(),
@@ -206,19 +358,21 @@ impl ArchiveReader {
         };
         let mut progress = |_| !cancelled();
         let progress: &mut dyn FnMut(capture::CaptureProgress) -> bool = &mut progress;
-        let opened = match (&self.source, &bank.location) {
-            (ArchiveSource::Temporary(_), BankLocation::File(path)) => {
-                capture::read::open_report_with_progress(path, &limits, progress)
-            }
-            _ => bank.location.open_member(&limits, bank.bytes, progress),
-        }
-        .map_err(|failure| bank.location.failure(failure))?;
-        if opened.report.digest != bank.digest {
-            return Err(bank
-                .location
-                .failure(error("contents changed after capture admission")));
-        }
-        let mut recording = opened.recording;
+        let mut recording =
+            if let (BankLocation::File(path), Some(admission)) = (&bank.location, bank.admission) {
+                capture::open_bank(path, &limits, admission, progress)?
+            } else {
+                let opened = bank
+                    .location
+                    .open_member(&limits, bank.bytes, progress)
+                    .map_err(|failure| bank.location.failure(failure))?;
+                if opened.report.digest != bank.digest {
+                    return Err(bank
+                        .location
+                        .failure(error("contents changed after capture admission")));
+                }
+                opened.recording
+            };
         if let ArchiveSource::Temporary(owner) = &self.source {
             // A replay cursor may outlive the recording that opened a temporary bank.
             let disk = recording.disk.as_mut().unwrap();
@@ -231,13 +385,32 @@ impl ArchiveReader {
                 .keep_owner(owner.clone())?;
             disk._owner = Some(owner.clone());
         }
-        let recording = Arc::new(recording);
-        let mut directory = self
-            .directory
-            .lock()
-            .map_err(|_| error("complete-session bank lock poisoned"))?;
-        directory.cached = Some((index, recording.clone()));
-        Ok(Some(recording))
+        Ok(Arc::new(recording))
+    }
+
+    fn lookahead(&self, from: usize, ahead: usize) -> Option<ReplayLookahead> {
+        if !matches!(&self.source, ArchiveSource::Temporary(_)) {
+            return None;
+        }
+        let directory = self.directory.lock().ok()?;
+        let current = directory.banks.partition_point(|bank| bank.last < from);
+        let (index, frame) = if ahead > from {
+            let index = current.checked_add(1)?;
+            let bank = directory.banks.get(index)?;
+            (index, bank.first)
+        } else {
+            let index = current.checked_sub(1)?;
+            let bank = directory.banks.get(index)?;
+            (index, bank.last)
+        };
+        if !(from.min(ahead)..=from.max(ahead)).contains(&frame) || frame == from {
+            return None;
+        }
+        Some(ReplayLookahead {
+            directory: Arc::downgrade(&self.directory),
+            index,
+            frame,
+        })
     }
 
     pub(super) fn publish(
@@ -245,12 +418,14 @@ impl ArchiveReader {
         location: BankLocation,
         report: &capture::CaptureReport,
         restore_from: usize,
+        admission: Option<capture::BankAdmission>,
     ) -> Result<(), Error> {
         let bank = Bank {
             first: report.range.first,
             last: report.range.last,
             bytes: report.bytes,
             digest: report.digest,
+            admission,
             location,
             restore_from,
         };
@@ -269,6 +444,12 @@ impl ArchiveReader {
             .ok_or_else(|| error("archive size overflow"))?;
         directory.banks.push(bank);
         Ok(())
+    }
+}
+
+impl crate::Recording {
+    pub fn replay_lookahead(&self, from: usize, ahead: usize) -> Option<ReplayLookahead> {
+        self.disk.as_ref()?.archive.as_ref()?.lookahead(from, ahead)
     }
 }
 
@@ -527,12 +708,13 @@ impl HistoryWriter {
         };
         // Opening needs a larger resource directory than the export footer alone.
         // Verify the actual lazy-reader admission before giving up the hot copy.
-        if let Err(failure) = capture::open_with_progress(&path, &limits, |value| {
+        let admission = match capture::admit_bank(&path, &limits, report.digest, |value| {
             progress(SealPhase::Admission, Some(value));
             !cancellation.requested()
         }) {
-            return Err(self.remove_incomplete_bank(&owner, &path, failure));
-        }
+            Ok(admission) => admission,
+            Err(failure) => return Err(self.remove_incomplete_bank(&owner, &path, failure)),
+        };
         // Readers choose hot/cold and consume one frame or export segment under a
         // read guard. Publishing and retiring the hot copy must be one transition.
         let _transition = loop {
@@ -558,6 +740,7 @@ impl HistoryWriter {
             BankLocation::File(Arc::from(path.as_path())),
             &report,
             first,
+            Some(admission),
         ) {
             return Err(self.remove_incomplete_bank(&owner, &path, failure));
         }

@@ -531,6 +531,110 @@ fn sealed_banks_keep_old_snapshots_readable_while_the_single_bank_cache_changes(
 }
 
 #[test]
+fn replay_prepares_only_the_next_bank_within_budget_and_cancels_its_owner() {
+    let directory = TestDirectory::new();
+    let mut history = HistoryWriter::new_persistent(directory.config()).unwrap();
+    for index in 0..4 {
+        append(&mut history, index);
+        if index % 2 == 1 {
+            history.seal_bank(&source(&history)).unwrap();
+        }
+    }
+    let recording = source(&history);
+    let archive = history.archive.as_ref().unwrap();
+    assert!(recording.replay_lookahead(0, 1).is_none());
+    assert_value(&recording, 1);
+    let forward = recording.replay_lookahead(1, 3).unwrap();
+    assert_eq!(forward.frame(), 2);
+    let live = Arc::new(AtomicBool::new(false));
+    assert!(forward.prepare(&recording, live.clone()).unwrap());
+    let prepared = {
+        let directory = archive.directory.lock().unwrap();
+        assert_eq!(directory.cached.as_ref().unwrap().0, 0);
+        directory.prepared.as_ref().unwrap().recording.clone()
+    };
+    assert!(Arc::ptr_eq(
+        &prepared,
+        &archive.open(2, &mut || false).unwrap().unwrap()
+    ));
+    assert_value(&recording, 3);
+    assert!(forward.cancel(&live).is_none());
+
+    let reverse = recording.replay_lookahead(2, 0).unwrap();
+    assert_eq!(reverse.frame(), 1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    assert!(reverse.prepare(&recording, cancelled.clone()).unwrap());
+    assert!(reverse.cancel(&cancelled).is_some());
+    assert!(reverse.prepare(&recording, cancelled).is_err());
+    archive.directory.lock().unwrap().banks[0]
+        .admission
+        .as_mut()
+        .unwrap()
+        .index_bytes = BANK_INDEX_BYTES;
+    assert!(
+        !reverse
+            .prepare(&recording, Arc::new(AtomicBool::new(false)))
+            .unwrap()
+    );
+    assert_value(&recording, 1);
+}
+
+#[test]
+fn replay_keeps_unchanged_objects_across_sealed_banks_and_the_hot_tail() {
+    let directory = TestDirectory::new();
+    let mut history = HistoryWriter::new_persistent(directory.config()).unwrap();
+    let mut scene = state(0);
+    let mut fixed = scene.objects[&7].clone();
+    fixed.id = 8;
+    scene.objects.insert(fixed.id, fixed);
+    for index in 0..6 {
+        scene
+            .objects
+            .get_mut(&7)
+            .unwrap()
+            .properties
+            .insert("value".into(), Value::U64(index as u64));
+        let patch = SceneUpdate::capture(&scene, &[7].into(), false);
+        history.append(&info(index), &scene, &patch, &Analysis::default(), vec![]);
+        if index == 1 || index == 3 {
+            history.seal_bank(&source(&history)).unwrap();
+        }
+    }
+    let recording = source(&history);
+    let archive = history.archive.as_ref().unwrap();
+    let (_, first_bank) = archive.bank(0).unwrap();
+    let (_, second_bank) = archive.bank(2).unwrap();
+    let BankLocation::File(path) = &second_bank.location else {
+        panic!("temporary bank should be a file");
+    };
+    assert!(
+        capture::open_bank(
+            path,
+            &capture::CaptureLimits::default(),
+            first_bank.admission.unwrap(),
+            |_| true,
+        )
+        .is_err()
+    );
+    let mut cursor = ReplayCursor::default();
+    let mut visible = SceneState::default();
+    for (position, frame) in [1, 2, 4, 3, 0, 5].into_iter().enumerate() {
+        let replay = cursor.seek(&recording, frame, || false).unwrap();
+        assert_eq!(replay.update.replace_all, position == 0);
+        if position != 0 {
+            let changed: Vec<_> = replay.update.changed_objects().map(|(id, _)| id).collect();
+            assert_eq!(changed, [7]);
+        }
+        replay.update.apply(&mut visible);
+        assert_eq!(visible, recording.state_at(frame).unwrap());
+        assert_eq!(
+            postcard::to_stdvec(&replay.analysis).unwrap(),
+            postcard::to_stdvec(&recording.analysis_at(frame).unwrap()).unwrap(),
+        );
+    }
+}
+
+#[test]
 fn analysis_failure_keeps_scene_history_recording_but_complete_export_stays_strict() {
     let directory = TestDirectory::new();
     let mut history = HistoryWriter::new_persistent(directory.config()).unwrap();

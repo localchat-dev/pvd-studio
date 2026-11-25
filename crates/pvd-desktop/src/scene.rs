@@ -5,15 +5,18 @@ use std::{
 
 use bevy::{
     asset::RenderAssetUsages,
-    camera::{RenderTarget, visibility::RenderLayers},
+    camera::{CameraUpdateSystems, RenderTarget, visibility::RenderLayers},
     mesh::{Indices, VertexAttributeValues},
     prelude::*,
     render::render_resource::{
         Extent3d, PrimitiveTopology, TextureDescriptor, TextureDimension, TextureFormat,
         TextureUsages,
     },
+    transform::TransformSystems,
 };
-use bevy_egui::{EguiGlobalSettings, EguiTextureHandle, EguiUserTextures, PrimaryEguiContext};
+use bevy_egui::{
+    EguiGlobalSettings, EguiPostUpdateSet, EguiTextureHandle, EguiUserTextures, PrimaryEguiContext,
+};
 use pvd_core::{
     Geometry, RenderObject,
     analysis::view::{MemorySource, ProfileSource},
@@ -32,6 +35,7 @@ mod selected_overlay_tests;
 mod source_index;
 #[cfg(test)]
 mod source_index_sync_tests;
+mod surface_overlay;
 pub(crate) use incremental::SceneChanges;
 
 const MAX_DEBUG_PRIMITIVES: usize = 100_000;
@@ -67,6 +71,7 @@ struct SharedGeometry {
     indices: std::sync::Arc<Vec<u32>>,
     hash: u64,
     valid: bool,
+    focus_radius: std::sync::OnceLock<f32>,
 }
 
 #[derive(Resource)]
@@ -110,16 +115,16 @@ pub struct Viewport {
     limit_lines: Vec<pvd_core::joint_geometry::Line>,
     debug_bounds: debug_bounds::DebugBounds,
     meshes: HashMap<u64, Handle<Mesh>>,
+    pub(crate) inspect_mesh_attributes: bool,
     mesh_cache: pvd_core::MeshCache,
     shared_geometry: HashMap<(usize, usize), SharedGeometry>,
     rendered: HashMap<(u64, u64), RenderedObject>,
     materials: HashMap<MaterialKey, Handle<StandardMaterial>>,
-    wires: HashMap<u64, Vec<[Vec3; 2]>>,
-    wire_keys: HashMap<u64, u64>,
+    wires: HashMap<AssetId<Mesh>, Vec<[Vec3; 2]>>,
     revision: u64,
     selected: Option<u64>,
     selection_revision: u64,
-    settings: [u32; 16],
+    settings: [u32; 18],
     palette: crate::studio::DisplayColors,
     incremental: incremental::SceneIndex,
     source_index: source_index::SourceIndex,
@@ -155,16 +160,16 @@ impl Default for Viewport {
             limit_lines: Vec::new(),
             debug_bounds: debug_bounds::DebugBounds::default(),
             meshes: HashMap::new(),
+            inspect_mesh_attributes: false,
             mesh_cache: pvd_core::MeshCache::default(),
             shared_geometry: HashMap::new(),
             rendered: HashMap::new(),
             materials: HashMap::new(),
             wires: HashMap::new(),
-            wire_keys: HashMap::new(),
             revision: u64::MAX,
             selected: None,
             selection_revision: 0,
-            settings: [u32::MAX; 16],
+            settings: [u32::MAX; 18],
             palette: crate::studio::DisplayColors::default(),
             incremental: incremental::SceneIndex::default(),
             source_index: source_index::SourceIndex::default(),
@@ -176,6 +181,21 @@ impl Default for Viewport {
 }
 
 impl Viewport {
+    pub(crate) fn solid_triangles_reach(&self, limit: usize) -> bool {
+        let mut triangles = 0usize;
+        self.objects.iter().any(|object| {
+            if let Geometry::TriangleMesh { indices, .. } = &object.geometry
+                && self
+                    .rendered
+                    .get(&(object.id, object.shape_id))
+                    .is_some_and(|entry| entry.visible)
+            {
+                triangles = triangles.saturating_add(indices.len() / 3);
+            }
+            triangles >= limit
+        })
+    }
+
     pub(crate) fn displayed_revision(&self) -> u64 {
         self.revision
     }
@@ -257,10 +277,16 @@ impl Viewport {
             .filter(|o| all || selected.contains(&o.id) || selected.contains(&o.shape_id))
             .filter(|o| !all || !matches!(o.geometry, Geometry::Plane))
         {
-            include(
-                Vec3::from(object.position),
-                geometry_radius(&object.geometry),
-            );
+            let radius = if let Some(resource) = incremental::shared_key(&object.geometry)
+                .and_then(|key| self.shared_geometry.get(&key))
+            {
+                *resource
+                    .focus_radius
+                    .get_or_init(|| geometry_radius(&object.geometry))
+            } else {
+                geometry_radius(&object.geometry)
+            };
+            include(Vec3::from(object.position), radius);
         }
         for cloud in &self.point_clouds.clouds {
             let visible = if cloud.kind == crate::point_clouds::Kind::Cloth {
@@ -387,7 +413,9 @@ pub fn setup(
         height: 512,
         depth_or_array_layers: 1,
     };
-    let mut image = Image {
+    let image = Image {
+        // The camera clears this target before drawing, including after a layout resize.
+        data: None,
         texture_descriptor: TextureDescriptor {
             label: Some("pvd-scene-viewport"),
             size,
@@ -402,7 +430,6 @@ pub fn setup(
         },
         ..default()
     };
-    image.resize(size);
     viewport.image = images.add(image);
     viewport.texture = textures.add_image(EguiTextureHandle::Strong(viewport.image.clone()));
     commands.spawn((
@@ -421,6 +448,13 @@ pub fn setup(
         Transform::from_translation(viewport.position()).looking_at(viewport.target, Vec3::Y),
         ViewCamera,
     ));
+    // The egui pass draws directly into the resolved target on its own render layer.
+    let mut ui_camera = commands.spawn((
+        PrimaryEguiContext,
+        Camera2d,
+        Msaa::Off,
+        RenderLayers::layer(1),
+    ));
     if let Some(mut check) = render_check {
         let target = images.add(Image::new_target_texture(
             check.size.x,
@@ -429,14 +463,7 @@ pub fn setup(
             None,
         ));
         check.target = target.clone();
-        commands.spawn((
-            PrimaryEguiContext,
-            Camera2d,
-            RenderLayers::layer(1),
-            RenderTarget::Image(target.into()),
-        ));
-    } else {
-        commands.spawn((PrimaryEguiContext, Camera2d, RenderLayers::layer(1)));
+        ui_camera.insert(RenderTarget::Image(target.into()));
     }
     commands.spawn((
         DirectionalLight {
@@ -445,6 +472,9 @@ pub fn setup(
         },
         Transform::from_xyz(6.0, 10.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
+    // PBR needs both shadow textures bound even with shadows disabled on the viewport light.
+    commands.insert_resource(bevy::light::PointLightShadowMap { size: 1 });
+    commands.insert_resource(bevy::light::DirectionalLightShadowMap { size: 1 });
     commands.insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
         brightness: 100.0,
@@ -466,14 +496,11 @@ struct ArrayCurveSelection {
 fn render_check_array_selection(state: &pvd_core::SceneState) -> Option<ArrayCurveSelection> {
     state.objects.values().find_map(|object| {
         object.properties.iter().find_map(|(property, value)| {
-            let pvd_core::Value::Array(values) = value else {
-                return None;
-            };
-            let elements: Vec<_> = values
-                .iter()
+            let elements: Vec<_> = value
+                .array_items()?
                 .enumerate()
                 .filter_map(|(index, value)| {
-                    let count = crate::curve::components(value).len().min(3);
+                    let count = crate::curve::components(&value).len().min(3);
                     (count != 0).then_some((index, count))
                 })
                 .take(2)
@@ -620,6 +647,14 @@ pub fn render_check(
             .find(|object| object.dynamic)
             .map(|object| object.id);
         studio.select_object(selected, false);
+        match check.panel.as_deref() {
+            Some("wireframe") => studio.prefs.wireframe = true,
+            Some("bounds") => {
+                studio.prefs.show_bounds = true;
+                studio.prefs.bounds_scope = crate::studio::ObjectScope::All;
+            }
+            _ => (),
+        }
         if check.panel.as_deref() == Some("multi-selection")
             && let Err(error) = prepare_multi_selection(&mut studio)
         {
@@ -1179,6 +1214,8 @@ pub fn sync_scene(
         studio.prefs.show_triggers as u32,
         studio.prefs.trigger_scope as u32,
         studio.prefs.joint_frame_scale.to_bits(),
+        studio.prefs.show_bounds as u32,
+        studio.prefs.bounds_scope as u32,
     ];
     if viewport.revision == studio.revision
         && viewport.selected == studio.selected
@@ -1197,6 +1234,9 @@ pub fn sync_scene(
         }
         viewport.wires.clear();
     }
+    if !studio.prefs.wireframe && !studio.prefs.show_bounds {
+        viewport.wires.clear();
+    }
     if coordinates_changed {
         let ratio = coordinates.scale / viewport.coordinates.scale;
         viewport.target = coordinates.point(viewport.coordinates.source_point(viewport.target));
@@ -1212,7 +1252,7 @@ pub fn sync_scene(
     if viewport.revision != revision {
         viewport
             .source_index
-            .update(&studio.state, changed.as_ref());
+            .update(&studio.state, changed.as_ref().map(|(objects, _)| objects));
     }
     let incremental = !coordinates_changed
         && !room_changed
@@ -1220,38 +1260,36 @@ pub fn sync_scene(
         && viewport.palette == palette
         && viewport.selected == studio.selected
         && viewport.selection_revision == studio.selection_revision();
-    let actors = if incremental {
+    let updates = if incremental {
         changed
-            .and_then(|changed| viewport.incremental.affected(&studio.state, changed))
-            .map(|actors| {
-                actors
-                    .into_iter()
-                    .filter(|id| studio.room_scope.contains(*id))
-                    .collect::<HashSet<_>>()
+            .and_then(|(changed, poses)| {
+                viewport.incremental.affected(&studio.state, changed, poses)
+            })
+            .and_then(|(mut actors, mut poses)| {
+                actors.retain(|id| studio.room_scope.contains(*id));
+                poses.retain(|id| studio.room_scope.contains(*id));
+                let poses = viewport.incremental.shape_poses(&studio.state, &poses)?;
+                Some((actors, poses))
             })
     } else {
         None
     };
-    let (mut scene, was_subset) = if let Some(actors) = &actors {
+    let (mut scene, was_subset) = if let Some((actors, _)) = &updates {
         (
-            studio.state.render_actors_cached(
-                actors
-                    .iter()
-                    .copied()
-                    .filter(|id| studio.room_scope.contains(*id)),
-                &mut viewport.mesh_cache,
-            ),
+            studio
+                .state
+                .render_actors_cached(actors.iter().copied(), &mut viewport.mesh_cache),
             true,
         )
     } else {
         (render_room(&studio, &mut viewport.mesh_cache), false)
     };
-    let actors = actors.filter(|actors| {
+    let updates = updates.filter(|(actors, _)| {
         viewport
             .incremental
             .accepts(actors, &scene, &viewport.shared_geometry)
     });
-    if actors.is_none() && was_subset {
+    if updates.is_none() && was_subset {
         scene = render_room(&studio, &mut viewport.mesh_cache);
     }
     let full_diagnostics = scene.diagnostics.is_empty();
@@ -1390,16 +1428,21 @@ pub fn sync_scene(
             format!("查询形状显示达到 {MAX_OVERLAY_LINES} 条线的预算；捕获数据仍完整保留。"),
         ));
     }
-    if let Some(actors) = actors {
-        incremental::sync_actors(
-            &mut commands,
-            &studio,
-            &mut viewport,
-            &mut meshes,
-            &mut materials,
-            actors,
-            scene.objects,
-        );
+    if let Some((actors, poses)) = updates {
+        incremental::sync_poses(&mut commands, &mut viewport, poses);
+        if actors.is_empty() {
+            viewport.incremental.last_actor_count = 0;
+        } else {
+            incremental::sync_actors(
+                &mut commands,
+                &studio,
+                &mut viewport,
+                &mut meshes,
+                &mut materials,
+                actors,
+                scene.objects,
+            );
+        }
         viewport.revision = studio.revision;
         viewport.finish_room_camera();
         return;
@@ -1427,6 +1470,7 @@ pub fn sync_scene(
                         indices: indices.clone(),
                         hash: geometry_hash(&object.geometry),
                         valid: valid_geometry(&object.geometry),
+                        focus_radius: Default::default(),
                     });
                 debug_assert!(std::sync::Arc::ptr_eq(&entry.vertices, vertices));
                 debug_assert!(std::sync::Arc::ptr_eq(&entry.indices, indices));
@@ -1447,7 +1491,6 @@ pub fn sync_scene(
     let mut used = HashSet::new();
     let mut used_materials = HashSet::new();
     let mut used_objects = HashSet::new();
-    viewport.wire_keys.clear();
     let mut asset_uses = HashMap::new();
     for object in &objects {
         if let Some(usage) = sync_object(
@@ -1488,7 +1531,7 @@ pub fn sync_scene(
             false
         }
     });
-    viewport.wires.retain(|key, _| used.contains(key));
+    viewport.wires.retain(|id, _| meshes.contains(*id));
     viewport.objects = objects;
     viewport.incremental = incremental::SceneIndex::rebuild(
         &studio.state,
@@ -1524,18 +1567,31 @@ fn sync_object(
         }
         _ => geometry_hash(&object.geometry),
     };
-    viewport.wire_keys.insert(object.shape_id, key);
     let mesh = if let Some(mesh) = viewport.meshes.get(&key) {
         mesh.clone()
     } else {
         let mut mesh = geometry_mesh(&object.geometry)?;
-        viewport.wires.insert(key, mesh_edges(&mesh));
         orient_winding(&mut mesh, viewport.coordinates.mirrored);
+        if matches!(object.geometry, Geometry::TriangleMesh { .. })
+            && !viewport.inspect_mesh_attributes
+        {
+            mesh.asset_usage = RenderAssetUsages::RENDER_WORLD;
+        }
         let handle = meshes.add(mesh);
         viewport.meshes.insert(key, handle.clone());
         handle
     };
     let selected = studio.is_selected(object.id) || studio.is_selected(object.shape_id);
+    if (studio.prefs.wireframe || show_object_bounds(studio, object, selected))
+        && let std::collections::hash_map::Entry::Vacant(entry) = viewport.wires.entry(mesh.id())
+        && let Some(surface) = meshes.get(&mesh)
+    {
+        entry.insert(surface_edges(
+            &object.geometry,
+            surface,
+            viewport.coordinates.mirrored,
+        ));
+    }
     let colors = &studio.prefs.display_colors;
     let [r, g, b] = if selected {
         [0.24, 0.82, 0.92]
@@ -1574,13 +1630,7 @@ fn sync_object(
             })
         })
         .clone();
-    let mut rotation = Quat::from_array(object.rotation).normalize();
-    if matches!(object.geometry, Geometry::Capsule { .. }) {
-        rotation *= Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
-    }
-    let transform = viewport.coordinates.transform(
-        Transform::from_translation(Vec3::from(object.position)).with_rotation(rotation),
-    );
+    let transform = object_transform(viewport.coordinates, object);
     let visible = !studio.prefs.wireframe;
     let object_key = (object.id, object.shape_id);
     sync_rendered_object(
@@ -1655,6 +1705,15 @@ fn sync_rendered_object(
     }
 }
 
+fn object_transform(coordinates: Coordinates, object: &RenderObject) -> Transform {
+    let mut rotation = Quat::from_array(object.rotation).normalize();
+    if matches!(object.geometry, Geometry::Capsule { .. }) {
+        rotation *= Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+    }
+    coordinates
+        .transform(Transform::from_translation(Vec3::from(object.position)).with_rotation(rotation))
+}
+
 fn geometry_hash(geometry: &Geometry) -> u64 {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     std::mem::discriminant(geometry).hash(&mut hash);
@@ -1715,19 +1774,15 @@ fn geometry_mesh(geometry: &Geometry) -> Option<Mesh> {
         } => Some(Capsule3d::new(*radius, *half_height * 2.0).mesh().build()),
         Geometry::Plane => Some(Plane3d::new(Vec3::X, Vec2::splat(100.0)).mesh().build()),
         Geometry::TriangleMesh { vertices, indices } => {
-            if vertices.is_empty()
-                || indices.len() % 3 != 0
-                || indices.iter().any(|i| *i as usize >= vertices.len())
-            {
-                return None;
-            }
             let mut mesh = Mesh::new(
                 PrimitiveTopology::TriangleList,
                 RenderAssetUsages::default(),
             );
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices.as_ref().clone());
-            mesh.insert_indices(Indices::U32(indices.as_ref().clone()));
-            mesh.duplicate_vertices();
+            let positions: Vec<_> = indices
+                .iter()
+                .map(|&index| vertices[index as usize])
+                .collect();
+            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
             mesh.compute_flat_normals();
             Some(mesh)
         }
@@ -1744,8 +1799,12 @@ fn valid_object(object: &RenderObject) -> bool {
 }
 
 fn valid_pose(object: &RenderObject) -> bool {
-    let rotation = Quat::from_array(object.rotation);
-    valid_position(object.position)
+    valid_transform(object.position, object.rotation)
+}
+
+fn valid_transform(position: [f32; 3], rotation: [f32; 4]) -> bool {
+    let rotation = Quat::from_array(rotation);
+    valid_position(position)
         && rotation.is_finite()
         && rotation.length_squared().is_finite()
         && rotation.length_squared() > 1e-12
@@ -1778,11 +1837,7 @@ fn valid_geometry(geometry: &Geometry) -> bool {
     }
 }
 
-pub fn update_camera(
-    mut viewport: ResMut<Viewport>,
-    mut studio: ResMut<Studio>,
-    mut camera: Query<(&mut Transform, &mut Projection), With<ViewCamera>>,
-) {
+pub fn update_camera(mut viewport: ResMut<Viewport>, mut studio: ResMut<Studio>) {
     if studio.focus_selected || studio.follow_selected {
         studio.captured_camera = None;
     }
@@ -1835,6 +1890,22 @@ pub fn update_camera(
     } else {
         1.0
     };
+}
+
+pub fn register_view_camera_pose(app: &mut App) {
+    app.add_systems(
+        PostUpdate,
+        apply_view_camera_pose
+            .after(EguiPostUpdateSet::EndPass)
+            .before(TransformSystems::Propagate)
+            .before(CameraUpdateSystems),
+    );
+}
+
+fn apply_view_camera_pose(
+    viewport: Res<Viewport>,
+    mut camera: Query<(&mut Transform, &mut Projection), With<ViewCamera>>,
+) {
     if let Ok((mut transform, mut projection)) = camera.single_mut() {
         *transform = Transform::from_translation(viewport.position())
             .looking_at(viewport.view_target(), viewport.view_up());
@@ -1842,13 +1913,14 @@ pub fn update_camera(
             && let Some(perspective) =
                 custom.get_mut::<crate::camera_projection::FinitePerspective>()
         {
-            perspective.set_clip(near, far);
+            perspective.set_clip(viewport.near, viewport.far);
         }
     }
 }
 
 pub fn draw_grid(
     mut raw_gizmos: Gizmos,
+    mut surfaces: surface_overlay::Surfaces,
     studio: Res<Studio>,
     viewport: Res<Viewport>,
     #[cfg(test)] output: Option<ResMut<selected_overlay_tests::Output>>,
@@ -1981,87 +2053,7 @@ pub fn draw_grid(
             );
         }
     }
-    if studio.prefs.wireframe || studio.prefs.show_bounds {
-        for object in &viewport.objects {
-            let Some(edges) = viewport
-                .wire_keys
-                .get(&object.shape_id)
-                .and_then(|key| viewport.wires.get(key))
-            else {
-                continue;
-            };
-            let mut rotation = Quat::from_array(object.rotation).normalize();
-            if matches!(object.geometry, Geometry::Capsule { .. }) {
-                rotation *= Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
-            }
-            let transform =
-                Transform::from_translation(Vec3::from(object.position)).with_rotation(rotation);
-            let mut min = Vec3::splat(f32::INFINITY);
-            let mut max = Vec3::splat(f32::NEG_INFINITY);
-            let selected = studio.is_selected(object.id) || studio.is_selected(object.shape_id);
-            let fallback = if selected {
-                [0.25, 0.85, 0.9, 1.0]
-            } else {
-                [0.6, 0.68, 0.76, 1.0]
-            };
-            let rgba = viewport
-                .rendered
-                .get(&(object.id, object.shape_id))
-                .map_or_else(captured_display::Style::default, |rendered| {
-                    rendered.display
-                })
-                .rgba(
-                    fallback,
-                    selected,
-                    captured_display::opacity(&studio, selected),
-                );
-            let wire_color = Color::srgba(rgba[0], rgba[1], rgba[2], rgba[3]);
-            for edge in edges {
-                let [a, b] = edge.map(|point| transform.transform_point(point));
-                if studio.prefs.wireframe {
-                    gizmos.line(a, b, wire_color);
-                }
-                min = min.min(a).min(b);
-                max = max.max(a).max(b);
-            }
-            if studio.prefs.show_bounds
-                && studio
-                    .prefs
-                    .bounds_scope
-                    .includes(studio.is_selected(object.id) || studio.is_selected(object.shape_id))
-                && !matches!(object.geometry, Geometry::Plane)
-                && min.is_finite()
-                && max.is_finite()
-            {
-                let corners = [
-                    Vec3::new(min.x, min.y, min.z),
-                    Vec3::new(max.x, min.y, min.z),
-                    Vec3::new(max.x, max.y, min.z),
-                    Vec3::new(min.x, max.y, min.z),
-                    Vec3::new(min.x, min.y, max.z),
-                    Vec3::new(max.x, min.y, max.z),
-                    Vec3::new(max.x, max.y, max.z),
-                    Vec3::new(min.x, max.y, max.z),
-                ];
-                for (a, b) in [
-                    (0, 1),
-                    (1, 2),
-                    (2, 3),
-                    (3, 0),
-                    (4, 5),
-                    (5, 6),
-                    (6, 7),
-                    (7, 4),
-                    (0, 4),
-                    (1, 5),
-                    (2, 6),
-                    (3, 7),
-                ] {
-                    gizmos.line(corners[a], corners[b], Color::srgb(0.93, 0.73, 0.35));
-                }
-            }
-        }
-    }
+    surfaces.draw(&studio, &viewport, &mut gizmos);
     if studio.prefs.show_com || studio.prefs.show_velocity || studio.prefs.show_local_axes {
         let selected_actors: HashSet<_> = viewport
             .objects
@@ -2351,7 +2343,7 @@ fn query_lines(queries: &pvd_core::queries::QueryScene) -> (Vec<QueryLine>, bool
             let Some(mesh) = geometry_mesh(&shape.geometry) else {
                 continue;
             };
-            let edges = mesh_edges(&mesh);
+            let edges = mesh_edges(&mesh, false);
             if edges.len() > MAX_OVERLAY_LINES - cached_edges {
                 limited = true;
                 break;
@@ -2475,20 +2467,53 @@ fn display_scale(value: f32) -> f32 {
     }
 }
 
-fn mesh_edges(mesh: &Mesh) -> Vec<[Vec3; 2]> {
+fn show_object_bounds(studio: &Studio, object: &RenderObject, selected: bool) -> bool {
+    studio.prefs.show_bounds
+        && studio.prefs.bounds_scope.includes(selected)
+        && !matches!(object.geometry, Geometry::Plane)
+}
+
+fn surface_edges(geometry: &Geometry, mesh: &Mesh, mirrored: bool) -> Vec<[Vec3; 2]> {
+    if let Geometry::TriangleMesh { vertices, indices } = geometry {
+        return triangle_edges(indices.chunks_exact(3).map(|t| {
+            [
+                vertices[t[0] as usize],
+                vertices[t[1] as usize],
+                vertices[t[2] as usize],
+            ]
+        }));
+    }
+    mesh_edges(mesh, mirrored)
+}
+
+fn mesh_edges(mesh: &Mesh, mirrored: bool) -> Vec<[Vec3; 2]> {
     let Some(VertexAttributeValues::Float32x3(vertices)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION)
     else {
         return Vec::new();
     };
-    let indices: Vec<usize> = match mesh.indices() {
-        Some(indices) => indices.iter().collect(),
-        None => (0..vertices.len()).collect(),
+    let indices = mesh.indices();
+    let vertex = |i: usize| match indices {
+        Some(Indices::U16(values)) => vertices[usize::from(values[i])],
+        Some(Indices::U32(values)) => vertices[values[i] as usize],
+        None => vertices[i],
     };
-    let mut keys = std::collections::BTreeSet::new();
+    let count = indices.map_or(vertices.len(), Indices::len) / 3;
+    triangle_edges((0..count).map(|triangle| {
+        let first = triangle * 3;
+        let mut points = [vertex(first), vertex(first + 1), vertex(first + 2)];
+        if mirrored {
+            points.swap(1, 2);
+        }
+        points
+    }))
+}
+
+fn triangle_edges(triangles: impl Iterator<Item = [[f32; 3]; 3]>) -> Vec<[Vec3; 2]> {
+    let mut keys = HashSet::new();
     let mut edges = Vec::new();
-    for triangle in indices.chunks_exact(3) {
+    for points in triangles {
         for (a, b) in [(0, 1), (1, 2), (2, 0)] {
-            let points = [vertices[triangle[a]], vertices[triangle[b]]];
+            let points = [points[a], points[b]];
             let mut key = points.map(|p| p.map(f32::to_bits));
             key.sort();
             if keys.insert(key) {
@@ -2605,6 +2630,49 @@ fn ray_box(origin: Vec3, direction: Vec3, half: Vec3) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_pose_is_propagated_in_the_input_frame() {
+        let mut app = App::new();
+        app.add_plugins(bevy::transform::TransformPlugin)
+            .init_resource::<Viewport>()
+            .add_systems(
+                PostUpdate,
+                (|mut viewport: ResMut<Viewport>| {
+                    viewport.target += Vec3::new(2.0, 1.0, -4.0);
+                    viewport.yaw += 0.35;
+                })
+                .in_set(EguiPostUpdateSet::EndPass),
+            );
+        let camera = app
+            .world_mut()
+            .spawn((ViewCamera, Transform::default(), Projection::default()))
+            .id();
+        register_view_camera_pose(&mut app);
+        app.update();
+        let viewport = app.world().resource::<Viewport>();
+        let actual = app.world().get::<GlobalTransform>(camera).unwrap();
+        let expected = Transform::from_translation(viewport.position())
+            .looking_at(viewport.view_target(), viewport.view_up());
+        assert!(actual.translation().abs_diff_eq(expected.translation, 1e-5));
+        assert!(actual.rotation().abs_diff_eq(expected.rotation, 1e-5));
+    }
+
+    #[test]
+    fn triangle_wireframe_keeps_order_after_gpu_upload_in_both_coordinate_systems() {
+        let geometry = Geometry::TriangleMesh {
+            vertices: vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [1., 1., 0.]].into(),
+            indices: vec![0, 1, 2, 2, 1, 3].into(),
+        };
+        for mirrored in [false, true] {
+            let mut mesh = geometry_mesh(&geometry).unwrap();
+            orient_winding(&mut mesh, mirrored);
+            let expected = mesh_edges(&mesh, mirrored);
+            assert_eq!(expected.len(), 5);
+            mesh.take_gpu_data().unwrap();
+            assert_eq!(surface_edges(&geometry, &mesh, mirrored), expected);
+        }
+    }
 
     #[test]
     #[ignore = "Requires the official PhysX 3.4 large-scene capture; CPU-only render synchronization benchmark"]

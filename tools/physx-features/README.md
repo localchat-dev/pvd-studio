@@ -16,8 +16,11 @@ The script builds all three producers, creates fresh SDK streams and truth files
 | `pvd-query-shapes` | Actual SDK query inputs and returned hits | Sweeps, overlaps and batch queries; primitives and convex query shapes; object lifetimes |
 | `pvd-joint-limits` | SDK visualization helpers and `PxScene::getRenderBuffer` | Linear/angular limits, swing cones and double cones; active/inactive colors |
 | `pvd-cct` | `PxController::getActor`, proxy shape geometry and pre-simulation world poses | Sustained capsule/box CCT movement in a configurable static scene; history and playback regression |
+| `pvd-large-scene` | Scene rigid actors, shapes and registered triangle meshes from SDK getters | Independent boxes, unique cooked grids and shared grid instances |
 
-Each executable takes two positional paths: capture and truth JSON. See `docs/heightfield.md`, `docs/query-shapes.md` and `docs/joint-limits.md` for exact evidence, commands and remaining limitations. These samples establish no claim about PVD3-saved `.pxd` / `.pxd2` containers or other SDK versions.
+`pvd-large-scene capture.pvdstream capture.sdk.json actors meshes cells [frames moving_boxes]` writes DEBUG frames. The defaults are three frames and zero moving boxes. To send the workload to a listener, replace the capture path with `--tcp host port`. See [static mesh validation](../../docs/validation.md#大型静态场景) and [large-scene playback](../../docs/validation.md#大型场景回放).
+
+The heightfield, query-shape and joint-limit executables accept a capture and a truth JSON path. See `docs/heightfield.md`, `docs/query-shapes.md` and `docs/joint-limits.md` for exact evidence, commands and remaining limitations. These samples establish no claim about PVD3-saved `.pxd` / `.pxd2` containers or other SDK versions.
 
 `pvd-query-shapes --host ADDRESS --port PORT truth.json` uses a fresh SDK socket connection and writes truth for that connection. PhysX 4.1 terrain and complex-query checks use the separately built [4.1 producers](../physx41-sample/README.md).
 

@@ -398,13 +398,11 @@ pub(super) fn value(object: &Object, property: &str, offset: u64, local_hit: boo
             add(&mut call.counts.value_local_hits, 1);
         }
         let (kind, count) = match value {
-            Value::Array(values) => {
+            Value::Array(_) | Value::MeshArray(_) => {
+                let count = value.array_len().unwrap();
                 add(&mut call.counts.array_arc_clones, 1);
-                add(
-                    &mut call.counts.array_items_behind_cloned_arcs,
-                    values.len(),
-                );
-                ("Array", values.len())
+                add(&mut call.counts.array_items_behind_cloned_arcs, count);
+                ("Array", count)
             }
             Value::Bytes(bytes) => {
                 add(&mut call.counts.bytes_arc_clones, 1);

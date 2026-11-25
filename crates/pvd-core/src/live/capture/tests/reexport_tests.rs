@@ -271,14 +271,13 @@ fn source_with_replaced_backing(
         &mut |_| true,
     )
     .unwrap();
-    let backing = Arc::new(CaptureBacking {
-        format: directory.format,
-        file: File::open(path).unwrap(),
-        base: 0,
-        path: path.to_owned(),
-        bytes: original.len() as u64,
-        owner: std::sync::Mutex::new(None),
-    });
+    let backing = Arc::new(CaptureBacking::new(
+        directory.format,
+        File::open(path).unwrap(),
+        path.to_owned(),
+        0,
+        original.len() as u64,
+    ));
     let resources = Resources::from_capture(
         backing,
         directory.blocks,

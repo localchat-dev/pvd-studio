@@ -40,7 +40,7 @@ function(add_feature_producer target source)
   endforeach()
 endfunction()
 
-foreach(feature heightfield query_shapes joint_limits profile_metrics cct)
+foreach(feature heightfield query_shapes joint_limits profile_metrics cct large_scene)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${feature}.cpp")
     string(REPLACE "_" "-" target_suffix "${feature}")
     add_feature_producer("pvd-${target_suffix}" "${feature}.cpp")

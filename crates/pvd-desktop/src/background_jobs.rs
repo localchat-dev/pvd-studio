@@ -119,6 +119,18 @@ impl BackgroundJobs {
         }
     }
 
+    pub(crate) fn wake(&self) {
+        let wake = self
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .wake
+            .clone();
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+
     pub fn spawn(
         &self,
         name: &str,

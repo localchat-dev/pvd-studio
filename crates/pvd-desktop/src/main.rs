@@ -44,6 +44,10 @@ mod tree;
 mod ui;
 
 use bevy::prelude::*;
+use bevy::render::{
+    RenderPlugin,
+    settings::{MemoryHints, WgpuFeatures, WgpuSettings},
+};
 use bevy::winit::WinitSettings;
 use bevy::{app::ScheduleRunnerPlugin, window::ExitCondition, winit::WinitPlugin};
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
@@ -137,7 +141,21 @@ fn main() -> AppExit {
         .insert_resource(ClearColor(Color::srgb(0.035, 0.045, 0.06)))
         .insert_resource(studio)
         .init_resource::<scene::Viewport>();
-    let plugins = DefaultPlugins.set(WindowPlugin {
+    // The display and lifecycle probes compare the actual mesh attributes to a full reconstruction.
+    app.world_mut()
+        .resource_mut::<scene::Viewport>()
+        .inspect_mesh_attributes = playback_check.is_some() || lifecycle_check.is_some();
+    let renderer = RenderPlugin {
+        render_creation: WgpuSettings {
+            memory_hints: MemoryHints::MemoryUsage,
+            // Captured surfaces use colors and geometry without material textures.
+            disabled_features: Some(WgpuFeatures::TEXTURE_BINDING_ARRAY),
+            ..default()
+        }
+        .into(),
+        ..default()
+    };
+    let plugins = DefaultPlugins.set(renderer).set(WindowPlugin {
         close_when_requested: false,
         primary_window: (!render_check).then(|| {
             let mut window = Window {
@@ -209,7 +227,7 @@ fn main() -> AppExit {
             && !grid_check
             && !navmesh_scene_check
         {
-            app.add_systems(Update, scene::render_check);
+            app.add_systems(Update, scene::render_check.after(scene::update_camera));
         }
     } else {
         app.add_plugins(plugins);
@@ -232,6 +250,7 @@ fn main() -> AppExit {
     )
     .add_systems(Update, sync_window_title)
     .add_systems(Update, clips::handle_window_close);
+    scene::register_view_camera_pose(&mut app);
     if let Some(config) = playback_check {
         app.add_plugins(display_probe::Plugin(config));
     }

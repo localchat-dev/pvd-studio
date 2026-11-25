@@ -3,7 +3,9 @@ use crate::analysis::SharedAnalysis;
 use crate::analysis::resident::ResidentBudgetExceeded;
 
 mod external_cache;
+mod mesh_property;
 pub(super) use external_cache::ExternalCache;
+use mesh_property::PropertyLayout;
 
 pub(super) const ANALYSIS_CHECKPOINT_FRAMES: usize = 32;
 const MAX_ANALYSIS_REPLAY_FRAMES: usize = 512;
@@ -86,6 +88,34 @@ impl ReplayCursor {
 
     pub fn clear(&mut self) {
         self.current = None;
+    }
+
+    /// Establish the index for a scene the caller already displays from this recording.
+    pub fn set_displayed_frame(
+        &mut self,
+        recording: &crate::Recording,
+        frame: usize,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<(), Error> {
+        self.with_cursor(
+            recording,
+            frame,
+            &mut cancelled,
+            |cursor, _, segment, cancelled| {
+                cursor.select_segment(segment)?;
+                cursor.index = read_index(
+                    &mut cursor.reader,
+                    segment,
+                    frame,
+                    &mut cursor.undo,
+                    cancelled,
+                )?;
+                cursor.frame = Some(frame);
+                cursor.analysis = None;
+                cursor.backing_changed = false;
+                Ok(())
+            },
+        )
     }
 
     pub fn seek(
@@ -183,6 +213,10 @@ impl ReplayCursor {
             .as_ref()
             .map(DiskRecording::history_guard)
             .transpose()?;
+        let archive = recording
+            .disk
+            .as_ref()
+            .and_then(|disk| disk.archive.as_ref());
         let archived = match &recording.disk {
             Some(disk) => disk.archived(frame, cancelled)?,
             None => None,
@@ -198,8 +232,23 @@ impl ReplayCursor {
         }
         let mut cursor = match self.current.take() {
             Some(cursor) if cursor.resources.same(&segment.resources) => cursor,
+            Some(previous)
+                if previous
+                    .archive
+                    .as_ref()
+                    .zip(archive)
+                    .is_some_and(|(old, new)| old.shares_resource_ids(new)) =>
+            {
+                // Sealing copies resource IDs from the same session into every bank.
+                let mut cursor = Cursor::open(segment)?;
+                cursor.frame = previous.frame;
+                cursor.index = previous.index;
+                cursor.backing_changed = true;
+                cursor
+            }
             _ => Cursor::open(segment)?,
         };
+        cursor.archive = archive.cloned();
         let result = operation(&mut cursor, disk, segment, cancelled)?;
         check_replay_cancelled(cancelled)?;
         self.current = Some(cursor);
@@ -370,6 +419,8 @@ impl UndoCache {
 struct Cursor {
     path: PathBuf,
     resources: Resources,
+    archive: Option<persistent::ArchiveReader>,
+    backing_changed: bool,
     reader: HistoryReader,
     frame: Option<usize>,
     index: StateIndex,
@@ -385,6 +436,8 @@ impl Cursor {
         Ok(Self {
             path: segment.path.clone(),
             resources: segment.resources.clone(),
+            archive: None,
+            backing_changed: false,
             reader: DiskRecording::open(segment)?,
             frame: None,
             index: StateIndex::default(),
@@ -446,7 +499,9 @@ impl Cursor {
         profile: &mut SeekProfile,
     ) -> Result<(SceneUpdate, Option<Vec<AnalysisInput>>), Error> {
         self.select_segment(segment)?;
-        if self.frame == Some(frame) {
+        let backing_changed = std::mem::take(&mut self.backing_changed);
+        let local_frame = self.frame.filter(|_| !backing_changed);
+        if local_frame == Some(frame) {
             #[cfg(all(test, feature = "scene-read-census"))]
             census::route(
                 &self.resources,
@@ -459,15 +514,15 @@ impl Cursor {
         }
         let started = profile.start();
         let replace_all = self.frame.is_none();
-        let rewound = match self.frame {
+        let rewound = match local_frame {
             Some(from) if from > frame => {
                 self.undo.rewind(&mut self.index, from, frame, cancelled)?
             }
             _ => None,
         };
         let mut undo_source = None;
-        let persistent = if rewound.is_none() && frame.checked_add(1) == self.frame {
-            let from = self.frame.unwrap();
+        let persistent = if rewound.is_none() && frame.checked_add(1) == local_frame {
+            let from = local_frame.unwrap();
             let source = disk.segment(from)?;
             if !source.resources.same(&segment.resources) || !source.lease.available() {
                 return Err(error("scene undo source changed or expired"));
@@ -493,9 +548,9 @@ impl Cursor {
         };
         #[cfg(test)]
         let persistent_route = persistent.is_some();
-        let adjacent = self.frame.and_then(|f| f.checked_add(1)) == Some(frame)
+        let adjacent = local_frame.and_then(|f| f.checked_add(1)) == Some(frame)
             && (segment.frames.first().unwrap().info.index != frame
-                || segment.previous_frame == self.frame);
+                || segment.previous_frame == local_frame);
         #[cfg(all(test, feature = "scene-read-census"))]
         census::route(
             &self.resources,
@@ -536,9 +591,9 @@ impl Cursor {
                 .copied()
                 .collect();
             let changes = IndexUpdate {
-                objects: changed_offsets(&self.index.objects, &index.objects),
-                debug: changed_offsets(&self.index.debug, &index.debug),
-                contacts: changed_offsets(&self.index.contacts, &index.contacts),
+                objects: changed_offsets(&self.index.objects, &index.objects, backing_changed),
+                debug: changed_offsets(&self.index.debug, &index.debug, backing_changed),
+                contacts: changed_offsets(&self.index.contacts, &index.contacts, backing_changed),
                 cameras: camera_changes(&self.index.cameras, &index.cameras),
                 generations: index
                     .generations
@@ -895,6 +950,7 @@ fn read_index(
 fn changed_offsets(
     previous: &BTreeMap<u64, u64>,
     next: &BTreeMap<u64, u64>,
+    backing_changed: bool,
 ) -> Vec<(u64, Option<u64>)> {
     let mut result = Vec::new();
     let mut previous = previous.iter().peekable();
@@ -902,7 +958,7 @@ fn changed_offsets(
     loop {
         match (previous.peek(), next.peek()) {
             (Some(&(&id, &offset)), Some(&(&next_id, &next_offset))) if id == next_id => {
-                if offset != next_offset {
+                if offset != next_offset || (backing_changed && offset & (1 << 63) == 0) {
                     result.push((id, Some(next_offset)));
                 }
                 previous.next();
@@ -1021,7 +1077,7 @@ pub(super) fn read_object(
     reader: &mut HistoryReader,
     offset: u64,
     size: u64,
-    values: &mut BTreeMap<u64, Value>,
+    values: &mut BTreeMap<(u64, PropertyLayout), Value>,
     references: &mut BTreeMap<u64, Arc<BTreeMap<u64, u32>>>,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<ObjectState, Error> {
@@ -1039,7 +1095,7 @@ pub(super) fn read_object(
 }
 
 struct ObjectRecords<'a> {
-    values: &'a mut BTreeMap<u64, Value>,
+    values: &'a mut BTreeMap<(u64, PropertyLayout), Value>,
     references: &'a mut BTreeMap<u64, Arc<BTreeMap<u64, u32>>>,
     external: Option<&'a mut ExternalCache>,
 }
@@ -1078,19 +1134,18 @@ fn read_object_cached(
                 "invalid shared history property offset or duplicate key",
             ));
         }
+        let layout = PropertyLayout::for_property(&object.object.type_name, &key);
+        let cache_key = (value_offset, layout);
         #[cfg(all(test, feature = "scene-read-census"))]
-        let census_local_hit = values.contains_key(&value_offset);
-        if let std::collections::btree_map::Entry::Vacant(entry) = values.entry(value_offset) {
+        let census_local_hit = values.contains_key(&cache_key);
+        if let std::collections::btree_map::Entry::Vacant(entry) = values.entry(cache_key) {
             let value = if let Some(cache) = external_cache.as_deref_mut()
                 && value_offset & (1 << 63) != 0
             {
-                cache.value(reader, value_offset, size, cancelled)?
+                cache.property(reader, value_offset, size, layout, cancelled)?
             } else {
-                let Record::Value(value) =
-                    read_record_with_cancel(reader, value_offset, size, cancelled)?
-                else {
-                    return Err(error("history property record type mismatch"));
-                };
+                let bytes = read_record_bytes_with_cancel(reader, value_offset, size, cancelled)?;
+                let value = layout.decode(reader, &bytes, cancelled)?;
                 #[cfg(all(test, feature = "scene-read-census"))]
                 census::decoded_value();
                 value
@@ -1103,12 +1158,12 @@ fn read_object_cached(
             &key,
             value_offset,
             census_local_hit,
-            &values[&value_offset],
+            &values[&cache_key],
         );
         object
             .object
             .properties
-            .insert(key, values[&value_offset].clone());
+            .insert(key, values[&cache_key].clone());
     }
     let mut bindings = BTreeMap::new();
     for (key, targets) in object.references {

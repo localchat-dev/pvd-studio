@@ -33,6 +33,10 @@ impl PartialEq for Value {
             (Self::Ref(a), Self::Ref(b)) => a == b,
             (Self::Array(a), Self::Array(b)) => std::sync::Arc::ptr_eq(a, b) || a == b,
             (Self::Bytes(a), Self::Bytes(b)) => std::sync::Arc::ptr_eq(a, b) || a == b,
+            (Self::MeshArray(a), Self::MeshArray(b)) => a == b,
+            (Self::Array(a), Self::MeshArray(b)) | (Self::MeshArray(b), Self::Array(a)) => {
+                a.len() == b.len() && b.iter().zip(a.iter()).all(|(left, right)| left == *right)
+            }
             _ => false,
         }
     }

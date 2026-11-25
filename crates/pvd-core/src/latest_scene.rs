@@ -504,12 +504,10 @@ fn apply_reference_appends(
     for &ReferenceAppend { target, generation } in appends {
         let inserted = targets.insert(target, generation).is_none();
         if inserted && let Some(properties) = properties.as_deref_mut() {
-            let value = properties
+            properties
                 .entry(key.1.clone())
-                .or_insert_with(|| Value::Array(Arc::new(Vec::new())));
-            if let Value::Array(values) = value {
-                Arc::make_mut(values).push(Value::Ref(target));
-            }
+                .or_insert_with(|| Value::Array(Arc::new(Vec::new())))
+                .append_reference(target);
         }
     }
 }

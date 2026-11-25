@@ -5,19 +5,26 @@ use std::thread;
 
 use pvd_core::{
     Recording,
-    live::{ReplayCursor, SceneUpdate},
+    live::{ReplayCursor, ReplayLookahead, SceneUpdate},
 };
 
 type LoadResult = Result<(Recording, SceneUpdate), pvd_core::Error>;
+pub(super) const LOOKAHEAD_FRAMES: usize = 12;
 
 struct Request {
     generation: u64,
     recording: Arc<Recording>,
     frame: usize,
     cancelled: Arc<AtomicBool>,
-    displayed_generation: Option<u64>,
+    displayed: Option<DisplayedFrame>,
     with_analysis: bool,
     trace: Option<crate::display_probe::RequestTrace>,
+}
+
+#[derive(Clone, Copy)]
+struct DisplayedFrame {
+    generation: u64,
+    frame: usize,
 }
 
 pub(super) struct Completed {
@@ -35,7 +42,7 @@ struct State {
     completed: Option<(u64, Completed)>,
     stopped: bool,
     active_cancel: Option<Arc<AtomicBool>>,
-    displayed_generation: Option<u64>,
+    displayed: Option<DisplayedFrame>,
     reset: bool,
 }
 
@@ -49,6 +56,14 @@ impl State {
 
 pub(super) struct Worker {
     shared: Arc<(Mutex<State>, Condvar)>,
+    jobs: crate::background_jobs::BackgroundJobs,
+    prefetch: Option<PrefetchJob>,
+}
+
+struct PrefetchJob {
+    plan: ReplayLookahead,
+    cancelled: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
 }
 
 trait Loader: Send + 'static {
@@ -70,13 +85,22 @@ struct ReplayLoader {
 
 impl Loader for ReplayLoader {
     fn load(&mut self, request: &Request) -> LoadResult {
-        // An unpublished result cannot become the base of a display delta.
-        if self.generation != request.displayed_generation {
-            self.clear();
-        }
         let cancelled = || request.cancelled.load(Ordering::Acquire);
         if let Some(trace) = &request.trace {
             trace.event("core_begin", 0);
+        }
+        // An unpublished result cannot become the base of a display delta.
+        if self.generation != request.displayed.map(|displayed| displayed.generation) {
+            self.clear();
+            if let Some(displayed) = request.displayed
+                && request.recording.is_disk_backed()
+                && request.frame.abs_diff(displayed.frame) == 1
+            {
+                // The visible frame can expire while live history rolls. Fall back to a full seek.
+                let _ =
+                    self.cursor
+                        .set_displayed_frame(&request.recording, displayed.frame, cancelled);
+            }
         }
         let (update, analysis) = if request.recording.is_disk_backed() {
             if request.with_analysis {
@@ -141,6 +165,7 @@ impl Worker {
         let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let worker = shared.clone();
         let shutdown = shared.clone();
+        let notify = jobs.clone();
         jobs.spawn_with_cancel(
             "pvd-history-seek",
             move || stop(&shutdown),
@@ -193,6 +218,8 @@ impl Worker {
                                 result,
                             },
                         ));
+                        drop(state);
+                        notify.wake();
                     } else {
                         drop(state);
                         loader.clear();
@@ -200,7 +227,70 @@ impl Worker {
                 }
             },
         )?;
-        Ok(Self { shared })
+        Ok(Self {
+            shared,
+            jobs: jobs.clone(),
+            prefetch: None,
+        })
+    }
+
+    pub fn prefetch(
+        &mut self,
+        plan: Option<ReplayLookahead>,
+        recording: &Arc<Recording>,
+        trace: Option<crate::display_probe::Trace>,
+    ) {
+        if let Some(active) = &self.prefetch
+            && plan
+                .as_ref()
+                .is_some_and(|plan| plan.same_bank(&active.plan))
+            && !active.cancelled.load(Ordering::Acquire)
+        {
+            return;
+        }
+        self.cancel_prefetch();
+        if self
+            .prefetch
+            .as_ref()
+            .is_some_and(|job| !job.thread.is_finished())
+        {
+            return;
+        }
+        self.prefetch = plan.and_then(|plan| {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let active = cancelled.clone();
+            let prepare = plan.clone();
+            let recording = recording.clone();
+            let thread = self
+                .jobs
+                .spawn("pvd-history-prefetch", cancelled.clone(), move || {
+                    let stamp = crate::display_probe::Stamp {
+                        frame: prepare.frame(),
+                        ..Default::default()
+                    };
+                    if let Some(trace) = &trace {
+                        trace.event("prefetch_begin", stamp, 0);
+                    }
+                    let ready = prepare.prepare(&recording, active).unwrap_or(false);
+                    if let Some(trace) = &trace {
+                        trace.event("prefetch_end", stamp, u64::from(ready));
+                    }
+                })
+                .ok()?;
+            Some(PrefetchJob {
+                plan,
+                cancelled,
+                thread,
+            })
+        });
+    }
+
+    pub fn cancel_prefetch(&self) {
+        if let Some(job) = &self.prefetch
+            && let Some(bank) = job.plan.cancel(&job.cancelled)
+        {
+            let _ = self.jobs.retire(bank);
+        }
     }
 
     pub fn request(&self, recording: Arc<Recording>, frame: usize) {
@@ -241,7 +331,7 @@ impl Worker {
                 recording,
                 frame,
                 cancelled,
-                displayed_generation: state.displayed_generation,
+                displayed: state.displayed,
                 with_analysis,
             });
             wake.notify_one();
@@ -249,22 +339,36 @@ impl Worker {
     }
 
     pub fn cancel(&self) {
+        self.cancel_request(true);
+    }
+
+    pub fn cancel_pending(&self) {
+        self.cancel_request(false);
+    }
+
+    fn cancel_request(&self, reset: bool) {
+        self.cancel_prefetch();
         let (mutex, wake) = &*self.shared;
         if let Ok(mut state) = mutex.lock() {
             state.cancel_active();
             state.generation = state.generation.wrapping_add(1);
             state.pending = None;
             state.completed = None;
-            state.displayed_generation = None;
-            state.reset = true;
-            wake.notify_one();
+            if reset {
+                state.displayed = None;
+                state.reset = true;
+                wake.notify_one();
+            }
         }
     }
 
     pub fn poll(&self) -> Option<Completed> {
         let mut state = self.shared.0.lock().ok()?;
         let (generation, completed) = state.completed.take()?;
-        state.displayed_generation = completed.result.is_ok().then_some(generation);
+        state.displayed = completed.result.is_ok().then_some(DisplayedFrame {
+            generation,
+            frame: completed.frame,
+        });
         Some(completed)
     }
 
@@ -281,6 +385,7 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        self.cancel_prefetch();
         stop(&self.shared);
     }
 }
@@ -318,7 +423,12 @@ mod tests {
         for action in 0..3 {
             let (started, start) = mpsc::channel();
             let (cancelled, cancellation) = mpsc::channel();
-            let worker = Worker::with_loader(move |request: &Request| {
+            let (repaint, repaint_requested) = mpsc::channel();
+            let jobs = crate::background_jobs::BackgroundJobs::default();
+            jobs.set_wake(move || {
+                let _ = repaint.send(());
+            });
+            let worker = Worker::with_registered_loader(&jobs, move |request: &Request| {
                 if request.frame == 0 {
                     started.send(()).unwrap();
                     let deadline = Instant::now() + Duration::from_secs(3);
@@ -330,7 +440,8 @@ mod tests {
                     return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
                 }
                 Ok(((*request.recording).clone(), SceneUpdate::default()))
-            });
+            })
+            .unwrap();
             worker.request(recording.clone(), 0);
             start.recv_timeout(Duration::from_secs(3)).unwrap();
             if action == 2 {
@@ -345,14 +456,10 @@ mod tests {
             }
             cancellation.recv_timeout(Duration::from_secs(3)).unwrap();
             if action == 0 {
-                let deadline = Instant::now() + Duration::from_secs(3);
-                let completed = loop {
-                    if let Some(completed) = worker.poll() {
-                        break completed;
-                    }
-                    assert!(Instant::now() < deadline, "replacement load did not finish");
-                    thread::sleep(Duration::from_millis(1));
-                };
+                repaint_requested
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                let completed = worker.poll().unwrap();
                 assert_eq!(completed.frame, 1);
                 assert!(completed.result.is_ok());
             } else {

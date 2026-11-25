@@ -57,10 +57,19 @@ fn floats(datatype: u32, items: u32, values: &[f32]) -> Event {
 }
 
 fn fixture_events(updates: Vec<Vec<Event>>) -> Vec<Event> {
+    array_events("CurveFixture", "Values", 12, updates)
+}
+
+fn array_events(
+    class_name: &str,
+    property: &str,
+    datatype: u32,
+    updates: Vec<Vec<Event>>,
+) -> Vec<Event> {
     let mut events: Vec<_> = [
         (1, "physx3"),
-        (2, "CurveFixture"),
-        (3, "Values"),
+        (2, class_name),
+        (3, property),
         (4, "frame"),
         (10, "PvdI64"),
         (11, "PvdU64"),
@@ -84,7 +93,7 @@ fn fixture_events(updates: Vec<Vec<Event>>) -> Vec<Event> {
             semantic: 0,
             datatype: Name {
                 namespace: 1,
-                name: 12,
+                name: datatype,
             },
             kind: 2,
             named_values: vec![],
@@ -110,6 +119,10 @@ fn fixture_events(updates: Vec<Vec<Event>>) -> Vec<Event> {
 }
 
 fn recording(updates: Vec<Vec<Event>>) -> Recording {
+    from_events(fixture_events(updates))
+}
+
+fn from_events(events: Vec<Event>) -> Recording {
     let mut builder = pvd_core::RecordingBuilder::new(Header {
         version: 1,
         timestamp_numerator: 1,
@@ -122,10 +135,43 @@ fn recording(updates: Vec<Vec<Event>>) -> Recording {
             stream_id: 1,
             timestamp: 0,
             offset: 0,
-            events: fixture_events(updates),
+            events,
         })
         .unwrap();
     builder.finish().unwrap()
+}
+
+#[test]
+fn mesh_points_keep_curve_and_clipboard_values_when_array_storage_changes() {
+    let points: Vec<_> = (0..300)
+        .flat_map(|index| [0.0, index as f32, 2.0])
+        .collect();
+    let recording = from_events(array_events(
+        "PxTriangleMesh",
+        "Points",
+        14,
+        vec![
+            vec![floats(14, 300, &points)],
+            vec![floats(14, 2, &points[..6])],
+        ],
+    ));
+    let mut spec = element_spec(1, ElementType::Vec3, 1);
+    spec.property = "Points".into();
+    assert_eq!(values(&recording, &spec), vec![Some(1.0), Some(1.0)]);
+    let state = recording.state_at(0).unwrap();
+    let packed = &state.objects[&7].properties["Points"];
+    assert!(matches!(packed, Value::MeshArray(_)));
+    let expected = Value::Array(
+        points
+            .chunks_exact(3)
+            .map(|point| Value::Vec3(point.try_into().unwrap()))
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    assert_eq!(
+        crate::property_copy::text(packed).unwrap(),
+        crate::property_copy::text(&expected).unwrap()
+    );
 }
 
 fn values(recording: &Recording, spec: &Spec) -> Vec<Option<f64>> {
@@ -153,7 +199,7 @@ fn array_element_lookup_borrows_one_fixed_index_and_rejects_shape_changes() {
     let array = Value::Array(elements.clone());
     let spec = element_spec(1, ElementType::Quat, 0);
     assert!(std::ptr::eq(
-        spec.property_value(&array).unwrap(),
+        spec.property_value(&array).unwrap().as_ref(),
         &elements[1]
     ));
     assert_eq!(Arc::strong_count(&elements), 2);

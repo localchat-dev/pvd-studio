@@ -51,7 +51,7 @@ DEBUG、PROFILE、MEMORY 及接触/约束/查询等源端开关分别决定数�
 | 范围 | 已验证内容 | 边界 |
 | --- | --- | --- |
 | 刚体、Shape、Material | 3.4.2/4.1.2 位姿、名字变化、销毁/ID 复用、引用与几何 | SDK 特有属性和全部交互组合未穷尽 |
-| 网格 / HeightField | 3.4.2/4.1.2 triangle/convex 顶点与索引；地形的局部姿态、缩放、材质、孔洞及各版本绕序 | 动态地形更新和其他 SDK 组合待验 |
+| 网格 / HeightField | 3.4.2/4.1.2 triangle/convex 顶点与索引；地形的局部姿态、缩放、材质、孔洞及各版本绕序。3.4.2 三角网格的回放与 RepX 已核对单网格 98 万面、250 份网格共 500 万面、共享网格共 1 亿实例面，见[大型静态场景](validation.md#大型静态场景) | 动态地形更新和其他 SDK 组合待验；静态规模不代表实时帧率 |
 | Aggregate / Articulation | 3.4.2 成员变化、Link 树、形状/速度、代际及回放；4.1.2 ReducedCoordinate 的 Base 归属、休眠/唤醒、Link 树/形状/速度、销毁与文件/TCP 回放 | 4.1 根属性和 Link 更新按各自捕获边界显示；RC flags、关节类型、Motion、drive 未捕获，4.1 RepX 未验证 |
 | Raycast / Sweep / Overlap | 3.4.2/4.1.2 普通及批量查询，含 convex、负 MTD 距离、无命中和对象复用 | 源流缺 inflation、batch queryStatus 或 Overlap 接触点时保持未知 |
 | 关节 / 接触 | SDK 样例、3.4.2 四类限位及原版 JointFrames/限位配对 | 原版点/线/文本/非空批量、特殊 renderer 重建和多 Scene 仍需样例 |

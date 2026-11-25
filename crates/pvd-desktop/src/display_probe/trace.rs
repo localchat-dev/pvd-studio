@@ -114,6 +114,9 @@ impl Trace {
         aux: u64,
         submission: Option<Submission>,
     ) {
+        if phase == 0 && stamp.request == 0 {
+            return;
+        }
         let record = Record {
             ns: self.0.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
             stage,

@@ -170,16 +170,17 @@ impl Writer {
                 self.append(" }")
             }
             Value::Ref(value) => self.append(&format!("0x{value:016X}")),
-            Value::Array(values) => {
+            Value::Array(_) | Value::MeshArray(_) => {
+                let values = value.array_items().unwrap();
                 if values.len() > self.remaining_nodes {
                     return Err(CopyError::Nodes);
                 }
                 self.append("[")?;
-                for (index, value) in values.iter().enumerate() {
+                for (index, value) in values.enumerate() {
                     if index > 0 {
                         self.append(", ")?;
                     }
-                    self.value(value, depth + 1)?;
+                    self.value(&value, depth + 1)?;
                 }
                 self.append("]")
             }

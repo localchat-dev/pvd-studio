@@ -1,4 +1,4 @@
-use crate::{Action, Error, ErrorEvent, SceneState, Value, debug_draw::Primitive, error};
+use crate::{Action, Error, ErrorEvent, SceneState, error};
 
 #[derive(Default)]
 pub(crate) struct ValidationState {
@@ -14,43 +14,15 @@ impl ValidationState {
         state: &mut SceneState,
         limit: usize,
     ) -> Result<(), Error> {
-        let affected_bytes = |state: &SceneState| match &action {
-            Action::Set(id, key, _) => property_bytes(state, *id, key, Value::retained_bytes),
-            Action::Push(id, key, _) | Action::Remove(id, key, _) => {
-                // Only the top-level array allocation and its reference bindings can change.
-                property_bytes(state, *id, key, |value| match value {
-                    Value::Array(values) => values.capacity() * std::mem::size_of::<Value>(),
-                    _ => 0,
-                })
-            }
-            Action::Create(object) => object_bytes(state, object.id),
-            Action::Destroy(id) => object_bytes(state, *id),
-            Action::Debug(id, ..) => state.debug_draw.get(id).map_or(0, draw_bytes),
-            Action::Contacts(id, ..) => contacts_bytes(state, *id),
-            Action::ClearDebug(ids) => ids
-                .iter()
-                .filter_map(|id| state.debug_draw.get(id))
-                .map(draw_bytes)
-                .sum(),
-            Action::ReplaceDebug(_) => state.debug_draw.values().map(draw_bytes).sum(),
-            Action::Error(_) => 0,
-            Action::Camera(name, _) | Action::RemoveCamera(name) => state
-                .cameras
-                .get(name)
-                .map_or(0, |_| crate::camera_entry_bytes(name)),
-        };
-        let before = affected_bytes(state);
+        let before = action.scene_bytes(state);
         action.apply(state);
-        let after = affected_bytes(state);
+        let after = action.scene_bytes(state);
         let error_bytes = match &action {
             Action::Error(event) => error_bytes(event),
             _ => 0,
         };
-        self.state_bytes = self
-            .state_bytes
-            .saturating_sub(before)
-            .saturating_add(after)
-            .saturating_add(error_bytes);
+        self.state_bytes =
+            crate::updated_state_bytes(self.state_bytes, before, after).saturating_add(error_bytes);
         if self.state_bytes > limit || state.generations.len() > 1_000_000 {
             return Err(error(
                 "clip validation exceeds its current scene resource budget",
@@ -70,58 +42,6 @@ impl ValidationState {
 
 fn error_bytes(event: &ErrorEvent) -> usize {
     2 * std::mem::size_of_val(event) + event.message.len() + event.file.len()
-}
-
-fn property_bytes(
-    state: &SceneState,
-    id: u64,
-    key: &str,
-    value_bytes: impl FnOnce(&Value) -> usize,
-) -> usize {
-    state
-        .objects
-        .get(&id)
-        .and_then(|object| object.properties.get(key))
-        .map_or(0, |value| key.len() + 96 + value_bytes(value))
-        + state
-            .reference_lifetimes
-            .get(&(id, key.to_owned()))
-            .map_or(0, |bindings| binding_bytes(key, bindings.len()))
-}
-
-fn binding_bytes(key: &str, count: usize) -> usize {
-    key.len() + 96 + count * 80
-}
-
-fn draw_bytes(draw: &std::sync::Arc<Vec<Primitive>>) -> usize {
-    (draw.capacity() - draw.len()) * std::mem::size_of::<Primitive>()
-        + crate::debug_windows::primitive_bytes(draw)
-}
-
-fn contacts_bytes(state: &SceneState, id: u64) -> usize {
-    state
-        .contacts
-        .get(&id)
-        .map_or(0, |contacts| 80 + std::mem::size_of_val(contacts.as_ref()))
-}
-
-fn object_bytes(state: &SceneState, id: u64) -> usize {
-    state.objects.get(&id).map_or(0, |object| {
-        256 + object.type_name.len()
-            + object
-                .properties
-                .iter()
-                .map(|(key, value)| key.len() + 96 + value.retained_bytes())
-                .sum::<usize>()
-    }) + state
-        .reference_lifetimes
-        .range((id, String::new())..)
-        .take_while(|((owner, _), _)| *owner == id)
-        .map(|((_, key), bindings)| binding_bytes(key, bindings.len()))
-        .sum::<usize>()
-        + state.debug_draw.get(&id).map_or(0, draw_bytes)
-        + contacts_bytes(state, id)
-        + usize::from(state.generations.contains_key(&id)) * 80
 }
 
 #[cfg(test)]

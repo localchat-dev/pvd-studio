@@ -9,6 +9,7 @@ pub(crate) struct SceneChanges {
     range: Option<(u64, u64)>,
     full: bool,
     objects: HashSet<u64>,
+    poses: HashSet<u64>,
 }
 
 impl SceneChanges {
@@ -17,6 +18,19 @@ impl SceneChanges {
     }
 
     pub(crate) fn record(&mut self, update: &SceneUpdate, revision: u64) {
+        self.record_update(update, None, revision);
+    }
+
+    pub(crate) fn record_replay(
+        &mut self,
+        update: &SceneUpdate,
+        state: &SceneState,
+        revision: u64,
+    ) {
+        self.record_update(update, Some(state), revision);
+    }
+
+    fn record_update(&mut self, update: &SceneUpdate, state: Option<&SceneState>, revision: u64) {
         match self.range {
             Some((_, end)) if end != revision => self.full = true,
             None => self.range = Some((revision, revision)),
@@ -24,14 +38,56 @@ impl SceneChanges {
         }
         self.range.as_mut().unwrap().1 = revision.wrapping_add(1);
         self.full |= update.replace_all;
-        self.objects
-            .extend(update.changed_objects().map(|(id, _)| id));
+        for (id, next) in update.changed_objects() {
+            let first_change = self.objects.insert(id);
+            if !self.full
+                && (first_change || self.poses.contains(&id))
+                && state.is_some_and(|state| rigid_motion_only(state, update, id, next))
+            {
+                self.poses.insert(id);
+            } else {
+                self.poses.remove(&id);
+            }
+        }
     }
 
-    pub(super) fn take(&mut self, from: u64, to: u64) -> Option<HashSet<u64>> {
+    pub(super) fn take(&mut self, from: u64, to: u64) -> Option<(HashSet<u64>, HashSet<u64>)> {
         let current = std::mem::take(self);
-        (!current.full && current.range == Some((from, to))).then_some(current.objects)
+        (!current.full && current.range == Some((from, to)))
+            .then_some((current.objects, current.poses))
     }
+}
+
+fn rigid_motion_only(
+    state: &SceneState,
+    update: &SceneUpdate,
+    id: u64,
+    next: Option<&Object>,
+) -> bool {
+    let (Some(previous), Some(next)) = (state.objects.get(&id), next) else {
+        return false;
+    };
+    if !(next.type_name.ends_with("::PxRigidDynamic")
+        || next.type_name.ends_with("::PxRigidStatic"))
+        || previous.generation != next.generation
+        || previous.type_name != next.type_name
+        || !matches!(
+            next.properties.get("GlobalPose"),
+            Some(Value::Transform { .. })
+        )
+    {
+        return false;
+    }
+    ["IsSleeping", "RigidBodyFlags", "$pickable"]
+        .into_iter()
+        .all(|name| previous.properties.get(name) == next.properties.get(name))
+        && !update.changes_object_properties(state, id, &["Shapes"])
+}
+
+pub(super) struct ShapePose {
+    slot: usize,
+    position: [f32; 3],
+    rotation: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -50,9 +106,9 @@ pub(super) struct SceneIndex {
     assets: HashMap<ObjectKey, AssetUse>,
     mesh_users: HashMap<u64, usize>,
     material_users: HashMap<MaterialKey, usize>,
-    shape_users: HashMap<u64, usize>,
     source: SourceResources,
     pub last_actor_count: usize,
+    pub last_pose_count: usize,
 }
 
 #[derive(Default)]
@@ -280,25 +336,60 @@ impl SceneIndex {
         result
     }
 
-    pub fn affected(&self, state: &SceneState, changed: HashSet<u64>) -> Option<HashSet<u64>> {
+    pub fn affected(
+        &self,
+        state: &SceneState,
+        changed: HashSet<u64>,
+        mut poses: HashSet<u64>,
+    ) -> Option<(HashSet<u64>, HashSet<u64>)> {
         if !self.ready {
             return None;
         }
         let mut result = HashSet::new();
         for id in changed {
+            let pose_only = poses.contains(&id);
             if let Some(object) = state.objects.get(&id) {
                 if object.type_name.ends_with("::PxCloth") {
                     return None;
                 }
-                if actor(object) {
+                if actor(object) && !pose_only {
                     result.insert(id);
                 }
             }
-            if self.dependencies.contains_key(&id) {
+            if self.dependencies.contains_key(&id) && !pose_only {
                 result.insert(id);
             }
             if let Some(actors) = self.dependents.get(&id) {
                 result.extend(actors);
+            }
+        }
+        poses.retain(|id| !result.contains(id));
+        Some((result, poses))
+    }
+
+    pub fn shape_poses(&self, state: &SceneState, actors: &HashSet<u64>) -> Option<Vec<ShapePose>> {
+        let mut result = Vec::with_capacity(actors.len());
+        for &id in actors {
+            let Some(keys) = self.actors.get(&id) else {
+                continue;
+            };
+            let Value::Transform { position, rotation } =
+                state.objects.get(&id)?.properties.get("GlobalPose")?
+            else {
+                return None;
+            };
+            for &key in keys {
+                let shape = state.resolve_reference(id, "Shapes", key.1)?;
+                let (position, rotation) =
+                    pvd_core::rigid_shape_pose((*position, *rotation), shape);
+                if !valid_transform(position, rotation) {
+                    return None;
+                }
+                result.push(ShapePose {
+                    slot: *self.slots.get(&key)?,
+                    position,
+                    rotation,
+                });
             }
         }
         Some(result)
@@ -343,7 +434,6 @@ impl SceneIndex {
     fn add_assets(&mut self, key: ObjectKey, usage: AssetUse) {
         *self.mesh_users.entry(usage.mesh).or_default() += 1;
         *self.material_users.entry(usage.material).or_default() += 1;
-        *self.shape_users.entry(key.1).or_default() += 1;
         self.assets.insert(key, usage);
     }
 
@@ -351,7 +441,6 @@ impl SceneIndex {
         if let Some(usage) = self.assets.remove(&key) {
             release(&mut self.mesh_users, usage.mesh);
             release(&mut self.material_users, usage.material);
-            release(&mut self.shape_users, key.1);
         }
     }
 }
@@ -417,6 +506,7 @@ pub(super) fn sync_actors(
                     indices: indices.clone(),
                     hash: geometry_hash(&object.geometry),
                     valid: true,
+                    focus_radius: Default::default(),
                 });
         }
         if !object_visible(studio, &object) {
@@ -447,9 +537,6 @@ pub(super) fn sync_actors(
                 index.slots.insert((moved.id, moved.shape_id), slot);
             }
         }
-        if !index.shape_users.contains_key(&key.1) {
-            viewport.wire_keys.remove(&key.1);
-        }
     }
     viewport.meshes.retain(|key, mesh| {
         if index.mesh_users.contains_key(key) {
@@ -467,14 +554,28 @@ pub(super) fn sync_actors(
             false
         }
     });
-    viewport
-        .wires
-        .retain(|key, _| index.mesh_users.contains_key(key));
+    viewport.wires.retain(|id, _| meshes.contains(*id));
     viewport
         .shared_geometry
         // Source users include hidden actors; their Arcs keep pointer keys valid.
         .retain(|key, _| index.source.shared.contains_key(key));
     viewport.incremental = index;
+}
+
+pub(super) fn sync_poses(commands: &mut Commands, viewport: &mut Viewport, poses: Vec<ShapePose>) {
+    viewport.incremental.last_pose_count = poses.len();
+    for pose in poses {
+        let object = &mut viewport.objects[pose.slot];
+        object.position = pose.position;
+        object.rotation = pose.rotation;
+        if let Some(rendered) = viewport.rendered.get_mut(&(object.id, object.shape_id)) {
+            let transform = object_transform(viewport.coordinates, object);
+            if rendered.transform != transform {
+                rendered.transform = transform;
+                commands.entity(rendered.entity).insert(transform);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -631,12 +732,135 @@ mod tests {
             studio.scene_changes = SceneChanges {
                 range: Some((revision, revision + 1)),
                 objects: changed.iter().copied().collect(),
-                full: false,
+                ..Default::default()
             };
             studio.state = state;
             studio.revision += 1;
         }
         app.update();
+    }
+
+    #[test]
+    fn replay_motion_reuses_render_assets_and_checks_shape_changes() {
+        let (_, mut initial) = fixture();
+        let local_pose = |x| Value::Transform {
+            position: [x, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        };
+        initial
+            .objects
+            .get_mut(&10)
+            .unwrap()
+            .properties
+            .insert("LocalPose".into(), local_pose(1.0));
+        let mut app = app();
+        app.world_mut().resource_mut::<Studio>().state = initial.clone();
+        app.update();
+        let rendered = &app.world().resource::<Viewport>().rendered[&(1, 10)];
+        let (entity, mesh) = (rendered.entity, rendered.mesh.id());
+        let mut expected = initial;
+        let commit = |app: &mut App, next: &SceneState, changed: &[u64]| {
+            let mut patch = SceneUpdate::full(next);
+            patch.replace_all = false;
+            {
+                let studio = &mut *app.world_mut().resource_mut::<Studio>();
+                studio
+                    .scene_changes
+                    .record_replay(&patch, &studio.state, studio.revision);
+                studio
+                    .scene_changes
+                    .objects
+                    .retain(|id| changed.contains(id));
+                studio.scene_changes.poses.retain(|id| changed.contains(id));
+                studio.state = next.clone();
+                studio.revision += 1;
+            }
+            app.update();
+            let mut full = next.render_scene().objects;
+            full.sort_by_key(|object| (object.id, object.shape_id));
+            assert_eq!(objects(app), full);
+        };
+        expected.objects.get_mut(&1).unwrap().properties.insert(
+            "GlobalPose".into(),
+            Value::Transform {
+                position: [2.0, 3.0, 4.0],
+                rotation: [0.0, 0.0, 1.0, 0.0],
+            },
+        );
+        commit(&mut app, &expected, &[1]);
+        let viewport = app.world().resource::<Viewport>();
+        assert_eq!(viewport.incremental.last_pose_count, 1);
+        assert_eq!(viewport.rendered[&(1, 10)].entity, entity);
+        assert_eq!(viewport.rendered[&(1, 10)].mesh.id(), mesh);
+        expected
+            .objects
+            .get_mut(&1)
+            .unwrap()
+            .properties
+            .insert("GlobalPose".into(), local_pose(2.0));
+        expected
+            .objects
+            .get_mut(&10)
+            .unwrap()
+            .properties
+            .insert("LocalPose".into(), local_pose(3.0));
+        commit(&mut app, &expected, &[1, 10]);
+        assert_eq!(
+            app.world()
+                .resource::<Viewport>()
+                .incremental
+                .last_pose_count,
+            0
+        );
+    }
+
+    #[test]
+    fn overlay_edges_follow_display_demand_without_replacing_surface_assets() {
+        let (_, initial) = fixture();
+        let mut app = app();
+        let mut studio = app.world_mut().resource_mut::<Studio>();
+        studio.state = initial;
+        studio.prefs.show_bounds = false;
+        studio.prefs.wireframe = false;
+        app.update();
+        let viewport = app.world().resource::<Viewport>();
+        let selected_mesh = viewport.rendered[&(3, 11)].mesh.id();
+        let shared_mesh = viewport.rendered[&(1, 10)].mesh.id();
+        assert_ne!(selected_mesh, shared_mesh);
+        assert!(viewport.wires.is_empty());
+
+        let mut studio = app.world_mut().resource_mut::<Studio>();
+        studio.select_object(Some(3), false);
+        studio.prefs.bounds_scope = crate::studio::ObjectScope::Selected;
+        studio.prefs.show_bounds = true;
+        app.update();
+        let viewport = app.world().resource::<Viewport>();
+        assert_eq!(viewport.wires.len(), 1);
+        assert!(!viewport.wires[&selected_mesh].is_empty());
+
+        let mut studio = app.world_mut().resource_mut::<Studio>();
+        studio.prefs.wireframe = true;
+        app.update();
+        let viewport = app.world().resource::<Viewport>();
+        assert_eq!(viewport.wires.len(), 2);
+        let shared_edges = &viewport.wires[&shared_mesh];
+        let mut mesh = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(shared_mesh)
+            .unwrap()
+            .clone();
+        orient_winding(&mut mesh, true);
+        assert_eq!(*shared_edges, mesh_edges(&mesh, true));
+
+        let mut studio = app.world_mut().resource_mut::<Studio>();
+        studio.prefs.wireframe = false;
+        studio.prefs.show_bounds = false;
+        app.update();
+        let viewport = app.world().resource::<Viewport>();
+        assert!(viewport.wires.is_empty());
+        assert_eq!(viewport.rendered[&(1, 10)].mesh.id(), shared_mesh);
+        assert_eq!(viewport.rendered[&(3, 11)].mesh.id(), selected_mesh);
     }
 
     #[test]

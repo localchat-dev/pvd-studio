@@ -7,21 +7,56 @@ use std::sync::{Arc, Weak};
 pub(crate) use terrain::{FrameTerrainSelections, RegionMesh};
 use terrain::{IndexedTerrain, TerrainCache, TerrainSource};
 
-const MAX_VERTICES: usize = 1_000_000;
-const MAX_INDICES: usize = 3_000_000;
+pub(crate) const MAX_VERTICES: usize = 1_000_000;
+pub(crate) const MAX_INDICES: usize = 3_000_000;
 const MAX_BOUNDS_BYTES: usize = 4 * 1024 * 1024;
 const BOUNDS_ENTRY_BYTES: usize =
     std::mem::size_of::<MeshKey>() + std::mem::size_of::<CachedBounds>();
 
+enum ArraySource {
+    Values(Weak<Vec<Value>>),
+    Packed(Weak<Box<[u8]>>),
+}
+
+impl ArraySource {
+    fn capture(value: &Value) -> Option<Self> {
+        match value {
+            Value::Array(values) => Some(Self::Values(Arc::downgrade(values))),
+            Value::MeshArray(values) => Some(Self::Packed(Arc::downgrade(values.bytes()))),
+            _ => None,
+        }
+    }
+
+    fn matches(&self, value: &Value) -> bool {
+        match (self, value) {
+            (Self::Values(previous), Value::Array(current)) => {
+                previous.as_ptr() == Arc::as_ptr(current)
+            }
+            (Self::Packed(previous), Value::MeshArray(current)) => {
+                previous.as_ptr() == Arc::as_ptr(current.bytes())
+            }
+            _ => false,
+        }
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Values(a), Self::Values(b)) => a.ptr_eq(b),
+            (Self::Packed(a), Self::Packed(b)) => a.ptr_eq(b),
+            _ => false,
+        }
+    }
+}
+
 struct CachedBounds {
-    values: Weak<Vec<Value>>,
+    values: ArraySource,
     dimensions: [usize; 2],
     bounds: Option<LocalBounds>,
 }
 
 impl CachedBounds {
-    fn matches(&self, values: &Arc<Vec<Value>>, dimensions: [usize; 2]) -> bool {
-        self.values.as_ptr() == Arc::as_ptr(values) && self.dimensions == dimensions
+    fn matches(&self, values: &Value, dimensions: [usize; 2]) -> bool {
+        self.values.matches(values) && self.dimensions == dimensions
     }
 }
 
@@ -139,9 +174,9 @@ impl MeshCache {
             let [rows, columns] = dimensions;
             let (min, max) =
                 values
-                    .iter()
+                    .array_items()?
                     .try_fold((i16::MAX, i16::MIN), |(min, max), value| {
-                        let Value::Array(fields) = value else {
+                        let Value::Array(fields) = value.as_ref() else {
                             return None;
                         };
                         let Value::I64(height) = fields.first()? else {
@@ -160,8 +195,8 @@ impl MeshCache {
             ])
         } else {
             let rotation = key.rotation.map(f32::from_bits);
-            LocalBounds::from_points(values.iter().map(|value| {
-                vec3(Some(value)).map(|point| scale_mesh_point(point, scale, rotation))
+            LocalBounds::from_points(values.array_items()?.map(|value| {
+                vec3(Some(&value)).map(|point| scale_mesh_point(point, scale, rotation))
             }))
         };
         if self.bounds.len() < MAX_BOUNDS_BYTES / BOUNDS_ENTRY_BYTES
@@ -171,7 +206,7 @@ impl MeshCache {
             self.bounds.insert(
                 key.clone(),
                 CachedBounds {
-                    values: Arc::downgrade(values),
+                    values: ArraySource::capture(values)?,
                     dimensions,
                     bounds,
                 },
@@ -238,10 +273,7 @@ pub(crate) struct MeshKey {
 }
 
 impl MeshKey {
-    fn bounds_source<'a>(
-        &self,
-        state: &'a SceneState,
-    ) -> Option<(&'a Arc<Vec<Value>>, [usize; 2])> {
+    fn bounds_source<'a>(&self, state: &'a SceneState) -> Option<(&'a Value, [usize; 2])> {
         let source = state.objects.get(&self.resource)?;
         if source.generation != self.generation {
             return None;
@@ -251,12 +283,10 @@ impl MeshKey {
         } else {
             ("Points", [0; 2])
         };
-        let Value::Array(values) = source.properties.get(property)? else {
-            return None;
-        };
+        let values = source.properties.get(property)?;
+        let count = values.array_len()?;
         let [rows, columns] = dimensions;
-        (values.len() <= MAX_VERTICES
-            && (self.kind != MeshKind::HeightField || values.len() == rows * columns))
+        (count <= MAX_VERTICES && (self.kind != MeshKind::HeightField || count == rows * columns))
             .then_some((values, dimensions))
     }
 }
@@ -438,16 +468,11 @@ impl SceneState {
         if kind == MeshKind::HeightField {
             return height_field_geometry(mesh, geometry, self.height_field_thickness(mesh)?);
         }
-        let Value::Array(points) = mesh.properties.get("Points")? else {
-            return None;
-        };
+        let points = mesh.properties.get("Points")?.array_items()?;
         if points.len() > MAX_VERTICES {
             return None;
         }
-        let mut vertices = points
-            .iter()
-            .map(|v| vec3(Some(v)))
-            .collect::<Option<Vec<_>>>()?;
+        let mut vertices = points.map(|v| vec3(Some(&v))).collect::<Option<Vec<_>>>()?;
         let mut indices = Vec::new();
         if kind == MeshKind::Convex {
             let Value::Array(polygons) = mesh.properties.get("HullPolygons")? else {
@@ -486,15 +511,13 @@ impl SceneState {
                 }
             }
         } else {
-            let Value::Array(triangles) = mesh.properties.get("Triangles")? else {
-                return None;
-            };
+            let triangles = mesh.properties.get("Triangles")?.array_items()?;
             if triangles.len() > MAX_INDICES {
                 return None;
             }
             indices.reserve(triangles.len());
-            for v in triangles.iter() {
-                indices.push(integer(v)?);
+            for v in triangles {
+                indices.push(integer(&v)?);
             }
             if indices.len() % 3 != 0 {
                 return None;

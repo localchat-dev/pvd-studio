@@ -1,5 +1,6 @@
 use pvd_core::{Recording, Value, analysis::view::ProfileSource};
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, VecDeque},
     sync::{
         Arc, Mutex,
@@ -83,17 +84,12 @@ impl Spec {
         )
     }
 
-    fn property_value<'a>(&self, value: &'a Value) -> Option<&'a Value> {
+    fn property_value<'a>(&self, value: &'a Value) -> Option<Cow<'a, Value>> {
         match self.source {
-            Source::Property => Some(value),
-            Source::PropertyElement { index, value_type } => {
-                let Value::Array(values) = value else {
-                    return None;
-                };
-                values
-                    .get(index)
-                    .filter(|value| ElementType::of(value) == Some(value_type))
-            }
+            Source::Property => Some(Cow::Borrowed(value)),
+            Source::PropertyElement { index, value_type } => value
+                .array_item(index)
+                .filter(|value| ElementType::of(value) == Some(value_type)),
             _ => None,
         }
     }
@@ -631,7 +627,7 @@ fn sample_with_source(
                     .get(spec.component)
                     .is_some_and(|name| *name == spec.component_name)
             })
-            .and_then(|value| number(value, spec.component));
+            .and_then(|value| number(&value, spec.component));
         samples.push((frame, value));
         progress.store(frame + 1, Ordering::Relaxed);
     }

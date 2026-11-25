@@ -105,7 +105,7 @@ impl Studio {
                     language.text("Cleaning up receive buffers", "正在清理接收缓存")
                 }
                 "pvd-file-loader" => language.text("Stopping file loading", "正在停止文件读取"),
-                "pvd-history-seek" => {
+                "pvd-history-seek" | "pvd-history-prefetch" => {
                     language.text("Cancelling history reads", "正在取消历史帧读取")
                 }
                 "pvd-studio-release" => language.text(

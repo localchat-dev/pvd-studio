@@ -1,5 +1,5 @@
 use super::*;
-use std::io::SeekFrom;
+use std::io::{BufReader, SeekFrom};
 
 pub(in crate::live) fn part_error(path: &Path, failure: Error) -> Error {
     let kind = failure
@@ -27,6 +27,7 @@ pub(in crate::live) struct OpenedCapture {
     pub(in crate::live) recording: crate::Recording,
     pub(in crate::live) report: CaptureReport,
     pub(super) has_room_directory: bool,
+    index_bytes: usize,
 }
 
 pub(in crate::live) fn open_set_part(
@@ -41,6 +42,57 @@ pub(in crate::live) fn open_set_part(
 pub(in crate::live) fn open_report_with_progress(
     path: &Path,
     limits: &CaptureLimits,
+    callback: impl FnMut(CaptureProgress) -> bool,
+) -> Result<OpenedCapture, Error> {
+    open(path, limits, Open::Full, callback)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::live) struct BankAdmission {
+    digest: [u8; 32],
+    paged_analysis: bool,
+    pub index_bytes: usize,
+}
+
+enum Open {
+    Full,
+    Admit([u8; 32]),
+    Reopen(BankAdmission),
+}
+
+pub(in crate::live) fn admit_bank(
+    path: &Path,
+    limits: &CaptureLimits,
+    digest: [u8; 32],
+    callback: impl FnMut(CaptureProgress) -> bool,
+) -> Result<BankAdmission, Error> {
+    let opened = open(path, limits, Open::Admit(digest), callback)?;
+    Ok(BankAdmission {
+        digest,
+        paged_analysis: opened
+            .recording
+            .disk
+            .as_ref()
+            .unwrap()
+            .analysis_pages
+            .is_some(),
+        index_bytes: opened.index_bytes,
+    })
+}
+
+pub(in crate::live) fn open_bank(
+    path: &Path,
+    limits: &CaptureLimits,
+    admission: BankAdmission,
+    callback: impl FnMut(CaptureProgress) -> bool,
+) -> Result<crate::Recording, Error> {
+    open(path, limits, Open::Reopen(admission), callback).map(|opened| opened.recording)
+}
+
+fn open(
+    path: &Path,
+    limits: &CaptureLimits,
+    mode: Open,
     mut callback: impl FnMut(CaptureProgress) -> bool,
 ) -> Result<OpenedCapture, Error> {
     limits.validate()?;
@@ -48,7 +100,7 @@ pub(in crate::live) fn open_report_with_progress(
     let mut file = open_file(&path)?;
     let bytes = file.metadata()?.len();
     let directory = directory(&mut file, bytes, limits, &mut callback)?;
-    restore(path, file, 0, directory, limits, callback)
+    restore(path, file, 0, directory, limits, mode, callback)
 }
 
 pub(super) fn open_file(path: &Path) -> Result<File, Error> {
@@ -78,6 +130,7 @@ pub(in crate::live) fn open_embedded(
         base,
         directory,
         limits,
+        Open::Full,
         callback,
     )
 }
@@ -88,18 +141,27 @@ fn restore(
     base: u64,
     directory: Directory,
     limits: &CaptureLimits,
+    mode: Open,
     mut callback: impl FnMut(CaptureProgress) -> bool,
 ) -> Result<OpenedCapture, Error> {
     let report = directory.report;
     let bytes = report.bytes;
-    let backing = Arc::new(CaptureBacking {
-        format: directory.format,
+    let expected = match mode {
+        Open::Full => None,
+        Open::Admit(digest) | Open::Reopen(BankAdmission { digest, .. }) => Some(digest),
+    };
+    if expected.is_some_and(|digest| digest != report.digest) {
+        return Err(error(
+            "complete-session bank differs from its admitted contents",
+        ));
+    }
+    let backing = Arc::new(CaptureBacking::new(
+        directory.format,
         file,
-        path: path.clone(),
+        path.clone(),
         base,
         bytes,
-        owner: std::sync::Mutex::new(None),
-    });
+    ));
     let mut budget = Budget::new(limits.index_bytes);
     budget.charge(directory.retained_bytes)?;
     let frame_count = directory
@@ -126,6 +188,9 @@ fn restore(
             })
         },
     )?;
+    let index_bytes = report
+        .index_bytes
+        .max(budget.used.saturating_add(resources.metadata_bytes()));
     let mut segments = VecDeque::new();
     let mut frames = crate::FrameIndex::default();
     for segment in directory.segments {
@@ -169,7 +234,12 @@ fn restore(
         analysis_pages: None,
     };
     disk.stats.segments = disk.segments.len();
-    if validate_records(&disk, &directory.records, report.range, &mut callback)? {
+    // A matching admitted bank has already passed record and first-frame validation.
+    let paged_analysis = match mode {
+        Open::Reopen(bank) => bank.paged_analysis,
+        _ => validate_records(&disk, &directory.records, report.range, &mut callback)?,
+    };
+    if paged_analysis {
         disk.analysis_pages = Some(analysis_pages::AnalysisPageReader::for_capture(&resources)?);
     }
     let metadata = directory.metadata;
@@ -207,6 +277,15 @@ fn restore(
             total: bytes,
         })
     };
+    if matches!(mode, Open::Reopen(_)) {
+        check_replay_cancelled(&mut cancelled)?;
+        return Ok(OpenedCapture {
+            recording,
+            report,
+            has_room_directory,
+            index_bytes,
+        });
+    }
     recording.initial =
         Arc::new(recording.state_at_with_cancel(report.range.first, &mut cancelled)?);
     if !has_room_directory {
@@ -240,6 +319,7 @@ fn restore(
         recording,
         report,
         has_room_directory,
+        index_bytes,
     })
 }
 
@@ -355,6 +435,7 @@ pub(super) fn directory<R: Read + Seek>(
     if total > limits.output_bytes || total < 8 {
         return Err(error("project capture size exceeds its limits"));
     }
+    let mut input = BufReader::with_capacity(256 << 10, input);
     input.seek(SeekFrom::Start(0))?;
     let mut magic = [0; 8];
     input.read_exact(&mut magic)?;
@@ -376,6 +457,7 @@ pub(super) fn directory<R: Read + Seek>(
     let mut block_ids = BTreeSet::new();
     let mut blob_ids = BTreeSet::new();
     let mut frame_total = 0usize;
+    let mut scratch = [0u8; 64 << 10];
     loop {
         progress(callback, CapturePhase::Validate, position, total)?;
         let entry_start = position;
@@ -432,7 +514,6 @@ pub(super) fn directory<R: Read + Seek>(
             budget.reserve(&mut payload, length)?;
         }
         let mut remaining = length;
-        let mut scratch = [0u8; 64 << 10];
         let mut inner_header = [0u8; 36];
         let mut inner_header_bytes = 0;
         let mut inner_hash = blake3::Hasher::new();

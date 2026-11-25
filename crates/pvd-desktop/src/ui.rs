@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::atomic::Ordering};
+use std::{borrow::Cow, path::PathBuf, sync::atomic::Ordering};
 
 use bevy::{prelude::*, render::render_resource::Extent3d};
 use bevy_egui::{EguiContexts, egui};
@@ -256,10 +256,17 @@ struct PropertyMenuTarget {
     generation: u32,
     property: String,
     index: Option<usize>,
-    value_type: std::mem::Discriminant<Value>,
+    value_type: Option<std::mem::Discriminant<Value>>,
 }
 
 impl PropertyMenuTarget {
+    fn value_type(value: &Value) -> Option<std::mem::Discriminant<Value>> {
+        value
+            .array_len()
+            .is_none()
+            .then(|| std::mem::discriminant(value))
+    }
+
     fn new(
         source_epoch: u64,
         object: &pvd_core::Object,
@@ -273,11 +280,11 @@ impl PropertyMenuTarget {
             generation: object.generation,
             property: property.into(),
             index,
-            value_type: std::mem::discriminant(value),
+            value_type: Self::value_type(value),
         }
     }
 
-    fn value<'a>(&self, source_epoch: u64, object: &'a pvd_core::Object) -> Option<&'a Value> {
+    fn value<'a>(&self, source_epoch: u64, object: &'a pvd_core::Object) -> Option<Cow<'a, Value>> {
         if self.source_epoch != source_epoch
             || self.object != object.id
             || self.generation != object.generation
@@ -286,14 +293,11 @@ impl PropertyMenuTarget {
         }
         let value = object.properties.get(&self.property)?;
         let value = if let Some(index) = self.index {
-            let Value::Array(values) = value else {
-                return None;
-            };
-            values.get(index)?
+            value.array_item(index)?
         } else {
-            value
+            Cow::Borrowed(value)
         };
-        (std::mem::discriminant(value) == self.value_type).then_some(value)
+        (Self::value_type(&value) == self.value_type).then_some(value)
     }
 
     fn label(&self) -> String {
@@ -1298,22 +1302,24 @@ impl Viewer<'_> {
                                     jump = Some(*target);
                                 }
                             }
-                            Value::Array(values) => {
+                            Value::Array(_) | Value::MeshArray(_) => {
+                                let length = value.array_len().unwrap();
                                 ui.menu_button(
                                     localized_format!(
                                         language,
                                         "Array · {} values",
                                         "数组 · {} 项",
-                                        values.len()
+                                        length
                                     ),
                                     |ui| {
                                         ui.set_min_width(280.0);
                                         egui::ScrollArea::vertical().max_height(360.0).show_rows(
                                             ui,
                                             24.0,
-                                            values.len(),
+                                            length,
                                             |ui, range| {
                                                 for index in range {
+                                                    let item = value.array_item(index).unwrap();
                                                     let array_row = property_value_row(
                                                         ui,
                                                         |ui| {
@@ -1324,7 +1330,7 @@ impl Viewer<'_> {
                                                                 .clicked()
                                                                 && let Err(error) = copy_property(
                                                                     ui.ctx(),
-                                                                    &values[index],
+                                                                    &item,
                                                                 )
                                                             {
                                                                 array_copy_error = Some(error);
@@ -1340,7 +1346,7 @@ impl Viewer<'_> {
                                                                     |ui| {
                                                                         plot_component_menu(
                                                                             ui,
-                                                                            &values[index],
+                                                                            &item,
                                                                             language,
                                                                         )
                                                                     },
@@ -1357,7 +1363,7 @@ impl Viewer<'_> {
                                                         |ui| {
                                                             ui.label(format!("[{index}]"));
                                                             if let Value::Ref(target) =
-                                                                &values[index]
+                                                                item.as_ref()
                                                             {
                                                                 let valid = self
                                                                     .studio
@@ -1386,7 +1392,7 @@ impl Viewer<'_> {
                                                                         .as_deref(),
                                                                     &object.type_name,
                                                                     name,
-                                                                    &values[index],
+                                                                    &item,
                                                                 );
                                                                 ui.add(
                                                                     egui::Label::new(text)
@@ -1405,7 +1411,7 @@ impl Viewer<'_> {
                                                                 object,
                                                                 name,
                                                                 Some(index),
-                                                                &values[index],
+                                                                &item,
                                                             ));
                                                     }
                                                 }
@@ -1471,6 +1477,7 @@ impl Viewer<'_> {
                 ui.set_max_width(360.0);
                 ui.add(egui::Label::new(target.label()).wrap());
                 let value = target.value(source_epoch, object);
+                let value = value.as_deref();
                 if value.is_none() {
                     ui.label(language.text(
                         "Property is unavailable at this frame.",

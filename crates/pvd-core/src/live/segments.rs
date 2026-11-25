@@ -265,7 +265,9 @@ impl SegmentWriter {
         }
         let mut properties = BTreeMap::new();
         for (key, value) in &object.properties {
-            if value.retained_bytes() >= LARGE_PROPERTY_BYTES {
+            if matches!(value, Value::MeshArray(_))
+                || value.retained_bytes() >= LARGE_PROPERTY_BYTES
+            {
                 let offset = if let Some(previous) = cache
                     .properties
                     .get(key)

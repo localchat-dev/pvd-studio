@@ -131,20 +131,46 @@ fn lru_has_fixed_slots_and_eviction_releases_only_the_cache_owner() {
     let weak = Arc::downgrade(&held);
     let digest = blake3::hash(b"entry");
     for id in 0..SLOTS {
-        cache.insert(RESOURCE_ID + id as u64, Kind::Value, digest, 40, || {
-            Payload::Bytes(held.clone())
-        });
+        cache.insert(
+            RESOURCE_ID + id as u64,
+            Kind::Value(PropertyLayout::General),
+            digest,
+            40,
+            || Payload::Value(Value::Bytes(held.clone())),
+        );
     }
     assert_eq!(cache.slots.iter().flatten().count(), SLOTS);
-    assert!(cache.get(RESOURCE_ID, Kind::Value, digest).is_some());
-    cache.insert(RESOURCE_ID + SLOTS as u64, Kind::Value, digest, 40, || {
-        Payload::Bytes(held.clone())
-    });
-    assert!(cache.get(RESOURCE_ID + 1, Kind::Value, digest).is_none());
-    assert!(cache.get(RESOURCE_ID, Kind::Value, digest).is_some());
+    assert!(
+        cache
+            .get(RESOURCE_ID, Kind::Value(PropertyLayout::General), digest)
+            .is_some()
+    );
+    cache.insert(
+        RESOURCE_ID + SLOTS as u64,
+        Kind::Value(PropertyLayout::General),
+        digest,
+        40,
+        || Payload::Value(Value::Bytes(held.clone())),
+    );
+    assert!(
+        cache
+            .get(
+                RESOURCE_ID + 1,
+                Kind::Value(PropertyLayout::General),
+                digest
+            )
+            .is_none()
+    );
+    assert!(
+        cache
+            .get(RESOURCE_ID, Kind::Value(PropertyLayout::General), digest)
+            .is_some()
+    );
     assert_eq!(cache.bytes, size_of::<ExternalCache>() + SLOTS * 40);
     for _ in 0..1000 {
-        cache.get(RESOURCE_ID, Kind::Value, digest).unwrap();
+        cache
+            .get(RESOURCE_ID, Kind::Value(PropertyLayout::General), digest)
+            .unwrap();
     }
     assert!(cache.slots.iter().flatten().all(|entry| entry.age < SLOTS));
     drop(cache);
@@ -171,12 +197,24 @@ fn byte_and_single_entry_limits_bypass_without_losing_decoded_values() {
         ..Default::default()
     };
     let first = cache
-        .value_bytes(&store.reader, RESOURCE_ID + 1, &payload, &mut || false)
+        .value_bytes(
+            &store.reader,
+            RESOURCE_ID + 1,
+            &payload,
+            PropertyLayout::General,
+            &mut || false,
+        )
         .unwrap();
     assert_eq!(first, value);
     assert_eq!(cache.bytes, size_of::<ExternalCache>() + cost);
     cache
-        .value_bytes(&store.reader, RESOURCE_ID + 2, &payload, &mut || false)
+        .value_bytes(
+            &store.reader,
+            RESOURCE_ID + 2,
+            &payload,
+            PropertyLayout::General,
+            &mut || false,
+        )
         .unwrap();
     assert_eq!(cache.slots.iter().flatten().count(), 1);
     assert_eq!(
@@ -186,7 +224,13 @@ fn byte_and_single_entry_limits_bypass_without_losing_decoded_values() {
     cache.entry_limit = cost - 1;
     assert_eq!(
         cache
-            .value_bytes(&store.reader, RESOURCE_ID + 3, &payload, &mut || false)
+            .value_bytes(
+                &store.reader,
+                RESOURCE_ID + 3,
+                &payload,
+                PropertyLayout::General,
+                &mut || false
+            )
             .unwrap(),
         value
     );
@@ -197,7 +241,13 @@ fn byte_and_single_entry_limits_bypass_without_losing_decoded_values() {
     };
     assert_eq!(
         too_small
-            .value_bytes(&store.reader, RESOURCE_ID + 1, &payload, &mut || false)
+            .value_bytes(
+                &store.reader,
+                RESOURCE_ID + 1,
+                &payload,
+                PropertyLayout::General,
+                &mut || false
+            )
             .unwrap(),
         value
     );
@@ -211,14 +261,32 @@ fn complete_record_digest_and_kind_are_required_even_for_the_same_id() {
     let id = RESOURCE_ID + 1;
     let first_bytes = bytes(array(1, 4));
     let first = cache
-        .value_bytes(&store.reader, id, &first_bytes, &mut || false)
+        .value_bytes(
+            &store.reader,
+            id,
+            &first_bytes,
+            PropertyLayout::General,
+            &mut || false,
+        )
         .unwrap();
     let second = cache
-        .value_bytes(&store.reader, id, &first_bytes, &mut || false)
+        .value_bytes(
+            &store.reader,
+            id,
+            &first_bytes,
+            PropertyLayout::General,
+            &mut || false,
+        )
         .unwrap();
     assert!(Arc::ptr_eq(array_arc(&first), array_arc(&second)));
     let changed = cache
-        .value_bytes(&store.reader, id, &bytes(array(2, 4)), &mut || false)
+        .value_bytes(
+            &store.reader,
+            id,
+            &bytes(array(2, 4)),
+            PropertyLayout::General,
+            &mut || false,
+        )
         .unwrap();
     assert_eq!(changed, array(2, 4));
     assert!(!Arc::ptr_eq(array_arc(&first), array_arc(&changed)));
@@ -230,26 +298,56 @@ fn complete_record_digest_and_kind_are_required_even_for_the_same_id() {
     let references = postcard::to_stdvec(&Record::References([(1, 2)].into())).unwrap();
     assert!(
         cache
-            .value_bytes(&store.reader, id, &references, &mut || false)
+            .value_bytes(
+                &store.reader,
+                id,
+                &references,
+                PropertyLayout::General,
+                &mut || false
+            )
             .is_err()
     );
     let mut trailing = first_bytes.clone();
     trailing.push(0);
     assert!(
         cache
-            .value_bytes(&store.reader, id, &trailing, &mut || false)
+            .value_bytes(
+                &store.reader,
+                id,
+                &trailing,
+                PropertyLayout::General,
+                &mut || false
+            )
             .is_err()
     );
     assert!(
         cache
-            .value_bytes(&store.reader, id, &first_bytes, &mut || true)
+            .value_bytes(
+                &store.reader,
+                id,
+                &first_bytes,
+                PropertyLayout::General,
+                &mut || true
+            )
             .is_err()
     );
     let first_low = cache
-        .value_bytes(&store.reader, 40, &first_bytes, &mut || false)
+        .value_bytes(
+            &store.reader,
+            40,
+            &first_bytes,
+            PropertyLayout::General,
+            &mut || false,
+        )
         .unwrap();
     let second_low = cache
-        .value_bytes(&store.reader, 40, &first_bytes, &mut || false)
+        .value_bytes(
+            &store.reader,
+            40,
+            &first_bytes,
+            PropertyLayout::General,
+            &mut || false,
+        )
         .unwrap();
     assert!(!Arc::ptr_eq(array_arc(&first_low), array_arc(&second_low)));
     assert!(
@@ -268,10 +366,22 @@ fn a_real_validated_hit_still_rejects_corrupted_or_truncated_resource_blocks() {
         let handle = store.save(&Record::Value(array(5, 1000)), &[]);
         let mut cache = ExternalCache::default();
         let first = cache
-            .value(&mut store.reader, handle.id(), 0, &mut || false)
+            .property(
+                &mut store.reader,
+                handle.id(),
+                0,
+                PropertyLayout::General,
+                &mut || false,
+            )
             .unwrap();
         let second = cache
-            .value(&mut store.reader, handle.id(), 0, &mut || false)
+            .property(
+                &mut store.reader,
+                handle.id(),
+                0,
+                PropertyLayout::General,
+                &mut || false,
+            )
             .unwrap();
         assert!(Arc::ptr_eq(array_arc(&first), array_arc(&second)));
         let path = fs::read_dir(&store._owner.path)
@@ -296,7 +406,13 @@ fn a_real_validated_hit_still_rejects_corrupted_or_truncated_resource_blocks() {
         store.reader.resources = Some(store.resources.reader());
         assert!(
             cache
-                .value(&mut store.reader, handle.id(), 0, &mut || false)
+                .property(
+                    &mut store.reader,
+                    handle.id(),
+                    0,
+                    PropertyLayout::General,
+                    &mut || false
+                )
                 .is_err()
         );
         assert_eq!(first, array(5, 1000));
@@ -312,16 +428,34 @@ fn cache_does_not_commit_pending_resources_or_keep_expired_resources_alive() {
     let id = handle.id();
     let mut cache = ExternalCache::default();
     cache
-        .value_bytes(&store.reader, id, &payload, &mut || false)
+        .value_bytes(
+            &store.reader,
+            id,
+            &payload,
+            PropertyLayout::General,
+            &mut || false,
+        )
         .unwrap();
     assert!(
         cache
-            .value(&mut store.reader, id, 0, &mut || false)
+            .property(
+                &mut store.reader,
+                id,
+                0,
+                PropertyLayout::General,
+                &mut || false
+            )
             .is_err()
     );
     store.resources.commit(&plan).unwrap();
     let decoded = cache
-        .value(&mut store.reader, id, 0, &mut || false)
+        .property(
+            &mut store.reader,
+            id,
+            0,
+            PropertyLayout::General,
+            &mut || false,
+        )
         .unwrap();
     drop(plan);
     let lease = ResourceLease::new(vec![handle]);
@@ -330,7 +464,13 @@ fn cache_does_not_commit_pending_resources_or_keep_expired_resources_alive() {
     assert_eq!(store.resources.physical_bytes(), 0);
     assert!(
         cache
-            .value(&mut store.reader, id, 0, &mut || false)
+            .property(
+                &mut store.reader,
+                id,
+                0,
+                PropertyLayout::General,
+                &mut || false
+            )
             .is_err()
     );
     assert_eq!(decoded, array(1, 100));
@@ -365,18 +505,20 @@ fn reference_hits_preserve_generations_and_low_offsets_never_cross_files() {
     first.writer.file.flush().unwrap();
     second.writer.file.flush().unwrap();
     let a = cache
-        .value(
+        .property(
             &mut first.reader,
             offset_a,
             first.writer.view.bytes,
+            PropertyLayout::General,
             &mut || false,
         )
         .unwrap();
     let b = cache
-        .value(
+        .property(
             &mut second.reader,
             offset_b,
             second.writer.view.bytes,
+            PropertyLayout::General,
             &mut || false,
         )
         .unwrap();
@@ -546,7 +688,13 @@ fn cached_payloads_do_not_bypass_object_offset_kind_or_duplicate_validation() {
     let refs = store.save(&Record::References([(1, 2)].into()), &[]);
     let mut cache = ExternalCache::default();
     cache
-        .value(&mut store.reader, value.id(), 0, &mut || false)
+        .property(
+            &mut store.reader,
+            value.id(),
+            0,
+            PropertyLayout::General,
+            &mut || false,
+        )
         .unwrap();
     cache
         .references(&mut store.reader, refs.id(), 0, &mut || false)

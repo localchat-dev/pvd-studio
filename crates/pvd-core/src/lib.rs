@@ -20,9 +20,12 @@ pub use latest_scene::{
 };
 pub mod live;
 mod mesh;
+mod mesh_array;
 #[cfg(test)]
 mod source_debug_tests;
+mod value_serde;
 pub use mesh::MeshCache;
+pub use mesh_array::MeshArray;
 pub mod metrics;
 pub mod native;
 pub mod navmesh;
@@ -123,7 +126,7 @@ fn check_replay_cancelled(cancelled: &mut impl FnMut() -> bool) -> Result<(), Er
     Ok(())
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub enum Value {
     Bool(bool),
     I64(i64),
@@ -140,6 +143,8 @@ pub enum Value {
     Ref(u64),
     Array(Arc<Vec<Value>>),
     Bytes(Arc<[u8]>),
+    #[serde(skip)]
+    MeshArray(MeshArray),
 }
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -156,9 +161,10 @@ impl fmt::Display for Value {
                 write!(f, "p {position:.4?} · q {rotation:.4?}")
             }
             Self::Ref(v) => write!(f, "0x{v:X}"),
-            Self::Array(v) => {
-                write!(f, "[{} items]", v.len())?;
-                for item in v.iter().take(4) {
+            Self::Array(_) | Self::MeshArray(_) => {
+                let items = self.array_items().unwrap();
+                write!(f, "[{} items]", items.len())?;
+                for item in items.take(4) {
                     write!(f, " {item}")?;
                 }
                 Ok(())
@@ -168,6 +174,28 @@ impl fmt::Display for Value {
     }
 }
 impl Value {
+    pub fn array_len(&self) -> Option<usize> {
+        match self {
+            Self::Array(values) => Some(values.len()),
+            Self::MeshArray(values) => Some(values.len()),
+            _ => None,
+        }
+    }
+
+    pub fn array_item(&self, index: usize) -> Option<std::borrow::Cow<'_, Self>> {
+        match self {
+            Self::Array(values) => values.get(index).map(std::borrow::Cow::Borrowed),
+            Self::MeshArray(values) => values.get(index).map(std::borrow::Cow::Owned),
+            _ => None,
+        }
+    }
+
+    pub fn array_items(
+        &self,
+    ) -> Option<impl ExactSizeIterator<Item = std::borrow::Cow<'_, Self>> + Clone> {
+        Some((0..self.array_len()?).map(|index| self.array_item(index).unwrap()))
+    }
+
     fn reference_count(&self) -> usize {
         match self {
             Self::Ref(_) => 1,
@@ -184,10 +212,23 @@ impl Value {
             _ => {}
         }
     }
+    fn append_reference(&mut self, target: u64) {
+        match self {
+            Self::Array(values) => Arc::make_mut(values).push(Self::Ref(target)),
+            Self::MeshArray(values) => {
+                let mut items = Vec::with_capacity(values.len() + 1);
+                items.extend(values.iter());
+                items.push(Self::Ref(target));
+                *self = Self::Array(items.into());
+            }
+            _ => {}
+        }
+    }
     fn retained_bytes(&self) -> usize {
         match self {
             Self::String(v) => v.len(),
             Self::Bytes(v) => v.len(),
+            Self::MeshArray(v) => v.bytes().len(),
             Self::Array(values) => {
                 values.capacity() * std::mem::size_of::<Value>()
                     + values.iter().map(Self::retained_bytes).sum::<usize>()
@@ -489,13 +530,10 @@ impl Action {
                     .or_default();
                 let inserted = Arc::make_mut(targets).insert(*target, generation).is_none();
                 if inserted && let Some(o) = state.objects.get_mut(id) {
-                    let v = o
-                        .properties
+                    o.properties
                         .entry(key.clone())
-                        .or_insert_with(|| Value::Array(Arc::new(Vec::new())));
-                    if let Value::Array(a) = v {
-                        Arc::make_mut(a).push(Value::Ref(*target));
-                    }
+                        .or_insert_with(|| Value::Array(Arc::new(Vec::new())))
+                        .append_reference(*target);
                 }
             }
             Self::Remove(id, key, target) => {
@@ -529,6 +567,95 @@ impl Action {
                 state.cameras.remove(name);
             }
         }
+    }
+
+    fn scene_bytes(&self, state: &SceneState) -> usize {
+        match self {
+            Self::Set(id, key, _) => property_state_bytes(state, *id, key, Value::retained_bytes),
+            Self::Push(id, key, _) | Self::Remove(id, key, _) => {
+                // Reference edits leave the payload of existing elements in place.
+                property_state_bytes(state, *id, key, |value| match value {
+                    Value::Array(values) => values.capacity() * std::mem::size_of::<Value>(),
+                    Value::MeshArray(values) => values.bytes().len(),
+                    _ => 0,
+                })
+            }
+            Self::Create(object) => object_state_bytes(state, object.id),
+            Self::Destroy(id) => object_state_bytes(state, *id),
+            Self::Debug(id, ..) => state.debug_draw.get(id).map_or(0, draw_state_bytes),
+            Self::Contacts(id, ..) => contacts_state_bytes(state, *id),
+            Self::ClearDebug(ids) => ids
+                .iter()
+                .filter_map(|id| state.debug_draw.get(id))
+                .map(draw_state_bytes)
+                .sum(),
+            Self::ReplaceDebug(_) => state.debug_draw.values().map(draw_state_bytes).sum(),
+            Self::Error(_) => 0,
+            Self::Camera(name, _) | Self::RemoveCamera(name) => state
+                .cameras
+                .get(name)
+                .map_or(0, |_| camera_entry_bytes(name)),
+        }
+    }
+}
+
+fn binding_state_bytes(key: &str, count: usize) -> usize {
+    key.len() + 96 + count * 80
+}
+
+fn property_state_bytes(
+    state: &SceneState,
+    id: u64,
+    key: &str,
+    value_bytes: impl FnOnce(&Value) -> usize,
+) -> usize {
+    state
+        .objects
+        .get(&id)
+        .and_then(|object| object.properties.get(key))
+        .map_or(0, |value| key.len() + 96 + value_bytes(value))
+        + state
+            .reference_lifetimes
+            .get(&(id, key.to_owned()))
+            .map_or(0, |bindings| binding_state_bytes(key, bindings.len()))
+}
+
+fn draw_state_bytes(draw: &Arc<Vec<debug_draw::Primitive>>) -> usize {
+    (draw.capacity() - draw.len()) * std::mem::size_of::<debug_draw::Primitive>()
+        + debug_windows::primitive_bytes(draw)
+}
+
+fn contacts_state_bytes(state: &SceneState, id: u64) -> usize {
+    state
+        .contacts
+        .get(&id)
+        .map_or(0, |contacts| 80 + std::mem::size_of_val(contacts.as_ref()))
+}
+
+fn object_state_bytes(state: &SceneState, id: u64) -> usize {
+    state.objects.get(&id).map_or(0, |object| {
+        256 + object.type_name.len()
+            + object
+                .properties
+                .iter()
+                .map(|(key, value)| key.len() + 96 + value.retained_bytes())
+                .sum::<usize>()
+    }) + state
+        .reference_lifetimes
+        .range((id, String::new())..)
+        .take_while(|((owner, _), _)| *owner == id)
+        .map(|((_, key), bindings)| binding_state_bytes(key, bindings.len()))
+        .sum::<usize>()
+        + state.debug_draw.get(&id).map_or(0, draw_state_bytes)
+        + contacts_state_bytes(state, id)
+        + usize::from(state.generations.contains_key(&id)) * 80
+}
+
+fn updated_state_bytes(total: usize, before: usize, after: usize) -> usize {
+    if after >= before {
+        total.saturating_add(after - before)
+    } else {
+        total.saturating_sub(before - after)
     }
 }
 
@@ -1266,6 +1393,14 @@ impl RecordingBuilder {
                 .and_then(|o| o.properties.get(key))
                 .map_or(0, |value| match value {
                     Value::Array(values) if Arc::strong_count(values) > 1 => value.retained_bytes(),
+                    Value::MeshArray(values)
+                        if matches!(&action, Action::Push(_, _, target)
+                            if !self.state.reference_lifetimes
+                                .get(&(*id, key.clone()))
+                                .is_some_and(|targets| targets.contains_key(target))) =>
+                    {
+                        (values.len() + 1) * std::mem::size_of::<Value>()
+                    }
                     _ => 0,
                 }),
             Action::Debug(id, _) => self
@@ -1421,6 +1556,18 @@ impl RecordingBuilder {
             }
             drop(analysis_timer);
             return self.set_value(id, key, Value::Bytes(data));
+        }
+        if items as usize >= mesh_array::MIN_PACKED_ITEMS
+            && let Some(values) = MeshArray::decode(
+                &self.state.objects[&id].type_name,
+                key,
+                typename,
+                items,
+                data,
+                self.recording.header.endian,
+            )?
+        {
+            return self.set_value(id, key, Value::MeshArray(values));
         }
         let value = decode_value(
             typename,
@@ -2678,9 +2825,8 @@ impl SceneState {
                 else {
                     continue;
                 };
-                let offset = rotate(rotation, local_position);
-                let shape_position = std::array::from_fn(|axis| position[axis] + offset[axis]);
-                let shape_rotation = quat_mul(rotation, local_rotation);
+                let (shape_position, shape_rotation) =
+                    compose_pose((position, rotation), (local_position, local_rotation));
                 let shape_region =
                     region.and_then(|region| region.in_shape_space(shape_position, shape_rotation));
                 if region.is_some() && shape_region.is_none() {
@@ -2842,6 +2988,22 @@ fn render_transform(value: Option<&Value>, scoped: bool) -> Option<([f32; 3], [f
     }
     render_region::normalize_rotation(rotation).map(|rotation| (position, rotation))
 }
+
+pub fn rigid_shape_pose(pose: ([f32; 3], [f32; 4]), shape: &Object) -> ([f32; 3], [f32; 4]) {
+    compose_pose(pose, transform(shape.properties.get("LocalPose")))
+}
+
+fn compose_pose(
+    (position, rotation): ([f32; 3], [f32; 4]),
+    (local_position, local_rotation): ([f32; 3], [f32; 4]),
+) -> ([f32; 3], [f32; 4]) {
+    let offset = rotate(rotation, local_position);
+    (
+        std::array::from_fn(|axis| position[axis] + offset[axis]),
+        quat_mul(rotation, local_rotation),
+    )
+}
+
 fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [
         a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],

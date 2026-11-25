@@ -47,6 +47,7 @@ pub use cache_directory::{
     CacheCleanupReport, cleanup_stale_history, enable_background_stale_history_cleanup,
     pending_history_cleanups, queue_stale_history_cleanup,
 };
+pub use persistent::ReplayLookahead;
 pub use replay::{ReplayCursor, ReplayFrame, ReplaySeekMetrics, SceneReplayFrame};
 use resources::{ResourceHandle, ResourcePlan, ResourceReader, Resources};
 use segments::{SegmentWriter, WriteState};
@@ -279,11 +280,26 @@ impl SceneUpdate {
         match (state.objects.get(&id), next) {
             (None, None) => false,
             (Some(_), None) | (None, Some(_)) => true,
-            (Some(previous), Some(next)) => names.iter().any(|&name| {
-                previous.properties.get(name) != next.object.properties.get(name)
-                    || state.reference_lifetimes.get(&(id, name.to_owned()))
-                        != next.references.get(name)
-            }),
+            (Some(previous), Some(next)) => {
+                if names
+                    .iter()
+                    .any(|&name| previous.properties.get(name) != next.object.properties.get(name))
+                {
+                    return true;
+                }
+                let previous = state
+                    .reference_lifetimes
+                    .range((id, String::new())..)
+                    .take_while(|((owner, _), _)| *owner == id)
+                    .filter_map(|((_, name), targets)| {
+                        names.contains(&name.as_str()).then_some((name, targets))
+                    });
+                let next = next
+                    .references
+                    .iter()
+                    .filter(|(name, _)| names.contains(&name.as_str()));
+                !previous.eq(next)
+            }
         }
     }
     pub fn changes_properties(&self, state: &SceneState, names: &[&str]) -> bool {
@@ -1323,7 +1339,7 @@ impl DiskRecording {
             cameras: index.cameras,
             ..Default::default()
         };
-        let mut values = BTreeMap::<u64, Value>::new();
+        let mut values = BTreeMap::new();
         let mut references = BTreeMap::<u64, Arc<BTreeMap<u64, u32>>>::new();
         for (id, offset) in index.objects {
             let object = replay::read_object(
@@ -2283,7 +2299,7 @@ impl Streaming {
             Action::ReplaceDebug(_) => &replaced_ids,
             Action::Error(_) | Action::Camera(..) | Action::RemoveCamera(_) => &[],
         };
-        let before = action_bytes(state, &action, ids);
+        let before = action.scene_bytes(state);
         if let Action::Error(event) = &action {
             self.errors_dirty = true;
             if self.errors.len() == MAX_ERRORS {
@@ -2298,11 +2314,8 @@ impl Streaming {
         if state.errors.len() > MAX_ERRORS {
             state.errors.drain(..state.errors.len() - MAX_ERRORS);
         }
-        let after = action_bytes(state, &action, ids);
-        self.state_bytes = self
-            .state_bytes
-            .saturating_sub(before)
-            .saturating_add(after);
+        let after = action.scene_bytes(state);
+        self.state_bytes = crate::updated_state_bytes(self.state_bytes, before, after);
         if self.state_bytes > limit || state.generations.len() > 1_000_000 {
             return Err(error(
                 "current live scene exceeds its bounded object/resource budget",
@@ -2405,59 +2418,10 @@ impl Streaming {
     }
 }
 
-fn action_bytes(state: &SceneState, action: &Action, ids: &[u64]) -> usize {
-    match action {
-        Action::Camera(name, _) | Action::RemoveCamera(name) => state
-            .cameras
-            .get(name)
-            .map_or(0, |_| camera_entry_bytes(name)),
-        Action::Set(id, key, _) => state
-            .objects
-            .get(id)
-            .and_then(|object| object.properties.get(key))
-            .map_or(0, |value| property_bytes(key, value)),
-        _ => ids.iter().map(|&id| entry_bytes(state, id)).sum(),
-    }
-}
-
-fn property_bytes(key: &str, value: &Value) -> usize {
-    key.len() + 96 + value.retained_bytes() + value.reference_count() * 80
-}
-
-fn entry_bytes(state: &SceneState, id: u64) -> usize {
-    let object = state.objects.get(&id).map_or(0, |object| {
-        256 + object.type_name.len()
-            + object
-                .properties
-                .iter()
-                .map(|(key, value)| property_bytes(key, value))
-                .sum::<usize>()
-    });
-    let debug = state.debug_draw.get(&id).map_or(0, |draw| {
-        draw.len() * std::mem::size_of::<Primitive>()
-            + draw
-                .iter()
-                .map(|p| {
-                    if let Primitive::Text { text, .. } = p {
-                        text.len()
-                    } else {
-                        0
-                    }
-                })
-                .sum::<usize>()
-    });
-    object
-        + debug
-        + state
-            .contacts
-            .get(&id)
-            .map_or(0, |c| std::mem::size_of_val(c.as_ref()))
-        + usize::from(state.generations.contains_key(&id)) * 80
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_state_bytes;
     use std::{fs, sync::atomic::Ordering};
 
     fn encoded(value: &impl Serialize) -> Vec<u8> {
@@ -2941,19 +2905,42 @@ mod tests {
         .unwrap();
         let mut streaming = Streaming::new(history);
         let mut state = SceneState::default();
-        let mut apply = |action| {
-            streaming.action(action, &mut state, usize::MAX).unwrap();
-            let exact: usize = state
+        let mut validation = crate::clip::ValidationState::default();
+        let mut validated = SceneState::default();
+        let exact = |state: &SceneState| {
+            state
                 .generations
                 .keys()
-                .map(|&id| entry_bytes(&state, id))
+                .copied()
+                .chain(state.reference_lifetimes.keys().map(|(id, _)| *id))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|id| object_state_bytes(state, id))
                 .sum::<usize>()
                 + state
                     .cameras
                     .keys()
                     .map(|name| camera_entry_bytes(name))
-                    .sum::<usize>();
-            assert_eq!(streaming.state_bytes, exact);
+                    .sum::<usize>()
+        };
+        let mut apply = |action: Action| {
+            let probe = matches!(&action,
+                Action::Push(1, key, _) | Action::Remove(1, key, _) if key == "Triangles");
+            validation
+                .apply(action.clone(), &mut validated, usize::MAX)
+                .unwrap();
+            streaming.action(action, &mut state, usize::MAX).unwrap();
+            assert_eq!(streaming.state_bytes, exact(&state));
+            assert_eq!(validation.state_bytes, exact(&validated));
+            if probe {
+                let values = &state.objects[&1].properties["Triangles"];
+                assert_eq!(*values.array_item(255).unwrap(), Value::U64(42));
+                let present = state.reference_lifetimes[&(1, "Triangles".into())].contains_key(&2);
+                assert_eq!(
+                    values.array_item(256).as_deref(),
+                    present.then_some(&Value::Ref(2))
+                );
+            }
         };
         for id in 1..=4 {
             apply(Action::Create(Object {
@@ -2963,6 +2950,29 @@ mod tests {
                 properties: BTreeMap::new(),
             }));
         }
+        let mut mixed = Vec::with_capacity(2048);
+        mixed.resize(1024, Value::U64(0));
+        mixed.extend([
+            Value::Array(vec![Value::Ref(2)].into()),
+            Value::Ref(2),
+            Value::Ref(2),
+        ]);
+        let held = Arc::new(mixed);
+        apply(Action::Set(1, "Mixed".into(), Value::Array(held.clone())));
+        apply(Action::Remove(1, "Mixed".into(), 2));
+        apply(Action::Push(1, "Mixed".into(), 3));
+        assert_eq!(held.len(), 1027);
+        apply(Action::Push(17, "Orphan".into(), 2));
+        apply(Action::Destroy(17));
+        let packed = crate::MeshArray::from_le_bytes(
+            crate::mesh_array::Element::Index16,
+            [42, 0].repeat(256),
+        )
+        .unwrap();
+        apply(Action::Set(1, "Triangles".into(), Value::MeshArray(packed)));
+        apply(Action::Push(1, "Triangles".into(), 2));
+        apply(Action::Push(1, "Triangles".into(), 2));
+        apply(Action::Remove(1, "Triangles".into(), 2));
         for value in 0..25 {
             apply(Action::Camera(
                 format!("camera-{}", value % 3),
@@ -3025,7 +3035,7 @@ mod tests {
             state
                 .generations
                 .keys()
-                .map(|&id| entry_bytes(&state, id))
+                .map(|&id| object_state_bytes(&state, id))
                 .sum::<usize>()
                 + state
                     .cameras
@@ -3172,6 +3182,12 @@ mod tests {
         assert!(patch.changes_object_properties(&state, 1, &["Geometry"]));
         assert!(!patch.changes_object_properties(&state, 1, &["Name"]));
         assert!(!patch.changes_object_properties(&state, 2, &["Geometry"]));
+        let bound = next.clone();
+        next.reference_lifetimes.remove(&(1, "Geometry".into()));
+        let removed = SceneUpdate::capture(&next, &[1].into(), false);
+        let added = SceneUpdate::capture(&bound, &[1].into(), false);
+        assert!(removed.changes_object_properties(&bound, 1, &["Name", "Geometry"]));
+        assert!(added.changes_object_properties(&next, 1, &["Name", "Geometry"]));
         next.objects.remove(&1);
         let patch = SceneUpdate::capture(&next, &[1].into(), false);
         assert!(patch.changes_object_properties(&state, 1, &["Geometry"]));

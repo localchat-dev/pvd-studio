@@ -157,15 +157,23 @@ impl Studio {
     }
 
     pub(super) fn pause_display_for(&mut self, reason: DisplayReason) {
+        let keep_displayed_frame = reason == DisplayReason::Pause && !self.follow_live;
         self.leave_live(reason);
         self.playing = 0;
-        self.cancel_seek();
+        if keep_displayed_frame {
+            self.cancel_pending_seek();
+        } else {
+            self.cancel_seek();
+        }
         self.restore_display_frame_source();
     }
 
     pub(super) fn seek_paused(&mut self, target: usize, reason: DisplayReason) {
         if self.seeking == Some(target) {
             self.playing = 0;
+            if let Some(worker) = &self.seek_worker {
+                worker.cancel_prefetch();
+            }
             self.display_reason = Some(reason);
             self.playback_recovery.make_manual();
             return;

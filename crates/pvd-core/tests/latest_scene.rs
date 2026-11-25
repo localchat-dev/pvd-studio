@@ -24,6 +24,8 @@ fn initialization() -> Vec<u8> {
         "SceneQueries.Raycasts",
         "PvdRaycast",
         "ObjectRef",
+        "PxTriangleMesh",
+        "Triangles",
     ]
     .into_iter()
     .enumerate()
@@ -63,9 +65,13 @@ fn create(class: u32, id: u64) -> Vec<u8> {
 }
 
 fn reference(target: u64) -> Vec<u8> {
+    push_reference(SCENE, 5, target)
+}
+
+fn push_reference(owner: u64, property: u32, target: u64) -> Vec<u8> {
     let mut event = vec![16];
-    event.extend(SCENE.to_le_bytes());
-    event.extend(5u32.to_le_bytes());
+    event.extend(owner.to_le_bytes());
+    event.extend(property.to_le_bytes());
     event.extend(target.to_le_bytes());
     event
 }
@@ -137,6 +143,49 @@ fn raycast(origin_x: f32) -> Vec<u8> {
     event.extend((data.len() as u32).to_le_bytes());
     event.extend(data);
     event
+}
+
+#[test]
+fn packed_mesh_reference_edit_reaches_published_and_reader_scenes() {
+    const MESH: u64 = 3;
+    const TRIANGLES: u32 = 12;
+    let mut live = LatestScene::default();
+    let reader = live.reader();
+    let mut view = LatestSceneView::default();
+    live.feed(&initialization()).unwrap();
+
+    let indices = [0u32, 1, 2].repeat(86);
+    let mut set = vec![7];
+    set.extend(MESH.to_le_bytes());
+    set.extend(TRIANGLES.to_le_bytes());
+    set.extend(1u32.to_le_bytes());
+    set.extend(6u32.to_le_bytes());
+    set.extend((indices.len() as u32).to_le_bytes());
+    set.extend((size_of_val(indices.as_slice()) as u32).to_le_bytes());
+    for index in &indices {
+        set.extend(index.to_le_bytes());
+    }
+    live.feed(&group(&[create(11, MESH), set, frame(0)]))
+        .unwrap();
+    reader.sync_view(&mut view, Some(0)).unwrap();
+    assert!(matches!(
+        view.scene().objects[&MESH].properties["Triangles"],
+        Value::MeshArray(_)
+    ));
+
+    live.feed(&group(&[push_reference(MESH, TRIANGLES, ACTOR), frame(1)]))
+        .unwrap();
+    reader.sync_view(&mut view, Some(1)).unwrap();
+    let published = reader.latest().unwrap();
+    for scene in [&published.scene, view.scene()] {
+        let value = &scene.objects[&MESH].properties["Triangles"];
+        assert_eq!(value.array_len(), Some(indices.len() + 1));
+        assert_eq!(
+            value.array_item(indices.len()).as_deref(),
+            Some(&Value::Ref(ACTOR))
+        );
+        assert!(scene.resolve_reference(MESH, "Triangles", ACTOR).is_some());
+    }
 }
 
 #[test]

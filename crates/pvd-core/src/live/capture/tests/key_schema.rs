@@ -209,14 +209,13 @@ fn keyed_capture_rejects_damage_version_mismatch_and_budget_and_cancellation() {
     let record =
         read_record_bytes_with_cancel(&mut reader, id, segment.committed_end, &mut || false)
             .unwrap();
-    reader.capture = Some(Arc::new(CaptureBacking {
-        format: Format::V1,
-        file: File::open(&path).unwrap(),
-        base: 0,
-        path: path.clone(),
-        bytes: bytes.len() as u64,
-        owner: std::sync::Mutex::new(None),
-    }));
+    reader.capture = Some(Arc::new(CaptureBacking::new(
+        Format::V1,
+        File::open(&path).unwrap(),
+        path.clone(),
+        0,
+        bytes.len() as u64,
+    )));
     assert!(reader.decode(&record, &mut || false).is_err());
     reader.capture = None;
     assert!(reader.decode(&record, &mut || false).is_ok());

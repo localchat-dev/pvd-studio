@@ -1372,6 +1372,15 @@ fn mesh_index(value: &Value) -> Result<usize, Error> {
     }
 }
 
+fn mesh_values<'a>(
+    mesh: &'a Object,
+    name: &str,
+) -> Result<impl ExactSizeIterator<Item = std::borrow::Cow<'a, Value>> + Clone, Error> {
+    value(mesh, name)?
+        .array_items()
+        .ok_or_else(|| error(format!("RepX mesh {name} must be an array")))
+}
+
 fn serialize_mesh(mesh: &Object, convex: bool, budget: &mut usize) -> Result<String, Error> {
     validate_fields(
         mesh,
@@ -1396,33 +1405,30 @@ fn serialize_mesh(mesh: &Object, convex: bool, budget: &mut usize) -> Result<Str
         },
         &[],
     )?;
-    let points = mesh_array(mesh, "Points")?;
+    let points = mesh_values(mesh, "Points")?;
     if points.len() < if convex { 4 } else { 3 }
         || points.len() > if convex { 255 } else { 1_000_000 }
     {
         return Err(error("RepX mesh vertex count is outside supported bounds"));
     }
-    let mut estimate = points.len() * 3 * 64 + 1024;
-    let mut indices = &[][..];
-    if !convex {
-        indices = mesh_array(mesh, "Triangles")?;
-        if indices.is_empty()
+    let indices = if convex {
+        None
+    } else {
+        Some(mesh_values(mesh, "Triangles")?)
+    };
+    if let Some(indices) = &indices
+        && (indices.len() == 0
             || indices.len() > 3_000_000
-            || indices.len() % 3 != 0
-            || indices.len() / 3 != integer(mesh, "NbTriangles")? as usize
-        {
-            return Err(error(
-                "RepX triangle index count disagrees with captured triangle count",
-            ));
-        }
-        estimate += indices.len() * 16;
+            || !indices.len().is_multiple_of(3)
+            || indices.len() / 3 != integer(mesh, "NbTriangles")? as usize)
+    {
+        return Err(error(
+            "RepX triangle index count disagrees with captured triangle count",
+        ));
     }
-    *budget = budget
-        .checked_sub(estimate)
-        .ok_or_else(|| error("RepX mesh XML exceeds the 128 MiB export budget"))?;
     let vertices = points
-        .iter()
-        .map(|point| match point {
+        .clone()
+        .map(|point| match point.as_ref() {
             Value::Vec3(v) if v.iter().all(|v| v.is_finite()) => Ok(*v),
             _ => Err(error(
                 "RepX mesh points must be finite three-dimensional vectors",
@@ -1445,12 +1451,12 @@ fn serialize_mesh(mesh: &Object, convex: bool, budget: &mut usize) -> Result<Str
             ));
         }
         validate_convex_hull(mesh, &vertices)?;
-    } else {
-        for triangle in indices.chunks_exact(3) {
+    } else if let Some(mut values) = indices.clone() {
+        while let Some(first) = values.next() {
             let triangle = [
-                mesh_index(&triangle[0])?,
-                mesh_index(&triangle[1])?,
-                mesh_index(&triangle[2])?,
+                mesh_index(&first)?,
+                mesh_index(&values.next().unwrap())?,
+                mesh_index(&values.next().unwrap())?,
             ];
             if triangle.iter().any(|i| *i >= vertices.len())
                 || triangle[0] == triangle[1]
@@ -1478,35 +1484,75 @@ fn serialize_mesh(mesh: &Object, convex: bool, budget: &mut usize) -> Result<Str
     } else {
         "PxBVH33TriangleMesh"
     };
-    let mut xml = format!("<{tag_name}>\n");
-    tag(&mut xml, "Id", &mesh.id.to_string())?;
+    let mut xml = MeshXml {
+        text: String::new(),
+        limit: *budget,
+    };
+    writeln!(xml, "<{tag_name}>\n<Id>{}</Id>", mesh.id).map_err(mesh_xml_error)?;
     numeric_mesh_property(&mut xml, if convex { "points" } else { "Points" }, points)?;
-    if !convex {
+    if let Some(indices) = indices {
         numeric_mesh_property(&mut xml, "Triangles", indices)?;
         if mesh.properties.contains_key("MaterialIndices") {
             numeric_mesh_property(
                 &mut xml,
                 "materialIndices",
-                mesh_array(mesh, "MaterialIndices")?,
+                mesh_values(mesh, "MaterialIndices")?,
             )?;
         }
     }
-    writeln!(xml, "</{tag_name}>").unwrap();
-    Ok(xml)
+    writeln!(xml, "</{tag_name}>").map_err(mesh_xml_error)?;
+    *budget -= xml.text.len();
+    xml.text.shrink_to_fit();
+    Ok(xml.text)
 }
 
-fn numeric_mesh_property(xml: &mut String, name: &str, values: &[Value]) -> Result<(), Error> {
-    write!(xml, "<{name}>").unwrap();
+struct MeshXml {
+    text: String,
+    limit: usize,
+}
+
+fn mesh_xml_error(_: std::fmt::Error) -> Error {
+    error("RepX mesh XML exceeds the 128 MiB export budget")
+}
+
+impl Write for MeshXml {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if text.len() > self.limit - self.text.len() {
+            return Err(std::fmt::Error);
+        }
+        let needed = self.text.len() + text.len();
+        if needed > self.text.capacity() {
+            let capacity = self
+                .text
+                .capacity()
+                .saturating_mul(2)
+                .max(needed)
+                .min(self.limit);
+            self.text.reserve_exact(capacity - self.text.len());
+        }
+        self.text.push_str(text);
+        Ok(())
+    }
+}
+
+fn numeric_mesh_property<'a>(
+    xml: &mut MeshXml,
+    name: &str,
+    values: impl Iterator<Item = std::borrow::Cow<'a, Value>>,
+) -> Result<(), Error> {
+    write!(xml, "<{name}>").map_err(mesh_xml_error)?;
     for value in values {
-        match value {
+        match value.as_ref() {
             Value::Vec3(v) if v.iter().all(|v| v.is_finite()) => {
-                write!(xml, " {} {} {}", v[0], v[1], v[2]).unwrap()
+                write!(xml, " {} {} {}", v[0], v[1], v[2]).map_err(mesh_xml_error)?
             }
-            Value::U64(v) if *v <= u32::MAX as u64 => write!(xml, " {v}").unwrap(),
+            Value::U64(v) if *v <= u32::MAX as u64 => {
+                write!(xml, " {v}").map_err(mesh_xml_error)?
+            }
             _ => return Err(error("RepX mesh numeric buffer contains an invalid value")),
         }
     }
-    writeln!(xml, "</{name}>").unwrap();
+    writeln!(xml, "</{name}>").map_err(mesh_xml_error)?;
     Ok(())
 }
 
@@ -1948,6 +1994,25 @@ fn tag(xml: &mut String, name: &str, text: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_mesh_xml_obeys_the_exact_byte_budget() {
+        let values = Value::Array(vec![Value::U64(2), Value::U64(100)].into());
+        let expected = "<Triangles> 2 100</Triangles>\n";
+        for limit in [expected.len() - 1, expected.len()] {
+            let mut xml = MeshXml {
+                text: String::new(),
+                limit,
+            };
+            let result =
+                numeric_mesh_property(&mut xml, "Triangles", values.array_items().unwrap());
+            assert!(xml.text.len() <= limit);
+            assert_eq!(result.is_ok(), limit == expected.len());
+            if result.is_ok() {
+                assert_eq!(xml.text, expected);
+            }
+        }
+    }
 
     fn spherical_property_fixture() -> Object {
         let mut joint = Object {

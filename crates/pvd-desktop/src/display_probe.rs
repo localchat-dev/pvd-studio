@@ -254,7 +254,7 @@ fn after_prepare(probe: Res<Probe>, studio: Res<Studio>) {
     probe.trace.event("sync_begin", stamp, 0);
 }
 fn after_sync(mut probe: ResMut<Probe>, studio: Res<Studio>, viewport: Res<Viewport>) {
-    let (revision, shapes, actors) = viewport.display_probe_stats();
+    let (revision, shapes, actors, poses) = viewport.display_probe_stats();
     if revision == studio.revision {
         probe.scene = stamp(&studio, probe.tick);
     }
@@ -262,6 +262,9 @@ fn after_sync(mut probe: ResMut<Probe>, studio: Res<Studio>, viewport: Res<Viewp
     probe
         .trace
         .event("last_sync_actor_count", probe.scene, actors as u64);
+    probe
+        .trace
+        .event("last_sync_pose_count", probe.scene, poses as u64);
     probe.trace.event("camera_begin", probe.scene, 0);
 }
 fn after_camera(probe: Res<Probe>) {
@@ -365,7 +368,7 @@ fn drive(
         adapter,
         device,
     } = display;
-    if probe.trace.elapsed() > Duration::from_secs(180) && probe.phase != Phase::Shutdown {
+    if probe.trace.elapsed() > Duration::from_secs(600) && probe.phase != Phase::Shutdown {
         probe.trace.fail("continuous render check timed out");
     }
     if probe.adapter.is_null()

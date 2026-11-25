@@ -252,6 +252,33 @@ fn expanded_large_enum_arrays_format_only_visible_rows() {
     }
 }
 
+#[test]
+#[ignore = "requires a PhysX 3.4 triangle mesh capture with packed point and index arrays"]
+fn sdk_mesh_arrays_expand_and_resolve_fixed_index_menu_targets() {
+    let capture = std::env::var_os("PVD_SDK34_LARGE_MESH_CAPTURE").unwrap();
+    let recording = Recording::from_path(std::path::PathBuf::from(capture)).unwrap();
+    let state = recording.state_at(0).unwrap();
+    let object = state
+        .objects
+        .values()
+        .find(|object| matches!(object.properties.get("Points"), Some(Value::MeshArray(_))))
+        .unwrap();
+    for name in ["Points", "Triangles"] {
+        let array = &object.properties[name];
+        let length = array.array_len().unwrap();
+        let row = array.array_item(length - 1).unwrap();
+        let target = PropertyMenuTarget::new(0, object, name, Some(length - 1), &row);
+        assert_eq!(target.value(0, object).as_deref(), Some(row.as_ref()));
+        let metadata = metadata("");
+        let first = array.array_item(0).unwrap();
+        let formatted = property_text(Some(&metadata), "fixture::Derived", "Values", &first);
+        let labels = inspector_text(Language::English, metadata, array.clone(), true);
+        assert!(labels.contains(&formatted), "{formatted} in {labels:?}");
+        assert!(labels.iter().any(|label| label == "[0]"));
+        assert!(!labels.contains(&format!("[{}]", length - 1)));
+    }
+}
+
 fn composite_precision_examples() -> Vec<(Value, &'static str)> {
     vec![
         (

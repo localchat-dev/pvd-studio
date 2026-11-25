@@ -22,6 +22,7 @@ pub(super) use metadata::schema_reader_bytes;
 pub use packed::{PACKED_MAGIC, PortableReport, write_portable_new};
 pub use packed_read::open_packed_with_progress;
 pub use read::open_with_progress;
+pub(super) use read::{BankAdmission, admit_bank, open_bank};
 pub use segmented::SET_MAGIC;
 pub use segmented_read::open_segmented_with_progress;
 pub const MAGIC: &[u8; 8] = b"PVDCAP03";

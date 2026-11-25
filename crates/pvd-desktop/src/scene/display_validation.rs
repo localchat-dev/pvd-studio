@@ -1,11 +1,12 @@
 use super::*;
 
 impl Viewport {
-    pub(crate) fn display_probe_stats(&self) -> (u64, usize, usize) {
+    pub(crate) fn display_probe_stats(&self) -> (u64, usize, usize, usize) {
         (
             self.revision,
             self.objects.len(),
             self.incremental.last_actor_count,
+            self.incremental.last_pose_count,
         )
     }
 

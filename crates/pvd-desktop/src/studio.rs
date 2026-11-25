@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     fs::File,
     io::{Read, Seek},
@@ -913,8 +914,11 @@ impl Studio {
         });
         self.display_reason = None;
         self.playback_recovery.clear();
+        if let Some(worker) = &self.seek_worker {
+            worker.cancel_prefetch();
+        }
         if self.seeking.is_some() {
-            self.cancel_seek();
+            self.cancel_pending_seek();
         }
         self.playing = direction;
         self.last_step = Instant::now();
@@ -1019,13 +1023,25 @@ impl Studio {
         self.commit_room_display();
     }
     fn cancel_seek(&mut self) {
+        self.cancel_display_seek(false);
+    }
+
+    fn cancel_pending_seek(&mut self) {
+        self.cancel_display_seek(true);
+    }
+
+    fn cancel_display_seek(&mut self, keep_displayed_frame: bool) {
         #[cfg(test)]
         {
             self.pending_playback_rebase = None;
             self.accepted_playback_rebase = None;
         }
         if let Some(worker) = &self.seek_worker {
-            worker.cancel();
+            if keep_displayed_frame {
+                worker.cancel_pending();
+            } else {
+                worker.cancel();
+            }
         }
         self.seeking = None;
         self.playback_recovery.clear();
@@ -1104,7 +1120,24 @@ impl Studio {
                     }
                 }
             }
-            let worker = self.seek_worker.as_ref().unwrap();
+            let lookahead = if intent == playback_recovery::Intent::Playback && self.playing != 0 {
+                self.playback_bounds().and_then(|(first, last)| {
+                    let ahead = if self.playing > 0 {
+                        self.frame
+                            .saturating_add(seeking::LOOKAHEAD_FRAMES)
+                            .min(last)
+                    } else {
+                        self.frame
+                            .saturating_sub(seeking::LOOKAHEAD_FRAMES)
+                            .max(first)
+                    };
+                    recording.replay_lookahead(self.frame, ahead)
+                })
+            } else {
+                None
+            };
+            let worker = self.seek_worker.as_mut().unwrap();
+            worker.prefetch(lookahead, &recording, self.display_trace.clone());
             #[cfg(test)]
             let rebase_witness = (intent == playback_recovery::Intent::Recovery)
                 .then(|| playback_tests::RebaseWitness::observe(&recording, self.frame, target))
@@ -1535,7 +1568,7 @@ impl Studio {
                     break;
                 }
             }
-            if self.playing != 0 {
+            if self.playing != 0 && self.seeking.is_none() {
                 let next = self.next_playback_frame(self.playing).unwrap_or(self.frame);
                 let interval = playback_interval(
                     self.recording.as_deref(),
@@ -1765,13 +1798,10 @@ impl Studio {
             return;
         };
         let (source, value) = if let Some(index) = index {
-            let pvd_core::Value::Array(values) = value else {
+            let Some(value) = value.array_item(index) else {
                 return;
             };
-            let Some(value) = values.get(index) else {
-                return;
-            };
-            let Some(value_type) = crate::curve::ElementType::of(value) else {
+            let Some(value_type) = crate::curve::ElementType::of(&value) else {
                 return;
             };
             (
@@ -1779,9 +1809,9 @@ impl Studio {
                 value,
             )
         } else {
-            (crate::curve::Source::Property, value)
+            (crate::curve::Source::Property, Cow::Borrowed(value))
         };
-        let Some(component_name) = crate::curve::components(value).get(component).copied() else {
+        let Some(component_name) = crate::curve::components(&value).get(component).copied() else {
             return;
         };
         let spec = crate::curve::Spec {
@@ -2336,7 +2366,8 @@ impl Studio {
                     if let Some(trace) = &completed.trace {
                         trace.event("tree_end", 0);
                     }
-                    self.scene_changes.record(&update, self.revision);
+                    self.scene_changes
+                        .record_replay(&update, &self.state, self.revision);
                     if let Some(trace) = &completed.trace {
                         trace.event("apply_begin", 0);
                     }
@@ -2391,7 +2422,7 @@ impl Studio {
                 }
             }
         }
-        if self.seeking.is_some() || self.playback_recovery.waiting() {
+        if self.playback_recovery.waiting() {
             context.request_repaint_after(Duration::from_millis(16));
         }
     }
@@ -2407,6 +2438,9 @@ impl Studio {
     }
     fn stop_seek_failure(&mut self, frame: usize, error: String) {
         self.playing = 0;
+        if let Some(worker) = &self.seek_worker {
+            worker.cancel_prefetch();
+        }
         if !self.follow_live {
             self.restore_display_frame_source();
             self.display_reason = Some(DisplayReason::SeekFailed);
@@ -3757,6 +3791,40 @@ mod tests {
         assert_eq!(result.frame, 7);
         assert!(result.result.is_ok());
         assert!(worker.poll().is_none());
+    }
+
+    #[test]
+    fn reversing_after_an_unpublished_seek_uses_the_displayed_scene() {
+        let worker = seeking::Worker::new();
+        let recording = Arc::new(small_disk_recording());
+        let wait = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.has_completed() {
+                assert!(Instant::now() < deadline, "seek worker timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        worker.request_scene(recording.clone(), 3);
+        wait();
+        let mut displayed = SceneState::default();
+        worker
+            .poll()
+            .unwrap()
+            .result
+            .unwrap()
+            .1
+            .apply(&mut displayed);
+        worker.request_scene(recording.clone(), 4);
+        wait();
+        worker.cancel_pending();
+        worker.request_scene(recording.clone(), 2);
+        wait();
+        let completed = worker.poll().unwrap();
+        assert_eq!(completed.frame, 2);
+        let (_, update) = completed.result.unwrap();
+        assert!(!update.replace_all);
+        update.apply(&mut displayed);
+        assert_eq!(displayed, recording.state_at(2).unwrap());
     }
 
     fn small_disk_recording() -> Recording {

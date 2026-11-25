@@ -197,6 +197,47 @@ cargo test --locked -p pvd-desktop studio::rooms::tests::tcp -- --ignored --noca
 
 跨机器持续吞吐、长时间频繁创建销毁、全部绘制类别及原生输入仍需独立检查。
 
+## 大型静态场景
+
+使用 PhysX 3.4.2 的同次 SDK getter 核对刚体、Shape、唯一网格、顶点、唯一面和实例面。生产器生成 3 个完成帧。下列命令生成 250 份不同的网格，每份 2 万面，并检查末帧、首帧、中间帧和 RepX 导出。
+
+```powershell
+./tools/physx-features/build.ps1 -Target pvd-large-scene
+$case = New-Item -ItemType Directory -Force output/large-scene
+$capture = Join-Path $case.FullName 'unique.pvdstream'
+& ./.deps/physx-features-build/Release/pvd-large-scene.exe $capture (Join-Path $case.FullName 'unique.sdk.json') 250 250 100
+$env:PVD_SDK34_LARGE_MESH_CAPTURE = $capture
+cargo test --locked -p pvd-core --test large_triangle_mesh -- --ignored --test-threads=1
+```
+
+最后三个参数依次指定刚体数、唯一网格数和每条边的网格单元数。用 `1 1 700` 生成单个 98 万面网格，用 `5000 1 100` 生成 5000 个实例共享 2 万面的场景。用 `50000 0 0` 单独验证 5 万个盒形刚体；上面的网格计数测试仅适用于含三角网格的捕获。桌面核对可使用 `pvd-desktop --render-check <capture> <png> 0 scene 1280 720`。该命令包含截图前的等待帧；进程启动至 PNG 写完的用时与交互帧率分别计量。
+
+普通视图上传三角网格后，通过捕获的索引几何支持线框、拾取和聚焦。大量实例共用同一网格的线框几何。单帧模型线框达到 400 万条线段时等待 GPU 完成，限制待处理帧占用。`--render-check` 的面板参数也可用 `wireframe` 或 `bounds` 压测全场景线框或包围框。逐属性核对实际渲染网格的回放、UI 操作及生命周期诊断会额外保留 CPU 顶点数据，比较常规显示内存时使用普通视图或 `--render-check`。
+
+### 大型场景回放
+
+使用 PhysX 3.4.2 生成 900 个完成帧、2,000 个静态三角网格实例和 1,024 个持续运动的运动学盒体。48 份独立网格各含 2 万面，共有 96 万独立面、4,000 万实例面。与 PVD3 对照时，让生产器用 `--tcp host port` 连接 [TCP 代理](native-validation.md)，用原版保存本次连接的 `.pxd2`，其余查看器读取代理保留的同一次连接原始流。
+
+```powershell
+./tools/physx-features/build.ps1 -Target pvd-large-scene
+$case = New-Item -ItemType Directory -Force output/large-scene-replay
+$capture = Join-Path $case.FullName 'large-moving.pvdstream'
+& ./.deps/physx-features-build/Release/pvd-large-scene.exe $capture (Join-Path $case.FullName 'large-moving.sdk.json') 2000 48 100 900 1024
+cargo run --locked --release -p pvd-desktop -- --render-playback-check $capture (Join-Path $case.FullName 'playback') 320 440 30
+```
+
+原生回放自载入完成后开始计时。拖轴记录松手到目标三维画面，跳过目标的手势单独计数。换向记录最后一次控件点击到新方向首个三维画面。连续播放用相邻不同场景画面之间的间隔统计可见帧率、P95 和长停顿；保留分卷边界，排除按钮操作与端点等待。记录各查看器的播放速率、窗口和视口设置。离屏命令单独核对正放、倒放和暂停端点的场景、分析及绘制，GPU 队列完成时间与原生画面更新分别计量。
+
+大型实体和线框的 GPU 提交受限。内部封存分卷通过完整校验后发布，重开核对已入库的摘要。Windows 捕获读取使用四个 64 KiB 页面，让分散存储、交替访问的帧记录和共享属性结构同时留在读缓存。跨分卷回放时，同一会话中资源 ID 未变的场景记录可沿用。定位和取消的回归覆盖热尾、封存分卷及换向时尚未显示的请求。
+
+连续正倒放接近分卷边界时，后台最多预读一个相邻卷。当前卷及预读卷共用 128 MiB 索引预算，预算不足时按需读取。暂停、拖轴和换向取消预读，释放尚未使用的预读卷。刚体的形状依赖和显示属性保持稳定时，视口更新现有形状的变换，继续应用完整的模型更新。形状依赖、物体代际、显示设置或坐标变化时重新同步受影响的内容。回归检查预读命中、取消、预算及共享形状的变换与几何更新。
+
+### 空场景内存
+
+用 `pvd-large-scene` 的 `0 0 0` 生成三个完成帧，SDK 真值中的刚体、Shape 和网格数均为零。与原版比较时，用 [TCP 代理](native-validation.md) 保留原版接收的同一次连接字节，离屏查看器读取这份原始流。桌面渲染的输出尺寸取原版实际客户区，使用各自默认布局。记录 Windows Job Object 的进程峰值提交量、稳定阶段的 `PrivateUsage` 和工作集。GPU 专用与共享用量单独采样。隔离桌面、隐藏窗口和无窗口渲染覆盖各自的资源分配路径；原生前台刷新与交互需要独立测量。
+
+PVD 场景材料使用显示色和顶点色，渲染设备省去材质纹理绑定数组。视口像素由相机写入，渲染目标仅保存 GPU 像素。Windows 字体优先以只读映射提供同一份字节，映射不可用时读取文件。核对空场景、双语 rich、500 万独立面、1 亿实例面及 5 万刚体的离屏画面，并运行 `cargo test --locked -p pvd-desktop mapped_font_excludes_writers_and_survives_rename` 检查字体文件替换时的映射生命周期。
+
 ## 录制包
 
 [PVD 录制包](pvd-archive.md)的默认回归覆盖 ZIP 目录、解压、CRC、资源上限、取消及三端接入。构造 stored/deflate 包装的真实原版和 SDK 输入另核对回放、CSV、区间导出与整份保存，输出与未包装源逐字节比较；原版生成 ZIP 的互通保持独立验收。

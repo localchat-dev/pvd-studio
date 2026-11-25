@@ -68,6 +68,11 @@ impl BankIndex {
     }
 }
 
+#[cfg(windows)]
+const READ_AHEAD_PAGES: usize = 4;
+#[cfg(windows)]
+const READ_AHEAD_PAGE_BYTES: usize = READ_BUFFER_BYTES / READ_AHEAD_PAGES;
+
 #[derive(Clone, Debug)]
 pub(in crate::live) struct BlobDescription {
     pub id: u64,
@@ -92,11 +97,39 @@ pub(in crate::live) struct CaptureBacking {
     pub path: PathBuf,
     pub base: u64,
     pub bytes: u64,
+    #[cfg(windows)]
+    read_ahead: Mutex<[ReadAhead; READ_AHEAD_PAGES]>,
     // Close the file before releasing ownership can remove its cache directory.
-    pub(in crate::live) owner: Mutex<Option<Arc<CacheDirectory>>>,
+    owner: Mutex<Option<Arc<CacheDirectory>>>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct ReadAhead {
+    start: Option<u64>,
+    bytes: Vec<u8>,
 }
 
 impl CaptureBacking {
+    pub(in crate::live) fn new(
+        format: crate::live::capture::Format,
+        file: File,
+        path: PathBuf,
+        base: u64,
+        bytes: u64,
+    ) -> Self {
+        Self {
+            format,
+            file,
+            path,
+            base,
+            bytes,
+            #[cfg(windows)]
+            read_ahead: Mutex::default(),
+            owner: Mutex::default(),
+        }
+    }
+
     pub(in crate::live) fn keep_owner(&self, owner: Arc<CacheDirectory>) -> Result<(), Error> {
         if self.path.parent() != Some(owner.path.as_path()) {
             return Err(error(
@@ -125,11 +158,40 @@ impl CaptureBacking {
         {
             return Err(error("capture read lies outside its committed file"));
         }
+        #[cfg(windows)]
+        if !bytes.is_empty() {
+            // The reader denies writes for the lifetime of this Windows file handle.
+            let start = offset & !(READ_AHEAD_PAGE_BYTES as u64 - 1);
+            let within = (offset - start) as usize;
+            if bytes.len() <= READ_AHEAD_PAGE_BYTES - within {
+                // Frame records alternate with shared schemas stored elsewhere in the capture.
+                let mut pages = self.read_ahead.lock().map_err(|_| lock_error())?;
+                let index =
+                    if let Some(index) = pages.iter().position(|page| page.start == Some(start)) {
+                        index
+                    } else {
+                        let index = pages.len() - 1;
+                        let page = &mut pages[index];
+                        let len = (self.bytes - start).min(READ_AHEAD_PAGE_BYTES as u64) as usize;
+                        page.start = None;
+                        page.bytes.resize(READ_AHEAD_PAGE_BYTES, 0);
+                        self.read_positioned(start, &mut page.bytes[..len])?;
+                        page.start = Some(start);
+                        index
+                    };
+                bytes.copy_from_slice(&pages[index].bytes[within..within + bytes.len()]);
+                pages[..=index].rotate_right(1);
+                return Ok(());
+            }
+        }
+        self.read_positioned(offset, bytes)
+    }
+
+    fn read_positioned(&self, offset: u64, mut bytes: &mut [u8]) -> Result<(), Error> {
         let mut offset = self
             .base
             .checked_add(offset)
             .ok_or_else(|| error("capture offset overflow"))?;
-        let mut bytes = bytes;
         while !bytes.is_empty() {
             let count = read_at(&self.file, offset, bytes)?;
             if count == 0 {

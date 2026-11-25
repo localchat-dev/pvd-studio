@@ -1,9 +1,9 @@
-use super::{MeshKey, MeshKind, SceneState, Value};
+use super::{ArraySource, MeshKey, MeshKind, SceneState};
 use crate::Geometry;
 use crate::render_region::{LocalBounds, ShapeRegion};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Range;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 const MIN_TRIANGLES: usize = 512;
 const LEAF_TRIANGLES: usize = 32;
@@ -15,8 +15,8 @@ pub(crate) type FrameTerrainSelections = BTreeMap<MeshKey, ShapeSelections>;
 type ShapeSelections = BTreeMap<Arc<[usize]>, Geometry>;
 
 pub(super) struct TerrainSource {
-    points: Weak<Vec<Value>>,
-    indices: Option<Weak<Vec<Value>>>,
+    points: ArraySource,
+    indices: Option<ArraySource>,
     dimensions: [usize; 2],
     reverse_winding: bool,
 }
@@ -27,10 +27,12 @@ impl TerrainSource {
         let resource = state.objects.get(&key.resource)?;
         let (indices, triangle_count, reverse_winding) = match key.kind {
             MeshKind::Triangle => {
-                let Value::Array(indices) = resource.properties.get("Triangles")? else {
-                    return None;
-                };
-                (Some(Arc::downgrade(indices)), indices.len() / 3, false)
+                let indices = resource.properties.get("Triangles")?;
+                (
+                    Some(ArraySource::capture(indices)?),
+                    indices.array_len()? / 3,
+                    false,
+                )
             }
             MeshKind::HeightField => {
                 let [rows, columns] = dimensions;
@@ -39,11 +41,11 @@ impl TerrainSource {
             }
             MeshKind::Convex => return None,
         };
-        if triangle_count < MIN_TRIANGLES && points.len() < MIN_TRIANGLES * 3 {
+        if triangle_count < MIN_TRIANGLES && points.array_len()? < MIN_TRIANGLES * 3 {
             return None;
         }
         Some(Self {
-            points: Arc::downgrade(points),
+            points: ArraySource::capture(points)?,
             indices,
             dimensions,
             reverse_winding,

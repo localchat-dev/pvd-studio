@@ -10,15 +10,14 @@ const RESOURCE_ID: u64 = 1 << 63;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    Value,
+    Value(PropertyLayout),
     References,
     ObjectKeys,
 }
 
 #[derive(Clone)]
 enum Payload {
-    Array(Arc<Vec<Value>>),
-    Bytes(Arc<[u8]>),
+    Value(Value),
     References(Arc<BTreeMap<u64, u32>>),
     ObjectKeys(Arc<Vec<String>>),
 }
@@ -77,15 +76,16 @@ impl ExternalCache {
         Ok(keys)
     }
 
-    pub(super) fn value(
+    pub(super) fn property(
         &mut self,
         reader: &mut HistoryReader,
         id: u64,
         size: u64,
+        layout: PropertyLayout,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<Value, Error> {
         let bytes = read_record_bytes_with_cancel(reader, id, size, cancelled)?;
-        self.value_bytes(reader, id, &bytes, cancelled)
+        self.value_bytes(reader, id, &bytes, layout, cancelled)
     }
 
     fn value_bytes(
@@ -93,30 +93,24 @@ impl ExternalCache {
         reader: &HistoryReader,
         id: u64,
         bytes: &[u8],
+        layout: PropertyLayout,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<Value, Error> {
         let digest = record_digest(bytes, cancelled)?;
-        if let Some(payload) = self.get(id, Kind::Value, digest) {
+        let kind = Kind::Value(layout);
+        if let Some(Payload::Value(value)) = self.get(id, kind, digest) {
             check_replay_cancelled(cancelled)?;
             self.observe(true, true);
-            return Ok(match payload {
-                Payload::Array(value) => Value::Array(value),
-                Payload::Bytes(value) => Value::Bytes(value),
-                Payload::References(_) | Payload::ObjectKeys(_) => unreachable!(),
-            });
+            return Ok(value);
         }
-        let Record::Value(value) = reader.decode(bytes, cancelled)? else {
-            return Err(error("history property record type mismatch"));
-        };
+        let value = layout.decode(reader, bytes, cancelled)?;
         #[cfg(all(test, feature = "scene-read-census"))]
         census::decoded_value();
         let allowance = value_allowance(&value, self.entry_limit, cancelled)?;
         check_replay_cancelled(cancelled)?;
         if let Some(allowance) = allowance {
-            self.insert(id, Kind::Value, digest, allowance, || match &value {
-                Value::Array(value) => Payload::Array(value.clone()),
-                Value::Bytes(value) => Payload::Bytes(value.clone()),
-                _ => unreachable!(),
+            self.insert(id, kind, digest, allowance, || {
+                Payload::Value(value.clone())
             });
         }
         self.observe(false, true);
@@ -280,7 +274,10 @@ fn value_allowance(
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<Option<usize>, Error> {
     check_replay_cancelled(cancelled)?;
-    if !matches!(value, Value::Array(_) | Value::Bytes(_)) {
+    if !matches!(
+        value,
+        Value::Array(_) | Value::Bytes(_) | Value::MeshArray(_)
+    ) {
         return Ok(None);
     }
     let mut stack: [std::slice::Iter<'_, Value>; DEPTH_LIMIT] = std::array::from_fn(|_| [].iter());
@@ -303,6 +300,7 @@ fn value_allowance(
         let extra = match value {
             Value::String(text) => Some(text.capacity()),
             Value::Bytes(value) => ARC_ALLOWANCE.checked_add(value.len()),
+            Value::MeshArray(value) => ARC_ALLOWANCE.checked_add(value.bytes().len()),
             Value::Array(value) => {
                 size_of::<Vec<Value>>()
                     .checked_add(ARC_ALLOWANCE)
